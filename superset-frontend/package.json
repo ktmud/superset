@@ -46,7 +46,7 @@
   "dependencies": {
     "@data-ui/sparkline": "0.0.54",
     "@superset-ui/chart": "0.12.3",
-    "@superset-ui/chart-composition": "0.12.1",
+    "@superset-ui/chart-composition": "0.12.8",
     "@superset-ui/color": "0.12.1",
     "@superset-ui/connection": "0.12.3",
     "@superset-ui/core": "0.12.0",
