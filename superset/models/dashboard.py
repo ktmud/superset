@@ -247,7 +247,7 @@ class Dashboard(  # pylint: disable=too-many-instance-attributes
 
     @cache_manager.cache.memoize(
         # manage cache version manually
-        make_name=lambda fname: f"{fname}-v2.1",
+        make_name=lambda fname: f"{fname}-v2.2",
         unless=lambda: not is_feature_enabled("DASHBOARD_CACHE"),
     )
     def full_data(self) -> Dict[str, Any]:
