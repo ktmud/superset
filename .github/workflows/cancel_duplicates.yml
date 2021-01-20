@@ -1,7 +1,19 @@
 name: Cancel Duplicates
 on:
   workflow_run:
-    workflows: ["CI"]
+    workflows:
+      [
+        "Docker",
+        "Docs",
+        "E2E",
+        "Frontend",
+        "Miscellaneous",
+        "Python MySQL",
+        "Python Presto/Hive",
+        "Python Misc",
+        "Tags",
+        "Translations",
+      ]
     types: ["requested"]
 
 jobs:
@@ -16,5 +28,4 @@ jobs:
           cancelFutureDuplicates: true
           token: ${{ secrets.GITHUB_TOKEN }}
           sourceRunId: ${{ github.event.workflow_run.id }}
-          notifyPRCancel: true
-          skipEventTypes: '["push", "pull_request", "pull_request_target"]'
+          notifyPRCancel: false
