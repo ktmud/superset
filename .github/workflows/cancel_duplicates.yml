@@ -21,6 +21,9 @@ jobs:
     name: "Cancel duplicate workflow runs"
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
       - uses: ./.github/actions/cancel-workflow-runs/
         name: "Cancel duplicate workflow runs"
         with:
