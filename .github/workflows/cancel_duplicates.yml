@@ -16,5 +16,4 @@ jobs:
           cancelFutureDuplicates: true
           token: ${{ secrets.GITHUB_TOKEN }}
           sourceRunId: ${{ github.event.workflow_run.id }}
-          notifyPRCancel: true
-          skipEventTypes: '["push", "pull_request", "pull_request_target"]'
+          notifyPRCancel: false
