@@ -92,8 +92,8 @@ export function applyMapStateToPropsToControl<T = ControlType>(
       ...controlState,
       ...mapStateToProps.call(controlState, controlPanelState, controlState),
     };
-    // `mapStateToProps` may also provide a value
-    value = value || state.value;
+    // allow overriding `value` from `mapStateToProps`
+    value = state.value ?? value;
   }
   // If default is a function, evaluate it
   if (typeof state.default === 'function') {
@@ -103,10 +103,9 @@ export function applyMapStateToPropsToControl<T = ControlType>(
       delete state.default;
     }
   }
-  // If no current value, set it as default
-  if (state.default && value === undefined) {
-    value = state.default;
-  }
+  // If no current value, use the default
+  value = value ?? state.default;
+
   // If a choice control went from multi=false to true, wrap value in array
   if (value && state.multi && !Array.isArray(value)) {
     value = [value];
