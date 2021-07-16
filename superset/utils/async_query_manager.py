@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import jwt
 import redis
-from flask import Flask, request, Request, Response, session
+from flask import Flask, g, request, Request, Response, session
 
 logger = logging.getLogger(__name__)
 
@@ -34,11 +34,13 @@ class AsyncQueryJobException(Exception):
     pass
 
 
-def build_job_metadata(channel_id: str, job_id: str, **kwargs: Any) -> Dict[str, Any]:
+def build_job_metadata(
+    channel_id: str, job_id: str, user_id: Optional[str], **kwargs: Any
+) -> Dict[str, Any]:
     return {
         "channel_id": channel_id,
         "job_id": job_id,
-        "user_id": session.get("user_id"),
+        "user_id": int(user_id) if user_id else None,
         "status": kwargs.get("status"),
         "errors": kwargs.get("errors", []),
         "result_url": kwargs.get("result_url"),
@@ -61,6 +63,8 @@ def increment_id(redis_id: str) -> str:
 
 
 class AsyncQueryManager:
+    # pylint: disable=too-many-instance-attributes
+
     MAX_EVENT_COUNT = 100
     STATUS_PENDING = "pending"
     STATUS_RUNNING = "running"
@@ -75,6 +79,7 @@ class AsyncQueryManager:
         self._stream_limit_firehose: Optional[int]
         self._jwt_cookie_name: str
         self._jwt_cookie_secure: bool = False
+        self._jwt_cookie_domain: Optional[str]
         self._jwt_secret: str
 
     def init_app(self, app: Flask) -> None:
@@ -105,13 +110,20 @@ class AsyncQueryManager:
         ]
         self._jwt_cookie_name = config["GLOBAL_ASYNC_QUERIES_JWT_COOKIE_NAME"]
         self._jwt_cookie_secure = config["GLOBAL_ASYNC_QUERIES_JWT_COOKIE_SECURE"]
+        self._jwt_cookie_domain = config["GLOBAL_ASYNC_QUERIES_JWT_COOKIE_DOMAIN"]
         self._jwt_secret = config["GLOBAL_ASYNC_QUERIES_JWT_SECRET"]
 
         @app.after_request
         def validate_session(  # pylint: disable=unused-variable
             response: Response,
         ) -> Response:
-            user_id = session["user_id"] if "user_id" in session else None
+            user_id = None
+
+            try:
+                user_id = g.user.get_id()
+                user_id = int(user_id)
+            except Exception:  # pylint: disable=broad-except
+                pass
 
             reset_token = (
                 not request.cookies.get(self._jwt_cookie_name)
@@ -133,6 +145,7 @@ class AsyncQueryManager:
                     value=token,
                     httponly=True,
                     secure=self._jwt_cookie_secure,
+                    domain=self._jwt_cookie_domain,
                 )
 
             return response
@@ -156,9 +169,11 @@ class AsyncQueryManager:
             logger.warning(exc)
             raise AsyncQueryTokenException("Failed to parse token")
 
-    def init_job(self, channel_id: str) -> Dict[str, Any]:
+    def init_job(self, channel_id: str, user_id: Optional[str]) -> Dict[str, Any]:
         job_id = str(uuid.uuid4())
-        return build_job_metadata(channel_id, job_id, status=self.STATUS_PENDING)
+        return build_job_metadata(
+            channel_id, job_id, user_id, status=self.STATUS_PENDING
+        )
 
     def read_events(
         self, channel: str, last_id: Optional[str]

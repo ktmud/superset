@@ -20,8 +20,11 @@ from croniter import croniter
 from flask_babel import gettext as _
 from marshmallow import fields, Schema, validate, validates_schema
 from marshmallow.validate import Length, Range, ValidationError
+from marshmallow_enum import EnumField
 
 from superset.models.reports import (
+    ReportCreationMethodType,
+    ReportDataFormat,
     ReportRecipientType,
     ReportScheduleType,
     ReportScheduleValidatorType,
@@ -81,6 +84,10 @@ grace_period_description = (
 working_timeout_description = (
     "If an alert is staled at a working state, how long until it's state is reseted to"
     " error"
+)
+creation_method_description = (
+    "Creation method is used to inform the frontend whether the report/alert was "
+    "created in the dashboard, chart, or alerts and reports UI."
 )
 
 
@@ -149,6 +156,12 @@ class ReportSchedulePostSchema(Schema):
         description=sql_description, example="SELECT value FROM time_series_table"
     )
     chart = fields.Integer(required=False, allow_none=True)
+    creation_method = EnumField(
+        ReportCreationMethodType,
+        by_value=True,
+        required=True,
+        description=creation_method_description,
+    )
     dashboard = fields.Integer(required=False, allow_none=True)
     database = fields.Integer(required=False)
     owners = fields.List(fields.Integer(description=owners_description))
@@ -178,6 +191,10 @@ class ReportSchedulePostSchema(Schema):
     )
 
     recipients = fields.List(fields.Nested(ReportRecipientSchema))
+    report_format = fields.String(
+        default=ReportDataFormat.VISUALIZATION,
+        validate=validate.OneOf(choices=tuple(key.value for key in ReportDataFormat)),
+    )
 
     @validates_schema
     def validate_report_references(  # pylint: disable=unused-argument,no-self-use
@@ -221,6 +238,12 @@ class ReportSchedulePutSchema(Schema):
         allow_none=True,
     )
     chart = fields.Integer(required=False, allow_none=True)
+    creation_method = EnumField(
+        ReportCreationMethodType,
+        by_value=True,
+        allow_none=True,
+        description=creation_method_description,
+    )
     dashboard = fields.Integer(required=False, allow_none=True)
     database = fields.Integer(required=False)
     owners = fields.List(fields.Integer(description=owners_description), required=False)
@@ -253,3 +276,7 @@ class ReportSchedulePutSchema(Schema):
         validate=[Range(min=1, error=_("Value must be greater than 0"))],
     )
     recipients = fields.List(fields.Nested(ReportRecipientSchema), required=False)
+    report_format = fields.String(
+        default=ReportDataFormat.VISUALIZATION,
+        validate=validate.OneOf(choices=tuple(key.value for key in ReportDataFormat)),
+    )

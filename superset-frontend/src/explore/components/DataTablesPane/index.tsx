@@ -17,9 +17,9 @@
  * under the License.
  */
 import React, { useCallback, useEffect, useState } from 'react';
-import { styled, t } from '@superset-ui/core';
-import Collapse from 'src/common/components/Collapse';
-import Tabs from 'src/common/components/Tabs';
+import { JsonObject, styled, t } from '@superset-ui/core';
+import Collapse from 'src/components/Collapse';
+import Tabs from 'src/components/Tabs';
 import Loading from 'src/components/Loading';
 import TableView, { EmptyWrapperType } from 'src/components/TableView';
 import { getChartDataRequest } from 'src/chart/chartAction';
@@ -93,6 +93,7 @@ const CollapseWrapper = styled.div`
         height: calc(100% - ${({ theme }) => theme.gridUnit * 8}px);
 
         .ant-collapse-content-box {
+          padding-top: 0;
           height: 100%;
         }
       }
@@ -105,11 +106,15 @@ export const DataTablesPane = ({
   tableSectionHeight,
   onCollapseChange,
   chartStatus,
+  ownState,
+  errorMessage,
 }: {
   queryFormData: Record<string, any>;
   tableSectionHeight: number;
   chartStatus: string;
+  ownState?: JsonObject;
   onCollapseChange: (openPanelName: string) => void;
+  errorMessage?: JSX.Element;
 }) => {
   const [data, setData] = useState<{
     [RESULT_TYPES.results]?: Record<string, any>[];
@@ -142,10 +147,11 @@ export const DataTablesPane = ({
         formData: queryFormData,
         resultFormat: 'json',
         resultType,
+        ownState,
       })
-        .then(response => {
+        .then(({ json }) => {
           // Only displaying the first query is currently supported
-          const result = response.result[0];
+          const result = json.result[0];
           setData(prevData => ({ ...prevData, [resultType]: result.data }));
           setIsLoading(prevIsLoading => ({
             ...prevIsLoading,
@@ -192,6 +198,17 @@ export const DataTablesPane = ({
 
   useEffect(() => {
     if (panelOpen && isRequestPending[RESULT_TYPES.results]) {
+      if (errorMessage) {
+        setIsRequestPending(prevState => ({
+          ...prevState,
+          [RESULT_TYPES.results]: false,
+        }));
+        setIsLoading(prevIsLoading => ({
+          ...prevIsLoading,
+          [RESULT_TYPES.results]: false,
+        }));
+        return;
+      }
       if (chartStatus === 'loading') {
         setIsLoading(prevIsLoading => ({
           ...prevIsLoading,
@@ -216,7 +233,14 @@ export const DataTablesPane = ({
       }));
       getData(RESULT_TYPES.samples);
     }
-  }, [panelOpen, isRequestPending, getData, activeTabKey, chartStatus]);
+  }, [
+    panelOpen,
+    isRequestPending,
+    getData,
+    activeTabKey,
+    chartStatus,
+    errorMessage,
+  ]);
 
   const filteredData = {
     [RESULT_TYPES.results]: useFilteredTableData(
@@ -257,6 +281,9 @@ export const DataTablesPane = ({
           showRowCount={false}
         />
       );
+    }
+    if (errorMessage) {
+      return <pre>{errorMessage}</pre>;
     }
     return null;
   };

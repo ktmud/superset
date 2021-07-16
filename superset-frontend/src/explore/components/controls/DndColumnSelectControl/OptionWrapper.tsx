@@ -43,7 +43,9 @@ export default function OptionWrapper(
     onShiftOptions,
     clickClose,
     withCaret,
+    isExtra,
     children,
+    ...rest
   } = props;
   const ref = useRef<HTMLDivElement>(null);
 
@@ -105,8 +107,13 @@ export default function OptionWrapper(
   drag(drop(ref));
 
   return (
-    <DragContainer ref={ref}>
-      <Option index={index} clickClose={clickClose} withCaret={withCaret}>
+    <DragContainer ref={ref} {...rest}>
+      <Option
+        index={index}
+        clickClose={clickClose}
+        withCaret={withCaret}
+        isExtra={isExtra}
+      >
         {children}
       </Option>
     </DragContainer>

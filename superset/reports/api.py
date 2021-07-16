@@ -15,17 +15,19 @@
 # specific language governing permissions and limitations
 # under the License.
 import logging
-from typing import Any
+from typing import Any, Optional
 
 from flask import g, request, Response
 from flask_appbuilder.api import expose, permission_name, protect, rison, safe
+from flask_appbuilder.hooks import before_request
 from flask_appbuilder.models.sqla.interface import SQLAInterface
 from flask_babel import ngettext
 from marshmallow import ValidationError
 
+from superset import is_feature_enabled
 from superset.charts.filters import ChartFilter
 from superset.constants import MODEL_API_RW_METHOD_PERMISSION_MAP, RouteMethod
-from superset.dashboards.filters import DashboardFilter
+from superset.dashboards.filters import DashboardAccessFilter
 from superset.databases.filters import DatabaseFilter
 from superset.models.reports import ReportSchedule
 from superset.reports.commands.bulk_delete import BulkDeleteReportScheduleCommand
@@ -61,6 +63,12 @@ logger = logging.getLogger(__name__)
 class ReportScheduleRestApi(BaseSupersetModelRestApi):
     datamodel = SQLAInterface(ReportSchedule)
 
+    @before_request
+    def ensure_alert_reports_enabled(self) -> Optional[Response]:
+        if not is_feature_enabled("ALERT_REPORTS"):
+            return self.response_404()
+        return None
+
     include_route_methods = RouteMethod.REST_MODEL_VIEW_CRUD_SET | {
         RouteMethod.RELATED,
         "bulk_delete",  # not using RouteMethod since locally defined
@@ -76,6 +84,7 @@ class ReportScheduleRestApi(BaseSupersetModelRestApi):
         "chart.id",
         "chart.slice_name",
         "context_markdown",
+        "creation_method",
         "crontab",
         "dashboard.dashboard_title",
         "dashboard.id",
@@ -95,6 +104,7 @@ class ReportScheduleRestApi(BaseSupersetModelRestApi):
         "recipients.id",
         "recipients.recipient_config_json",
         "recipients.type",
+        "report_format",
         "sql",
         "type",
         "validator_config_json",
@@ -114,6 +124,7 @@ class ReportScheduleRestApi(BaseSupersetModelRestApi):
         "created_by.first_name",
         "created_by.last_name",
         "created_on",
+        "creation_method",
         "crontab",
         "crontab_humanized",
         "id",
@@ -131,6 +142,7 @@ class ReportScheduleRestApi(BaseSupersetModelRestApi):
         "active",
         "chart",
         "context_markdown",
+        "creation_method",
         "crontab",
         "dashboard",
         "database",
@@ -140,11 +152,12 @@ class ReportScheduleRestApi(BaseSupersetModelRestApi):
         "name",
         "owners",
         "recipients",
+        "report_format",
         "sql",
         "type",
-        "working_timeout",
         "validator_config_json",
         "validator_type",
+        "working_timeout",
     ]
     edit_columns = add_columns
     add_model_schema = ReportSchedulePostSchema()
@@ -163,12 +176,18 @@ class ReportScheduleRestApi(BaseSupersetModelRestApi):
         "type",
         "crontab_humanized",
     ]
-    search_columns = ["name", "active", "created_by", "type", "last_state"]
+    search_columns = [
+        "name",
+        "active",
+        "created_by",
+        "type",
+        "last_state",
+    ]
     search_filters = {"name": [ReportScheduleAllTextFilter]}
     allowed_rel_fields = {"owners", "chart", "dashboard", "database", "created_by"}
     filter_rel_fields = {
         "chart": [["id", ChartFilter, lambda: []]],
-        "dashboard": [["id", DashboardFilter, lambda: []]],
+        "dashboard": [["id", DashboardAccessFilter, lambda: []]],
         "database": [["id", DatabaseFilter, lambda: []]],
     }
     text_field_rel_fields = {
@@ -237,6 +256,7 @@ class ReportScheduleRestApi(BaseSupersetModelRestApi):
                 "Error deleting report schedule %s: %s",
                 self.__class__.__name__,
                 str(ex),
+                exc_info=True,
             )
             return self.response_422(message=str(ex))
 
@@ -298,6 +318,7 @@ class ReportScheduleRestApi(BaseSupersetModelRestApi):
                 "Error creating report schedule %s: %s",
                 self.__class__.__name__,
                 str(ex),
+                exc_info=True,
             )
             return self.response_422(message=str(ex))
 
@@ -366,7 +387,10 @@ class ReportScheduleRestApi(BaseSupersetModelRestApi):
             return self.response_403()
         except ReportScheduleUpdateFailedError as ex:
             logger.error(
-                "Error updating report %s: %s", self.__class__.__name__, str(ex)
+                "Error updating report %s: %s",
+                self.__class__.__name__,
+                str(ex),
+                exc_info=True,
             )
             return self.response_422(message=str(ex))
 

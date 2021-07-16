@@ -22,7 +22,7 @@ import { Moment } from 'moment';
 import { isInteger } from 'lodash';
 import { Col, InputNumber, Row } from 'src/common/components';
 import { DatePicker } from 'src/components/DatePicker';
-import { Radio } from 'src/common/components/Radio';
+import { Radio } from 'src/components/Radio';
 import { Select } from 'src/components/Select';
 import { InfoTooltipWithTrigger } from '@superset-ui/chart-controls';
 import {
@@ -130,8 +130,8 @@ export function CustomFrame(props: FrameComponentProps) {
             <Row>
               <DatePicker
                 showTime
-                value={dttmToMoment(sinceDatetime)}
-                onSelect={(datetime: Moment) =>
+                defaultValue={dttmToMoment(sinceDatetime)}
+                onChange={(datetime: Moment) =>
                   onChange('sinceDatetime', datetime.format(MOMENT_FORMAT))
                 }
                 allowClear={false}
@@ -188,8 +188,8 @@ export function CustomFrame(props: FrameComponentProps) {
             <Row>
               <DatePicker
                 showTime
-                value={dttmToMoment(untilDatetime)}
-                onSelect={(datetime: Moment) =>
+                defaultValue={dttmToMoment(untilDatetime)}
+                onChange={(datetime: Moment) =>
                   onChange('untilDatetime', datetime.format(MOMENT_FORMAT))
                 }
                 allowClear={false}
@@ -247,8 +247,8 @@ export function CustomFrame(props: FrameComponentProps) {
               <Col>
                 <DatePicker
                   showTime
-                  value={dttmToMoment(anchorValue)}
-                  onSelect={(datetime: Moment) =>
+                  defaultValue={dttmToMoment(anchorValue)}
+                  onChange={(datetime: Moment) =>
                     onChange('anchorValue', datetime.format(MOMENT_FORMAT))
                   }
                   allowClear={false}
