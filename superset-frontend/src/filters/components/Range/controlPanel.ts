@@ -16,16 +16,15 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { t } from '@superset-ui/core';
+import { t } from '@apache-superset/core/translation';
 import {
   ControlPanelConfig,
-  sections,
   sharedControls,
 } from '@superset-ui/chart-controls';
+import { SingleValueType } from './SingleValueType';
 
 const config: ControlPanelConfig = {
   controlPanelSections: [
-    sections.legacyRegularTime,
     {
       label: t('Query'),
       expanded: true,
@@ -35,7 +34,7 @@ const config: ControlPanelConfig = {
             name: 'groupby',
             config: {
               ...sharedControls.groupby,
-              label: 'Column',
+              label: t('Column'),
               required: true,
             },
           },
@@ -51,10 +50,21 @@ const config: ControlPanelConfig = {
             name: 'enableEmptyFilter',
             config: {
               type: 'CheckboxControl',
-              label: t('Required'),
+              label: () => t('Filter value is required'),
               default: false,
               renderTrigger: true,
-              description: t('User must select a value for this filter.'),
+              description: () =>
+                t('User must select a value before applying the filter'),
+            },
+          },
+          {
+            name: 'enableSingleValue',
+            config: {
+              type: 'CheckboxControl',
+              label: () => t('Single value'),
+              default: SingleValueType.Exact,
+              renderTrigger: true,
+              description: () => t('Use only a single value.'),
             },
           },
         ],

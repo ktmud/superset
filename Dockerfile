@@ -16,150 +16,428 @@
 #
 
 ######################################################################
-# PY stage that simply does a pip install on our requirements
-######################################################################
-ARG PY_VER=3.8.12
-FROM python:${PY_VER} AS superset-py
-
-RUN mkdir /app \
-        && apt-get update -y \
-        && apt-get install -y --no-install-recommends \
-            build-essential \
-            default-libmysqlclient-dev \
-            libpq-dev \
-            libsasl2-dev \
-            libecpg-dev \
-        && rm -rf /var/lib/apt/lists/*
-
-# First, we just wanna install requirements, which will allow us to utilize the cache
-# in order to only build if and only if requirements change
-COPY ./requirements/*.txt  /app/requirements/
-COPY setup.py MANIFEST.in README.md /app/
-COPY superset-frontend/package.json /app/superset-frontend/
-RUN cd /app \
-    && mkdir -p superset/static \
-    && touch superset/static/version_info.json \
-    && pip install --no-cache -r requirements/local.txt
-
-
-######################################################################
 # Node stage to deal with static asset construction
 ######################################################################
-FROM node:16 AS superset-node
+# Base images are pinned by digest so builds are reproducible and cached
+# stages don't silently outlive base image updates. Renovate
+# (.github/renovate.json) refreshes the digests weekly; when changing a tag
+# by hand, bump its digest too. PY_VER carries its digest, so overriding it
+# (e.g. the py311/py312 presets) replaces both.
+ARG PY_VER=3.11-slim-trixie@sha256:07d4824036af339fa1b6ef769cc99d9c10a141769538b52b3b597c84f7a7b535
 
-ARG NPM_VER=7
-RUN npm install -g npm@${NPM_VER}
+# If BUILDPLATFORM is null, set it to 'amd64' (or leave as is otherwise).
+ARG BUILDPLATFORM=${BUILDPLATFORM:-amd64}
 
+# Include translations in the final build
+ARG BUILD_TRANSLATIONS="false"
+
+######################################################################
+# system-ca exposes the system CA bundle of the pinned python image. The
+# node base images ship no CA store, so the Node stages copy this one in
+# and verify TLS against the same store as the Python stages, rather than
+# Node's built-in CA list.
+######################################################################
+FROM python:${PY_VER} AS system-ca
+
+######################################################################
+# superset-node-manifests holds only the npm manifests of the frontend
+# tree (the root package.json + lockfile, .npmrc, and every workspace package.json),
+# so the `npm ci` layer in superset-node-ci can see the workspaces and is
+# cached on dependency declarations alone, not on every source change.
+# Docker cannot COPY a glob while keeping the directory structure, hence
+# the copy-then-prune stage.
+######################################################################
+FROM --platform=${BUILDPLATFORM} node:24-trixie-slim@sha256:af02d57b57719b9657a45199a79264a9437940cd55b3c7b3fc99615654f124a0 AS superset-node-manifests
+WORKDIR /app/superset-frontend
+COPY superset-frontend /app/superset-frontend
+RUN find . -type f ! -name package.json ! -name package-lock.json ! -name .npmrc -delete \
+    && find . -depth -type d -empty -delete
+
+######################################################################
+# superset-node-ci used as a base for building frontend assets and CI
+######################################################################
+FROM --platform=${BUILDPLATFORM} node:24-trixie-slim@sha256:af02d57b57719b9657a45199a79264a9437940cd55b3c7b3fc99615654f124a0 AS superset-node-ci
+ARG BUILD_TRANSLATIONS
+ENV BUILD_TRANSLATIONS=${BUILD_TRANSLATIONS}
+ARG DEV_MODE="false"           # Skip frontend build in dev mode
+ENV DEV_MODE=${DEV_MODE}
+
+COPY docker/ /app/docker/
+# Arguments for build configuration
 ARG NPM_BUILD_CMD="build"
-ENV BUILD_CMD=${NPM_BUILD_CMD}
 
-# NPM ci first, as to NOT invalidate previous steps except for when package.json changes
-RUN mkdir -p /app/superset-frontend
-RUN mkdir -p /app/superset/assets
-COPY ./docker/frontend-mem-nag.sh /
-COPY ./superset-frontend/package* /app/superset-frontend/
-RUN /frontend-mem-nag.sh \
-        && cd /app/superset-frontend \
-        && npm ci
+# Install system dependencies required for node-gyp
+RUN /app/docker/apt-install.sh build-essential python3 zstd
 
-# Next, copy in the rest and let webpack do its thing
-COPY ./superset-frontend /app/superset-frontend
-# This seems to be the most expensive step
-RUN cd /app/superset-frontend \
-        && npm run ${BUILD_CMD} \
-        && rm -rf node_modules
+# Define environment variables for frontend build
+ENV BUILD_CMD=${NPM_BUILD_CMD} \
+    PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 
+# Run the frontend memory monitoring script
+RUN /app/docker/frontend-mem-nag.sh
+
+WORKDIR /app/superset-frontend
+
+# Create necessary folders to avoid errors in subsequent steps
+RUN mkdir -p /app/superset/static/assets \
+             /app/superset/translations
+
+# Harden `npm ci` against transient npm-registry network blips (e.g. ECONNRESET),
+# which otherwise fail the entire multi-platform image build with no retry.
+ENV npm_config_fetch_retries=5 \
+    npm_config_fetch_retry_mintimeout=20000 \
+    npm_config_fetch_retry_maxtimeout=120000 \
+    npm_config_fetch_timeout=600000
+
+# Verify TLS against the system CA store (see system-ca)
+COPY --from=system-ca /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+ENV NODE_OPTIONS=--use-openssl-ca \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+
+# Install dependencies from the manifests alone (root + workspaces) if not in
+# dev mode. With the workspace package.json files present, npm ci links the
+# workspaces and installs their dependencies too, so the CI jobs that run
+# in this image do not need an `npm i` of their own.
+COPY --from=superset-node-manifests /app/superset-frontend /app/superset-frontend
+RUN --mount=type=cache,target=/root/.cache \
+    --mount=type=cache,target=/root/.npm \
+    if [ "${DEV_MODE}" = "false" ]; then \
+        npm ci; \
+    else \
+        echo "Skipping 'npm ci' in dev mode"; \
+    fi
+
+# Runs the webpack build process
+COPY superset-frontend /app/superset-frontend
+
+######################################################################
+# superset-node is used for compiling frontend assets
+######################################################################
+FROM superset-node-ci AS superset-node
+
+# Build the frontend if not in dev mode
+RUN --mount=type=cache,target=/root/.npm \
+    if [ "${DEV_MODE}" = "false" ]; then \
+        echo "Running 'npm run ${BUILD_CMD}'"; \
+        npm run ${BUILD_CMD}; \
+    else \
+        echo "Skipping 'npm run ${BUILD_CMD}' in dev mode"; \
+    fi;
+
+# Copy translation files
+COPY superset/translations /app/superset/translations
+
+# Build translations if enabled, then cleanup localization files
+RUN if [ "${BUILD_TRANSLATIONS}" = "true" ]; then \
+        npm run build-translation; \
+    fi; \
+    rm -rf /app/superset/translations/*/*/*.[po,mo];
+
+
+######################################################################
+# superset-websocket builds the realtime WebSocket (Node) server that
+# ships in the official image, launched via docker/entrypoints/run-websocket.sh
+######################################################################
+FROM node:24-trixie-slim@sha256:af02d57b57719b9657a45199a79264a9437940cd55b3c7b3fc99615654f124a0 AS superset-websocket
+
+# Harden `npm ci` against transient npm-registry network blips (e.g. ECONNRESET).
+ENV npm_config_fetch_retries=5 \
+    npm_config_fetch_retry_mintimeout=20000 \
+    npm_config_fetch_retry_maxtimeout=120000 \
+    npm_config_fetch_timeout=600000
+
+# Verify TLS against the system CA store (see system-ca)
+COPY --from=system-ca /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+ENV NODE_OPTIONS=--use-openssl-ca \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+
+WORKDIR /app/superset-websocket
+
+# Install against the lockfile first (cached until it changes), then bundle the
+# TypeScript server into a single self-contained CJS file (esbuild inlines every
+# dependency), so the runtime image needs only the Node binary and dist/ — no
+# node_modules to ship.
+COPY superset-websocket/package.json superset-websocket/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+COPY superset-websocket/ ./
+RUN npm run build
+
+
+######################################################################
+# Base python layer
+######################################################################
+FROM python:${PY_VER} AS python-base
+
+ARG SUPERSET_HOME="/app/superset_home"
+ENV SUPERSET_HOME=${SUPERSET_HOME}
+
+RUN mkdir -p ${SUPERSET_HOME}
+RUN useradd --user-group -d ${SUPERSET_HOME} -m --no-log-init --shell /bin/bash superset \
+    && chmod -R 1777 ${SUPERSET_HOME} \
+    && chown -R superset:superset ${SUPERSET_HOME}
+
+# Some bash scripts needed throughout the layers
+COPY --chmod=755 docker/*.sh /app/docker/
+
+# Use the system CA store for every download in the Python stages, rather than
+# the CA lists pip and uv bundle. UV_SYSTEM_CERTS needs uv>=0.11.0.
+ENV PIP_CERT=/etc/ssl/certs/ca-certificates.crt \
+    UV_SYSTEM_CERTS=true
+
+RUN pip install --no-cache-dir --upgrade "uv>=0.11.0"
+
+# Using uv as it's faster/simpler than pip
+RUN uv venv /app/.venv
+ENV PATH="/app/.venv/bin:${PATH}"
+
+######################################################################
+# Python translation compiler layer
+######################################################################
+FROM python-base AS python-translation-compiler
+
+ARG BUILD_TRANSLATIONS
+ENV BUILD_TRANSLATIONS=${BUILD_TRANSLATIONS}
+
+# Install Python dependencies using docker/pip-install.sh
+COPY requirements/translations.txt requirements/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    . /app/.venv/bin/activate && /app/docker/pip-install.sh --requires-build-essential -r requirements/translations.txt
+
+COPY superset/translations/ /app/translations_mo/
+RUN if [ "${BUILD_TRANSLATIONS}" = "true" ]; then \
+        pybabel compile --use-fuzzy -d /app/translations_mo || true; \
+    fi; \
+    rm -f /app/translations_mo/*/*/*.[po,json]
+
+######################################################################
+# Python APP common layer
+######################################################################
+FROM python-base AS python-common
+
+ENV SUPERSET_HOME="/app/superset_home" \
+    HOME="/app/superset_home" \
+    SUPERSET_ENV="production" \
+    FLASK_APP="superset.app:create_app()" \
+    PYTHONPATH="/app/pythonpath" \
+    SUPERSET_PORT="8088"
+
+# Copy the entrypoints, make them executable in userspace
+COPY --chmod=755 docker/entrypoints /app/docker/entrypoints
+
+WORKDIR /app
+# Set up necessary directories
+RUN mkdir -p \
+      ${PYTHONPATH} \
+      superset/static \
+      requirements \
+      superset-frontend \
+      apache_superset.egg-info \
+      requirements \
+    && touch superset/static/version_info.json
+
+# Optionally install Playwright and the headless Chromium used for screenshots.
+# `playwright install` runs on Playwright's bundled Node; --use-openssl-ca makes
+# it use the system CA store, consistent with the rest of the build.
+ENV PLAYWRIGHT_BROWSERS_PATH=/usr/local/share/playwright-browsers
+
+ARG INCLUDE_CHROMIUM="false"
+RUN --mount=type=cache,target=${SUPERSET_HOME}/.cache/uv \
+    if [ "${INCLUDE_CHROMIUM}" = "true" ]; then \
+        /app/docker/apt-install.sh libatomic1 && \
+        uv pip install playwright && \
+        playwright install-deps && \
+        NODE_OPTIONS=--use-openssl-ca SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+            playwright install chromium; \
+    else \
+        echo "Skipping browser installation"; \
+    fi
+
+# Copy required files for Python build
+COPY pyproject.toml setup.py MANIFEST.in README.md ./
+COPY superset-frontend/package.json superset-frontend/
+COPY scripts/check-env.py scripts/
+
+# keeping for backward compatibility
+COPY --chmod=755 ./docker/entrypoints/run-server.sh /usr/bin/
+
+# Some debian libs
+RUN /app/docker/apt-install.sh \
+      curl \
+      libsasl2-dev \
+      libsasl2-modules-gssapi-mit \
+      libpq-dev \
+      libldap2-dev
+
+# Create data directory for DuckDB examples database
+# The database file will be created at runtime when examples are loaded from Parquet files
+RUN mkdir -p /app/data && chown -R superset:superset /app/data
+
+# --- Realtime WebSocket server (part of the official image) ---------------
+# The realtime transport (superset-websocket) is a Node service, bundled by
+# esbuild into a single self-contained file. Copy the Node runtime plus that
+# bundle so every image built from this stage can launch it via an alternate
+# entrypoint (docker/entrypoints/run-websocket.sh) rather than needing a separate
+# image. This lives here rather than in a single downstream stage so the lean and
+# dev images both ship it — docker-compose-non-dev.yml runs the websocket service
+# from the dev target.
+RUN /app/docker/apt-install.sh libstdc++6
+COPY --from=superset-websocket /usr/local/bin/node /usr/local/bin/node
+COPY --from=superset-websocket --chown=superset:superset \
+    /app/superset-websocket/dist /app/superset-websocket/dist
+
+HEALTHCHECK CMD /app/docker/docker-healthcheck.sh
+CMD ["/app/docker/entrypoints/run-server.sh"]
+EXPOSE ${SUPERSET_PORT}
 
 ######################################################################
 # Final lean image...
 ######################################################################
-ARG PY_VER=3.8.12
-FROM python:${PY_VER} AS lean
+FROM python-common AS lean
 
-ENV LANG=C.UTF-8 \
-    LC_ALL=C.UTF-8 \
-    FLASK_ENV=production \
-    FLASK_APP="superset.app:create_app()" \
-    PYTHONPATH="/app/pythonpath" \
-    SUPERSET_HOME="/app/superset_home" \
-    SUPERSET_PORT=8088
+# Install Python dependencies using docker/pip-install.sh.
+# Requirements are installed *before* the application source is copied
+# below so that source-only changes don't bust this (slow, network-bound)
+# cache layer or defeat --cache-from.
+COPY requirements/base.txt requirements/
 
-RUN mkdir -p ${PYTHONPATH} \
-        && useradd --user-group -d ${SUPERSET_HOME} -m --no-log-init --shell /bin/bash superset \
-        && apt-get update -y \
-        && apt-get install -y --no-install-recommends \
-            build-essential \
-            default-libmysqlclient-dev \
-            libsasl2-modules-gssapi-mit \
-            libpq-dev \
-        && rm -rf /var/lib/apt/lists/*
+# Copy superset-core package needed for editable install in base.txt
+COPY superset-core superset-core
 
-COPY --from=superset-py /usr/local/lib/python3.8/site-packages/ /usr/local/lib/python3.8/site-packages/
-# Copying site-packages doesn't move the CLIs, so let's copy them one by one
-COPY --from=superset-py /usr/local/bin/gunicorn /usr/local/bin/celery /usr/local/bin/flask /usr/bin/
-COPY --from=superset-node /app/superset/static/assets /app/superset/static/assets
-COPY --from=superset-node /app/superset-frontend /app/superset-frontend
+RUN --mount=type=cache,target=${SUPERSET_HOME}/.cache/uv \
+    /app/docker/pip-install.sh --requires-build-essential -r requirements/base.txt
 
-## Lastly, let's install superset itself
-COPY superset /app/superset
-COPY setup.py MANIFEST.in README.md /app/
-RUN cd /app \
-        && chown -R superset:superset * \
-        && pip install -e .
+# Copy compiled frontend assets and application source now that
+# dependencies have been resolved and cached above.
+COPY --from=superset-node /app/superset/static/assets superset/static/assets
+# Copy service.worker.js optionally as it doesn't exist when DEV_MODE=true
+COPY --from=superset-node /app/superset/static/service-worker.j[s] superset/static/service-worker.js
 
-COPY ./docker/docker-entrypoint.sh /usr/bin/
+# TODO, when the next version comes out, use --exclude superset/translations
+COPY superset superset
+# TODO in the meantime, remove the .po files
+RUN rm superset/translations/*/*/*.po
 
-WORKDIR /app
+# Merging translations from backend and frontend stages
+COPY --from=superset-node /app/superset/translations superset/translations
+COPY --from=python-translation-compiler /app/translations_mo superset/translations
+
+# Install the superset package itself. --no-deps because its dependencies
+# were already installed from requirements/base.txt above, so this layer
+# stays fast even though the source copy above changes on every edit.
+RUN --mount=type=cache,target=${SUPERSET_HOME}/.cache/uv \
+    uv pip install -e . --no-deps
+RUN python -m compileall /app/superset
 
 USER superset
 
-HEALTHCHECK CMD curl -f "http://localhost:$SUPERSET_PORT/health"
+######################################################################
+# Batteries-included default image: lean + common drivers, MCP and a
+# headless Chromium. This is the image published under the plain tags
+# (latest, master, <version>); the minimal image ships as `lean`.
+######################################################################
+FROM lean AS superset
+USER root
 
-EXPOSE ${SUPERSET_PORT}
+# mysqlclient needs the MySQL client dev headers + pkg-config to build.
+# Playwright's bundled Node needs libatomic before installing browser dependencies.
+# Keep these extra dependencies out of the minimal `lean` stage.
+RUN /app/docker/apt-install.sh \
+    libatomic1 \
+    pkg-config \
+    default-libmysqlclient-dev
 
-ENTRYPOINT ["/usr/bin/docker-entrypoint.sh"]
+# Bundle the common metadata/analytics drivers (postgres, mysql) and the
+# MCP server dependencies (fastmcp) so the default image is usable without
+# layering extra packages. Routed through pip-install.sh because mysqlclient
+# is a source dist that needs a C compiler to build; the helper installs
+# build-essential just for the build and purges it afterward (the lean base
+# ships no compiler). The mysql client lib installed above stays, so the
+# compiled extension can link against it at runtime.
+RUN --mount=type=cache,target=${SUPERSET_HOME}/.cache/uv \
+    /app/docker/pip-install.sh --requires-build-essential .[postgres,mysql,fastmcp]
+
+# Bundle Playwright + a headless Chromium so Alerts & Reports and thumbnail
+# generation work out of the box. Installed directly (rather than via the
+# INCLUDE_CHROMIUM build arg on python-common) because this stage builds
+# FROM lean, which is already past that arg. Chromium ships for both
+# linux/amd64 and linux/arm64, so this works on multi-platform builds.
+# See the INCLUDE_CHROMIUM step in python-common for --use-openssl-ca.
+RUN --mount=type=cache,target=${SUPERSET_HOME}/.cache/uv \
+    uv pip install playwright \
+    && playwright install-deps \
+    && NODE_OPTIONS=--use-openssl-ca SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+        playwright install chromium
+
+USER superset
 
 ######################################################################
 # Dev image...
 ######################################################################
-FROM lean AS dev
-ARG GECKODRIVER_VERSION=v0.28.0
-ARG FIREFOX_VERSION=88.0
+FROM python-common AS dev
 
-COPY ./requirements/*.txt ./docker/requirements-*.txt/ /app/requirements/
+# Debian libs needed for dev
+RUN /app/docker/apt-install.sh \
+    git \
+    pkg-config \
+    default-libmysqlclient-dev
 
-USER root
+# Copy development requirements and install them *before* the application
+# source is copied below, so source-only edits don't bust this cache layer.
+COPY requirements/*.txt requirements/
 
-RUN apt-get update -y \
-    && apt-get install -y --no-install-recommends libnss3 libdbus-glib-1-2 libgtk-3-0 libx11-xcb1
+# Copy local packages needed for editable installs in development.txt
+COPY superset-core superset-core
+COPY superset-extensions-cli superset-extensions-cli
 
-# Install GeckoDriver WebDriver
-RUN wget https://github.com/mozilla/geckodriver/releases/download/${GECKODRIVER_VERSION}/geckodriver-${GECKODRIVER_VERSION}-linux64.tar.gz -O /tmp/geckodriver.tar.gz && \
-    tar xvfz /tmp/geckodriver.tar.gz -C /tmp && \
-    mv /tmp/geckodriver /usr/local/bin/geckodriver && \
-    rm /tmp/geckodriver.tar.gz
+# requirements/development.txt is generated by `uv pip compile` and embeds
+# `-e .` (an editable install of this same package) as its first line. That
+# self-reference needs the full superset/ source tree, which hasn't been
+# copied in yet at this point, so it's stripped here; the real editable
+# install of `.` runs below, once the source is present.
+RUN --mount=type=cache,target=${SUPERSET_HOME}/.cache/uv \
+    grep -vxF -- "-e ." requirements/development.txt > requirements/development-deps.txt && \
+    /app/docker/pip-install.sh --requires-build-essential -r requirements/development-deps.txt
 
-# Install Firefox
-RUN wget https://download-installer.cdn.mozilla.net/pub/firefox/releases/${FIREFOX_VERSION}/linux-x86_64/en-US/firefox-${FIREFOX_VERSION}.tar.bz2 -O /opt/firefox.tar.bz2 && \
-    tar xvf /opt/firefox.tar.bz2 -C /opt && \
-    ln -s /opt/firefox/firefox /usr/local/bin/firefox
+# Copy compiled frontend assets and application source now that
+# dependencies have been resolved and cached above.
+COPY --from=superset-node /app/superset/static/assets superset/static/assets
+# Copy service.worker.js optionally as it doesn't exist when DEV_MODE=true
+COPY --from=superset-node /app/superset/static/service-worker.j[s] superset/static/service-worker.js
 
-# Cache everything for dev purposes...
-RUN cd /app \
-    && pip install --no-cache -r requirements/docker.txt \
-    && pip install --no-cache -r requirements/requirements-local.txt || true
+# TODO, when the next version comes out, use --exclude superset/translations
+COPY superset superset
+# TODO in the meantime, remove the .po files
+RUN rm superset/translations/*/*/*.po
+
+# Merging translations from backend and frontend stages
+COPY --from=superset-node /app/superset/translations superset/translations
+COPY --from=python-translation-compiler /app/translations_mo superset/translations
+
+# Install the superset package together with its postgres extra, using the
+# same uv cache mount as the requirements install above. --no-deps because
+# all dependencies (including the postgres extra's psycopg2-binary) are
+# already installed from requirements/development.txt above.
+# NOTE: source is bind-mounted over /app/superset in DEV_MODE, so a
+# compileall pass here would be wasted work; unlike `lean`, `dev` skips it.
+RUN --mount=type=cache,target=${SUPERSET_HOME}/.cache/uv \
+    uv pip install -e .[postgres] --no-deps
+
 USER superset
-
 
 ######################################################################
 # CI image...
 ######################################################################
 FROM lean AS ci
+USER root
+RUN uv pip install .[postgres,duckdb]
+USER superset
+CMD ["/app/docker/entrypoints/docker-ci.sh"]
 
-COPY --chown=superset ./docker/docker-bootstrap.sh /app/docker/
-COPY --chown=superset ./docker/docker-init.sh /app/docker/
-COPY --chown=superset ./docker/docker-ci.sh /app/docker/
-
-RUN chmod a+x /app/docker/*.sh
-
-CMD /app/docker/docker-ci.sh
+######################################################################
+# Showtime image - lean + DuckDB for examples database
+######################################################################
+FROM lean AS showtime
+USER root
+RUN uv pip install .[duckdb]
+USER superset
+CMD ["/app/docker/entrypoints/docker-ci.sh"]

@@ -14,66 +14,98 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-import json
 import string
+from operator import or_
 from random import choice, randint, random, uniform
-from typing import Any, Dict, List
+from typing import Any
 
 import pandas as pd
 import pytest
 from pandas import DataFrame
-from sqlalchemy import DateTime, String, TIMESTAMP
+from sqlalchemy import DateTime, String, text
 
 from superset import db
 from superset.connectors.sqla.models import SqlaTable
 from superset.models.core import Database
 from superset.models.dashboard import Dashboard
 from superset.models.slice import Slice
-from superset.utils.core import get_example_database
+from superset.reports.models import ReportSchedule
+from superset.utils import json
+from superset.utils.core import get_example_default_schema
+from superset.utils.database import get_example_database
 from tests.integration_tests.dashboard_utils import (
     create_dashboard,
-    create_table_for_dashboard,
+    create_table_metadata,
 )
 from tests.integration_tests.test_app import app
 
-
-@pytest.fixture()
-def load_world_bank_dashboard_with_slices():
-    dash_id_to_delete, slices_ids_to_delete = _load_data()
-    yield
-    with app.app_context():
-        _cleanup(dash_id_to_delete, slices_ids_to_delete)
+WB_HEALTH_POPULATION = "wb_health_population"
 
 
-@pytest.fixture(scope="module")
-def load_world_bank_dashboard_with_slices_module_scope():
-    dash_id_to_delete, slices_ids_to_delete = _load_data()
-    yield
-    with app.app_context():
-        _cleanup(dash_id_to_delete, slices_ids_to_delete)
-
-
-def _load_data():
-    table_name = "wb_health_population"
-
+@pytest.fixture(scope="session")
+def load_world_bank_data():
     with app.app_context():
         database = get_example_database()
-        df = _get_dataframe(database)
         dtype = {
             "year": DateTime if database.backend != "presto" else String(255),
             "country_code": String(3),
             "country_name": String(255),
             "region": String(255),
         }
-        table = create_table_for_dashboard(df, table_name, database, dtype)
-        slices = _create_world_bank_slices(table)
-        dash = _create_world_bank_dashboard(table, slices)
-        slices_ids_to_delete = [slice.id for slice in slices]
-        dash_id_to_delete = dash.id
-        return dash_id_to_delete, slices_ids_to_delete
+        with database.get_sqla_engine() as engine:
+            _get_dataframe(database).to_sql(
+                WB_HEALTH_POPULATION,
+                engine,
+                if_exists="replace",
+                chunksize=500,
+                dtype=dtype,
+                index=False,
+                method="multi",
+                schema=get_example_default_schema(),
+            )
+
+    yield
+    with app.app_context():
+        with get_example_database().get_sqla_engine() as engine:
+            with engine.begin() as conn:
+                conn.execute(text("DROP TABLE IF EXISTS wb_health_population"))
 
 
-def _create_world_bank_slices(table: SqlaTable) -> List[Slice]:
+@pytest.fixture
+def load_world_bank_dashboard_with_slices(load_world_bank_data):
+    with app.app_context():
+        dash_id_to_delete, slices_ids_to_delete = create_dashboard_for_loaded_data()
+        yield
+        _cleanup(dash_id_to_delete, slices_ids_to_delete)
+
+
+@pytest.fixture(scope="module")
+def load_world_bank_dashboard_with_slices_module_scope(load_world_bank_data):
+    with app.app_context():
+        dash_id_to_delete, slices_ids_to_delete = create_dashboard_for_loaded_data()
+        yield
+        _cleanup_reports(dash_id_to_delete, slices_ids_to_delete)
+        _cleanup(dash_id_to_delete, slices_ids_to_delete)
+
+
+@pytest.fixture(scope="class")
+def load_world_bank_dashboard_with_slices_class_scope(load_world_bank_data):
+    with app.app_context():
+        dash_id_to_delete, slices_ids_to_delete = create_dashboard_for_loaded_data()
+        yield
+        _cleanup(dash_id_to_delete, slices_ids_to_delete)
+
+
+def create_dashboard_for_loaded_data():
+    table = create_table_metadata(WB_HEALTH_POPULATION, get_example_database())
+    slices = _create_world_bank_slices(table)
+    dash = _create_world_bank_dashboard(table)
+    slices_ids_to_delete = [slice.id for slice in slices]
+    dash_id_to_delete = dash.id
+    return dash_id_to_delete, slices_ids_to_delete
+
+
+def _create_world_bank_slices(table: SqlaTable) -> list[Slice]:
     from superset.examples.world_bank import create_slices
 
     slices = create_slices(table)
@@ -81,7 +113,7 @@ def _create_world_bank_slices(table: SqlaTable) -> List[Slice]:
     return slices
 
 
-def _commit_slices(slices: List[Slice]):
+def _commit_slices(slices: list[Slice]):
     for slice in slices:
         o = db.session.query(Slice).filter_by(slice_name=slice.slice_name).one_or_none()
         if o:
@@ -90,13 +122,12 @@ def _commit_slices(slices: List[Slice]):
         db.session.commit()
 
 
-def _create_world_bank_dashboard(table: SqlaTable, slices: List[Slice]) -> Dashboard:
+def _create_world_bank_dashboard(table: SqlaTable) -> Dashboard:
+    from superset.examples.helpers import update_slice_ids
     from superset.examples.world_bank import dashboard_positions
 
     pos = dashboard_positions
-    from superset.examples.helpers import update_slice_ids
-
-    update_slice_ids(pos, slices)
+    slices = update_slice_ids(pos)
 
     table.fetch_metadata()
 
@@ -108,13 +139,24 @@ def _create_world_bank_dashboard(table: SqlaTable, slices: List[Slice]) -> Dashb
     return dash
 
 
-def _cleanup(dash_id: int, slices_ids: List[int]) -> None:
-    engine = get_example_database().get_sqla_engine()
-    engine.execute("DROP TABLE IF EXISTS wb_health_population")
+def _cleanup(dash_id: int, slices_ids: list[int]) -> None:
     dash = db.session.query(Dashboard).filter_by(id=dash_id).first()
     db.session.delete(dash)
     for slice_id in slices_ids:
         db.session.query(Slice).filter_by(id=slice_id).delete()
+    db.session.commit()
+
+
+def _cleanup_reports(dash_id: int, slices_ids: list[int]) -> None:
+    reports = db.session.query(ReportSchedule).filter(
+        or_(
+            ReportSchedule.dashboard_id == dash_id,
+            ReportSchedule.chart_id.in_(slices_ids),
+        )
+    )
+
+    for report in reports:
+        db.session.delete(report)
     db.session.commit()
 
 
@@ -130,25 +172,25 @@ def _get_dataframe(database: Database) -> DataFrame:
     return df
 
 
-def _get_world_bank_data() -> List[Dict[Any, Any]]:
+def _get_world_bank_data() -> list[dict[Any, Any]]:
     data = []
     for _ in range(100):
         data.append(
             {
                 "country_name": "".join(
-                    choice(string.ascii_uppercase + string.ascii_lowercase + " ")
-                    for _ in range(randint(3, 10))
+                    choice(string.ascii_uppercase + string.ascii_lowercase + " ")  # noqa: S311
+                    for _ in range(randint(3, 10))  # noqa: S311
                 ),
                 "country_code": "".join(
-                    choice(string.ascii_uppercase + string.ascii_lowercase)
+                    choice(string.ascii_uppercase + string.ascii_lowercase)  # noqa: S311
                     for _ in range(3)
                 ),
                 "region": "".join(
-                    choice(string.ascii_uppercase + string.ascii_lowercase)
-                    for _ in range(randint(3, 10))
+                    choice(string.ascii_uppercase + string.ascii_lowercase)  # noqa: S311
+                    for _ in range(randint(3, 10))  # noqa: S311
                 ),
                 "year": "-".join(
-                    [str(randint(1900, 2020)), str(randint(1, 12)), str(randint(1, 28))]
+                    [str(randint(1900, 2020)), str(randint(1, 12)), str(randint(1, 28))]  # noqa: S311
                 ),
                 "NY_GNP_PCAP_CD": get_random_float_or_none(0, 100, 0.3),
                 "SE_ADT_1524_LT_FM_ZS": get_random_float_or_none(0, 100, 0.3),
@@ -481,7 +523,7 @@ def _get_world_bank_data() -> List[Dict[Any, Any]]:
 
 
 def get_random_float_or_none(min_value, max_value, none_probability):
-    if random() < none_probability:
+    if random() < none_probability:  # noqa: S311
         return None
     else:
-        return uniform(min_value, max_value)
+        return uniform(min_value, max_value)  # noqa: S311

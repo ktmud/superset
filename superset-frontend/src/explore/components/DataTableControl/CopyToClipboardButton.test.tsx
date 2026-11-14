@@ -16,26 +16,69 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import userEvent from '@testing-library/user-event';
-import React from 'react';
-import { render, screen } from 'spec/helpers/testing-library';
+import {
+  render,
+  screen,
+  userEvent,
+  waitFor,
+} from 'spec/helpers/testing-library';
 import { CopyToClipboardButton } from '.';
 
 test('Render a button', () => {
-  render(<CopyToClipboardButton data={{ copy: 'data', data: 'copy' }} />, {
+  render(<CopyToClipboardButton data={[{ copy: 'data', data: 'copy' }]} />, {
     useRedux: true,
   });
   expect(screen.getByRole('button')).toBeInTheDocument();
 });
 
-test('Should copy to clipboard', () => {
-  document.execCommand = jest.fn();
+test('Should copy to clipboard', async () => {
+  const callback = jest.fn();
+  document.execCommand = callback;
 
-  render(<CopyToClipboardButton data={{ copy: 'data', data: 'copy' }} />, {
+  const originalClipboard = { ...global.navigator.clipboard };
+  // @ts-expect-error
+  global.navigator.clipboard = { write: callback, writeText: callback };
+
+  render(<CopyToClipboardButton data={[{ copy: 'data', data: 'copy' }]} />, {
     useRedux: true,
   });
 
-  expect(document.execCommand).toHaveBeenCalledTimes(0);
-  userEvent.click(screen.getByRole('button'));
-  expect(document.execCommand).toHaveBeenCalledWith('copy');
+  expect(callback).toHaveBeenCalledTimes(0);
+  await userEvent.click(screen.getByRole('button'));
+
+  await waitFor(() => {
+    expect(callback).toHaveBeenCalled();
+  });
+
+  jest.resetAllMocks();
+  // @ts-expect-error
+  global.navigator.clipboard = originalClipboard;
+});
+
+test('Should not copy to clipboard when disabled', async () => {
+  const callback = jest.fn();
+  document.execCommand = callback;
+
+  const originalClipboard = { ...global.navigator.clipboard };
+  // @ts-expect-error
+  global.navigator.clipboard = { write: callback, writeText: callback };
+
+  render(
+    <CopyToClipboardButton data={[{ copy: 'data', data: 'copy' }]} disabled />,
+    {
+      useRedux: true,
+    },
+  );
+
+  const copyButton = screen.getByRole('button');
+  expect(copyButton).toHaveAttribute('aria-disabled', 'true');
+  await userEvent.click(copyButton);
+
+  await waitFor(() => {
+    expect(callback).not.toHaveBeenCalled();
+  });
+
+  jest.resetAllMocks();
+  // @ts-expect-error
+  global.navigator.clipboard = originalClipboard;
 });

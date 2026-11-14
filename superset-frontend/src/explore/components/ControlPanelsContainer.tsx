@@ -17,52 +17,105 @@
  * under the License.
  */
 /* eslint camelcase: 0 */
-import React from 'react';
-import { bindActionCreators } from 'redux';
-import { connect } from 'react-redux';
+import {
+  cloneElement,
+  isValidElement,
+  ReactNode,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import { t } from '@apache-superset/core/translation';
 import {
   ensureIsArray,
-  t,
-  styled,
   getChartControlPanelRegistry,
   QueryFormData,
   DatasourceType,
-  css,
+  isDefined,
+  JsonValue,
+  NO_TIME_RANGE,
+  usePrevious,
+  isFeatureEnabled,
+  FeatureFlag,
+  VizType,
 } from '@superset-ui/core';
+import {
+  styled,
+  css,
+  SupersetTheme,
+  useTheme,
+} from '@apache-superset/core/theme';
 import {
   ControlPanelSectionConfig,
   ControlState,
   CustomControlItem,
-  DatasourceMeta,
+  Dataset,
   ExpandedControlItem,
-  InfoTooltipWithTrigger,
+  isCustomControlItem,
+  getHeaderGroupsControlProps,
+  headerGroupsHaveSameContent,
+  isTemporalColumn,
   sections,
+  syncTimeComparisonGroups,
+  type HeaderGroupConfig,
 } from '@superset-ui/chart-controls';
+import { useSelector } from 'react-redux';
+import { kebabCase, isEqual } from 'lodash-es';
 
-import Collapse from 'src/components/Collapse';
-import Tabs from 'src/components/Tabs';
-import { PluginContext } from 'src/components/DynamicPlugins';
-import Loading from 'src/components/Loading';
+import {
+  Collapse,
+  Loading,
+  Label,
+  Tooltip,
+} from '@superset-ui/core/components';
+import Tabs from '@superset-ui/core/components/Tabs';
+import { PluginContext } from 'src/components';
+import { useConfirmModal } from 'src/hooks/useConfirmModal';
 
 import { getSectionsToRender } from 'src/explore/controlUtils';
-import {
-  ExploreActions,
-  exploreActions,
-} from 'src/explore/actions/exploreActions';
-import { ExplorePageState } from 'src/explore/reducers/getInitialState';
-import { ChartState } from 'src/explore/types';
-
+import { ExploreActions } from 'src/explore/actions/exploreActions';
+import { ChartState, ExplorePageState } from 'src/explore/types';
+import { Icons } from '@superset-ui/core/components/Icons';
 import ControlRow from './ControlRow';
 import Control from './Control';
+import { ExploreAlert } from './ExploreAlert';
+import { RunQueryButton } from './RunQueryButton';
+import { CONTROL_SECTIONS_ID, Operators } from '../constants';
+import { Clauses } from './controls/FilterControl/types';
+import StashFormDataContainer from './StashFormDataContainer';
+
+const TABS_KEYS = {
+  DATA: 'DATA',
+  CUSTOMIZE: 'CUSTOMIZE',
+  MATRIXIFY: 'MATRIXIFY',
+};
+
+// Table charts don't support matrixify feature
+const MATRIXIFY_INCOMPATIBLE_CHARTS = new Set([
+  VizType.Table,
+  VizType.TableAgGrid,
+  VizType.PivotTable,
+  VizType.TimeTable,
+  VizType.TimePivot,
+]);
 
 export type ControlPanelsContainerProps = {
-  actions: ExploreActions;
-  datasource_type: DatasourceType;
   exploreState: ExplorePageState['explore'];
+  actions: Pick<ExploreActions, 'setControlValue' | 'resetSemanticSelections'>;
+  datasource_type: DatasourceType;
   chart: ChartState;
   controls: Record<string, ControlState>;
   form_data: QueryFormData;
   isDatasourceMetaLoading: boolean;
+  errorMessage: ReactNode;
+  buttonErrorMessage?: ReactNode; // Error message for RunQueryButton (includes all errors)
+  onQuery: () => void;
+  onStop: () => void;
+  canStopQuery: boolean;
+  chartIsStale: boolean;
 };
 
 export type ExpandedControlPanelSectionConfig = Omit<
@@ -72,111 +125,145 @@ export type ExpandedControlPanelSectionConfig = Omit<
   controlSetRows: ExpandedControlItem[][];
 };
 
+const iconStyles = css`
+  &.anticon {
+    font-size: unset;
+    .anticon {
+      line-height: unset;
+      vertical-align: unset;
+    }
+  }
+`;
+
+const actionButtonsContainerStyles = (theme: SupersetTheme) => css`
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: ${theme.sizeUnit * 4}px;
+  background: ${theme.colorBgContainer};
+  flex-shrink: 0;
+
+  & > button {
+    min-width: 156px;
+  }
+`;
+
 const Styles = styled.div`
+  position: relative;
   height: 100%;
   width: 100%;
-  overflow: auto;
-  overflow-x: visible;
-  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+
+  /* Resizable adds overflow-y: auto as a style to this div */
+  /* To override it, we need to use !important */
+  overflow: visible !important;
+
   #controlSections {
-    min-height: 100%;
-    overflow: visible;
-  }
-  .nav-tabs {
-    flex: 0 0 1;
-  }
-  .tab-content {
+    flex: 1;
     overflow: auto;
+  }
+
+  .tab-content {
+    overflow: visible;
     flex: 1 1 100%;
   }
+
+  /* Ensure Ant Design tabs allow content to expand */
+  .ant-tabs-body {
+    overflow: visible;
+    height: auto;
+  }
+
+  .ant-tabs-body-holder {
+    overflow: visible;
+    height: auto;
+  }
+
+  .ant-tabs-content {
+    overflow: visible;
+    height: auto;
+  }
+
+  /* Ensure collapse components can expand */
+  .ant-collapse-panel {
+    overflow: visible;
+  }
+
+  .ant-collapse-body {
+    overflow: visible;
+  }
+
   .Select__menu {
     max-width: 100%;
   }
   .type-label {
-    margin-right: ${({ theme }) => theme.gridUnit * 3}px;
-    width: ${({ theme }) => theme.gridUnit * 7}px;
+    margin-right: ${({ theme }) => theme.sizeUnit * 3}px;
+    width: ${({ theme }) => theme.sizeUnit * 7}px;
     display: inline-block;
     text-align: center;
-    font-weight: ${({ theme }) => theme.typography.weights.bold};
+    font-weight: ${({ theme }) => theme.fontWeightStrong};
   }
 `;
-
-const ControlPanelsTabs = styled(Tabs)`
-  .ant-tabs-nav-list {
-    width: ${({ fullWidth }) => (fullWidth ? '100%' : '50%')};
-  }
-  .ant-tabs-content-holder {
-    overflow: visible;
-  }
-  .ant-tabs-tabpane {
-    height: 100%;
-  }
-`;
-
-type ControlPanelsContainerState = {
-  expandedQuerySections: string[];
-  expandedCustomizeSections: string[];
-  querySections: ControlPanelSectionConfig[];
-  customizeSections: ControlPanelSectionConfig[];
-  loading: boolean;
-};
 
 const isTimeSection = (section: ControlPanelSectionConfig): boolean =>
-  !!section.label &&
-  (sections.legacyRegularTime.label === section.label ||
-    sections.legacyTimeseriesTime.label === section.label);
+  !!section.label && sections.legacyTimeseriesTime.label === section.label;
 
-const hasTimeColumn = (datasource: DatasourceMeta): boolean =>
-  datasource?.columns?.some(c => c.is_dttm) ||
-  datasource.type === DatasourceType.Druid;
-
+const hasTimeColumn = (datasource: Dataset): boolean =>
+  datasource?.columns?.some(c => c.is_dttm);
 const sectionsToExpand = (
   sections: ControlPanelSectionConfig[],
-  datasource: DatasourceMeta,
+  datasource: Dataset,
 ): string[] =>
   // avoid expanding time section if datasource doesn't include time column
   sections.reduce(
     (acc, section) =>
-      section.expanded && (!isTimeSection(section) || hasTimeColumn(datasource))
+      (section.expanded || !section.label) &&
+      (!isTimeSection(section) || hasTimeColumn(datasource))
         ? [...acc, String(section.label)]
         : acc,
     [] as string[],
   );
 
 function getState(
-  props: ControlPanelsContainerProps,
-): ControlPanelsContainerState {
-  const {
-    exploreState: { datasource },
-  } = props;
-
+  vizType: string,
+  datasource: Dataset,
+  datasourceType: DatasourceType,
+) {
   const querySections: ControlPanelSectionConfig[] = [];
   const customizeSections: ControlPanelSectionConfig[] = [];
+  const matrixifySections: ControlPanelSectionConfig[] = [];
+  let matrixifyEnableControl: ControlPanelSectionConfig | null = null;
 
-  getSectionsToRender(props.form_data.viz_type, props.datasource_type).forEach(
-    section => {
-      // if at least one control in the section is not `renderTrigger`
-      // or asks to be displayed at the Data tab
-      if (
-        section.tabOverride === 'data' ||
-        section.controlSetRows.some(rows =>
-          rows.some(
-            control =>
-              control &&
-              typeof control === 'object' &&
-              'config' in control &&
-              control.config &&
-              (!control.config.renderTrigger ||
-                control.config.tabOverride === 'data'),
-          ),
-        )
-      ) {
-        querySections.push(section);
+  getSectionsToRender(vizType, datasourceType).forEach(section => {
+    if (!section) return;
+    if (section.tabOverride === 'matrixify') {
+      // Separate the enable control from other sections
+      if (section.label === t('Enable Matrixify')) {
+        matrixifyEnableControl = section;
       } else {
-        customizeSections.push(section);
+        matrixifySections.push(section);
       }
-    },
-  );
+    } else if (
+      section.tabOverride === 'data' ||
+      section.controlSetRows.some(rows =>
+        rows.some(
+          control =>
+            control &&
+            typeof control === 'object' &&
+            'config' in control &&
+            control.config &&
+            (!control.config.renderTrigger ||
+              control.config.tabOverride === 'data'),
+        ),
+      )
+    ) {
+      querySections.push(section);
+    } else if (section.controlSetRows && section.controlSetRows.length > 0) {
+      customizeSections.push(section);
+    }
+  });
+
   const expandedQuerySections: string[] = sectionsToExpand(
     querySections,
     datasource,
@@ -185,117 +272,417 @@ function getState(
     customizeSections,
     datasource,
   );
+  const expandedMatrixifySections: string[] = sectionsToExpand(
+    matrixifySections,
+    datasource,
+  );
+
   return {
     expandedQuerySections,
     expandedCustomizeSections,
+    expandedMatrixifySections,
     querySections,
     customizeSections,
-    loading: false,
+    matrixifySections,
+    matrixifyEnableControl,
   };
 }
 
-export class ControlPanelsContainer extends React.Component<
-  ControlPanelsContainerProps,
-  ControlPanelsContainerState
-> {
-  // trigger updates to the component when async plugins load
-  static contextType = PluginContext;
+function useResetOnChangeRef(initialValue: () => any, resetOnChangeValue: any) {
+  const value = useRef(initialValue());
+  const prevResetOnChangeValue = useRef(resetOnChangeValue);
+  if (prevResetOnChangeValue.current !== resetOnChangeValue) {
+    value.current = initialValue();
+    prevResetOnChangeValue.current = resetOnChangeValue;
+  }
 
-  constructor(props: ControlPanelsContainerProps) {
-    super(props);
-    this.state = {
-      expandedQuerySections: [],
-      expandedCustomizeSections: [],
-      querySections: [],
-      customizeSections: [],
-      loading: false,
+  return value;
+}
+
+export const ControlPanelsContainer = (props: ControlPanelsContainerProps) => {
+  const theme = useTheme();
+  const pluginContext = useContext(PluginContext);
+  const { showConfirm, ConfirmModal } = useConfirmModal();
+
+  const prevState = usePrevious(props.exploreState);
+  const prevDatasource = usePrevious(props.exploreState.datasource);
+  const prevChartStatus = usePrevious(props.chart.chartStatus);
+
+  const [showDatasourceAlert, setShowDatasourceAlert] = useState(false);
+  const [activeTabKey, setActiveTabKey] = useState<string>(TABS_KEYS.DATA);
+
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  const controlsTransferred = useSelector<
+    ExplorePageState,
+    string[] | undefined
+  >(state => state.explore.controlsTransferred);
+
+  const defaultTimeFilter = useSelector<ExplorePageState>(
+    state => state.common?.conf?.DEFAULT_TIME_FILTER || NO_TIME_RANGE,
+  );
+
+  const { form_data, actions } = props;
+  const { setControlValue } = actions;
+  const { x_axis, adhoc_filters } = form_data;
+
+  const previousXAxis = usePrevious(x_axis);
+
+  const hasHeaderGroupsControl = Boolean(props.controls.header_groups);
+  const headerGroupsValue = props.controls.header_groups?.value;
+  const exploreDatasource = props.exploreState.datasource;
+  const exploreFormData = props.exploreState.form_data;
+  const exploreControls = props.exploreState.controls;
+  const timeCompareValue = exploreControls?.time_compare?.value;
+  const queryModeValue = exploreControls?.query_mode?.value;
+  const comparisonTypeValue = exploreControls?.comparison_type?.value;
+  const queryColnames = props.chart.queriesResponse?.[0]?.colnames;
+
+  // HeaderGroupsControl is on the Customize tab and is not mounted until that
+  // tab is opened. Sync time-comparison auto-groups into form_data here so
+  // enabling Time Comparison updates the chart without visiting Customize.
+  useEffect(() => {
+    if (!hasHeaderGroupsControl || !setControlValue) {
+      return;
+    }
+    const current = ensureIsArray(headerGroupsValue) as HeaderGroupConfig[];
+    const { timeComparisonGroups } = getHeaderGroupsControlProps(
+      {
+        datasource: exploreDatasource,
+        form_data: {
+          metrics: exploreFormData?.metrics,
+          percent_metrics: exploreFormData?.percent_metrics,
+          groupby: exploreFormData?.groupby,
+          all_columns: exploreFormData?.all_columns,
+          query_mode: exploreFormData?.query_mode,
+          comparison_type: exploreFormData?.comparison_type,
+          time_compare: exploreFormData?.time_compare,
+        },
+        controls: {
+          time_compare: { value: timeCompareValue },
+          query_mode: { value: queryModeValue },
+          comparison_type: { value: comparisonTypeValue },
+        },
+      },
+      {
+        queriesResponse: queryColnames ? [{ colnames: queryColnames }] : null,
+      },
+    );
+    const next = syncTimeComparisonGroups(current, timeComparisonGroups);
+    if (!headerGroupsHaveSameContent(current, next)) {
+      setControlValue('header_groups', next, undefined, {
+        programmatic: true,
+      });
+    }
+  }, [
+    exploreDatasource,
+    comparisonTypeValue,
+    exploreFormData?.all_columns,
+    exploreFormData?.comparison_type,
+    exploreFormData?.groupby,
+    exploreFormData?.metrics,
+    exploreFormData?.percent_metrics,
+    exploreFormData?.query_mode,
+    exploreFormData?.time_compare,
+    hasHeaderGroupsControl,
+    headerGroupsValue,
+    queryColnames,
+    queryModeValue,
+    setControlValue,
+    timeCompareValue,
+  ]);
+
+  useEffect(() => {
+    if (
+      x_axis &&
+      x_axis !== previousXAxis &&
+      isTemporalColumn(x_axis, props.exploreState.datasource)
+    ) {
+      const noFilter = !adhoc_filters?.find(
+        filter =>
+          filter.expressionType === 'SIMPLE' &&
+          filter.operator === Operators.TemporalRange &&
+          filter.subject === x_axis,
+      );
+      if (noFilter) {
+        showConfirm({
+          title: t('The X-axis is not on the filters list'),
+          body: t(
+            `The X-axis is not on the filters list which will prevent it from being used in time range filters in dashboards. Would you like to add it to the filters list?`,
+          ),
+          onConfirm: () => {
+            setControlValue('adhoc_filters', [
+              ...(adhoc_filters || []),
+              {
+                clause: Clauses.Where,
+                subject: x_axis,
+                operator: Operators.TemporalRange,
+                comparator: defaultTimeFilter,
+                expressionType: 'SIMPLE',
+              },
+            ]);
+          },
+          confirmText: t('Yes'),
+          cancelText: t('No'),
+        });
+      }
+    }
+  }, [
+    x_axis,
+    adhoc_filters,
+    setControlValue,
+    defaultTimeFilter,
+    previousXAxis,
+    props.exploreState.datasource,
+    showConfirm,
+  ]);
+
+  useEffect(() => {
+    let shouldUpdateControls = false;
+    const removeDatasourceWarningFromControl = (
+      value: JsonValue | undefined,
+    ) => {
+      if (
+        typeof value === 'object' &&
+        isDefined(value) &&
+        'datasourceWarning' in value &&
+        value.datasourceWarning === true
+      ) {
+        shouldUpdateControls = true;
+        return { ...value, datasourceWarning: false };
+      }
+      return value;
     };
-    this.renderControl = this.renderControl.bind(this);
-    this.renderControlPanelSection = this.renderControlPanelSection.bind(this);
-  }
-
-  componentDidUpdate(prevProps: ControlPanelsContainerProps) {
     if (
-      this.props.form_data.datasource !== prevProps.form_data.datasource ||
-      this.props.form_data.viz_type !== prevProps.form_data.viz_type
+      props.chart.chartStatus === 'success' &&
+      prevChartStatus !== 'success'
     ) {
-      // eslint-disable-next-line react/no-did-update-set-state
-      this.setState(getState(this.props));
+      controlsTransferred?.forEach(controlName => {
+        shouldUpdateControls = false;
+        if (!isDefined(props.controls[controlName])) {
+          return;
+        }
+        const alteredControls = Array.isArray(props.controls[controlName].value)
+          ? ensureIsArray(props.controls[controlName].value)?.map(
+              removeDatasourceWarningFromControl,
+            )
+          : removeDatasourceWarningFromControl(
+              props.controls[controlName].value,
+            );
+        if (shouldUpdateControls) {
+          props.actions.setControlValue(
+            controlName,
+            alteredControls,
+            undefined,
+            {
+              programmatic: true,
+            },
+          );
+        }
+      });
     }
-  }
+  }, [
+    controlsTransferred,
+    prevChartStatus,
+    props.actions,
+    props.chart.chartStatus,
+    props.controls,
+  ]);
 
-  // required for an Antd bug that would otherwise malfunction re-rendering
-  // a collapsed panel after changing the datasource or viz type
-  UNSAFE_componentWillReceiveProps(nextProps: ControlPanelsContainerProps) {
+  useEffect(() => {
     if (
-      this.props.form_data.datasource !== nextProps.form_data.datasource ||
-      this.props.form_data.viz_type !== nextProps.form_data.viz_type
+      prevDatasource &&
+      prevDatasource.type !== DatasourceType.Query &&
+      (props.exploreState.datasource?.id !== prevDatasource.id ||
+        props.exploreState.datasource?.type !== prevDatasource.type)
     ) {
-      this.setState({ loading: true });
+      setShowDatasourceAlert(true);
+      containerRef.current?.scrollTo(0, 0);
     }
-  }
+  }, [
+    props.exploreState.datasource?.id,
+    props.exploreState.datasource?.type,
+    prevDatasource,
+  ]);
 
-  componentDidMount() {
-    this.setState(getState(this.props));
-  }
+  const {
+    expandedQuerySections,
+    expandedCustomizeSections,
+    expandedMatrixifySections,
+    querySections,
+    customizeSections,
+    matrixifySections,
+    matrixifyEnableControl,
+  } = useMemo(
+    () =>
+      getState(
+        form_data.viz_type,
+        props.exploreState.datasource,
+        props.datasource_type,
+      ),
+    [props.exploreState.datasource, form_data.viz_type, props.datasource_type],
+  );
 
-  renderControl({ name, config }: CustomControlItem) {
-    const { actions, controls, chart, exploreState } = this.props;
-    const { visibility } = config;
+  const resetTransferredControls = useCallback(() => {
+    ensureIsArray(props.exploreState.controlsTransferred).forEach(controlName =>
+      props.actions.setControlValue(
+        controlName,
+        props.controls[controlName].default,
+      ),
+    );
+  }, [props.actions, props.exploreState.controlsTransferred, props.controls]);
+
+  const handleClearFormClick = useCallback(() => {
+    resetTransferredControls();
+    setShowDatasourceAlert(false);
+  }, [resetTransferredControls]);
+
+  const handleContinueClick = useCallback(() => {
+    setShowDatasourceAlert(false);
+  }, []);
+
+  const shouldRecalculateControlState = ({
+    name,
+    config,
+  }: CustomControlItem): boolean => {
+    const { controls, chart, exploreState } = props;
+
+    return Boolean(
+      config.shouldMapStateToProps?.(
+        prevState || exploreState,
+        exploreState,
+        controls[name],
+        chart,
+      ),
+    );
+  };
+
+  const renderControl = ({ name, config }: CustomControlItem) => {
+    const { controls, chart, exploreState } = props;
+    const { visibility, hidden, disableStash, ...restConfig } = config;
 
     // If the control item is not an object, we have to look up the control data from
     // the centralized controls file.
     // When it is an object we read control data straight from `config` instead
     const controlData = {
-      ...config,
+      ...restConfig,
       ...controls[name],
-      // if `mapStateToProps` accept three arguments, it means it needs chart
-      // state, too. Since it's may be expensive to run mapStateToProps for every
-      // re-render, we only run this when the chart plugin explicitly ask for this.
-      ...(config.mapStateToProps?.length === 3
-        ? // @ts-ignore /* The typing accuses of having an extra parameter. I didn't remove it because I believe it could be an error in the types and not in the code */
-          config.mapStateToProps(exploreState, controls[name], chart)
+      ...(shouldRecalculateControlState({ name, config })
+        ? config?.mapStateToProps?.(exploreState, controls[name], chart)
         : // for other controls, `mapStateToProps` is already run in
           // controlUtils/getControlState.ts
           undefined),
       name,
     };
-    const { validationErrors, ...restProps } = controlData as ControlState & {
+    const {
+      validationErrors,
+      label: baseLabel,
+      description: baseDescription,
+      ...restProps
+    } = controlData as ControlState & {
       validationErrors?: any[];
     };
 
-    // if visibility check says the config is not visible, don't render it
-    if (visibility && !visibility.call(config, this.props, controlData)) {
-      return null;
-    }
-    return (
-      <Control
-        key={`control-${name}`}
-        name={name}
-        validationErrors={validationErrors}
-        actions={actions}
-        {...restProps}
-      />
-    );
-  }
+    const isVisible = visibility
+      ? visibility.call(config, props, controlData)
+      : undefined;
 
-  renderControlPanelSection(section: ExpandedControlPanelSectionConfig) {
-    const { controls } = this.props;
-    const { label, description } = section;
+    const isHidden =
+      typeof hidden === 'function'
+        ? hidden.call(config, props, controlData)
+        : hidden;
+
+    const label =
+      typeof baseLabel === 'function'
+        ? baseLabel(exploreState, controls[name], chart)
+        : baseLabel;
+
+    const description =
+      typeof baseDescription === 'function'
+        ? baseDescription(exploreState, controls[name], chart)
+        : baseDescription;
+
+    if (name.includes('adhoc_filters')) {
+      restProps.canDelete = (
+        valueToBeDeleted: Record<string, any>,
+        values: Record<string, any>[],
+      ) => {
+        const isTemporalRange = (filter: Record<string, any>) =>
+          filter.operator === Operators.TemporalRange;
+        if (!controls?.time_range?.value && isTemporalRange(valueToBeDeleted)) {
+          const count = values.filter(isTemporalRange).length;
+          if (count === 1) {
+            // if temporal filter's value is "No filter", prevent deletion
+            // otherwise reset the value to "No filter"
+            if (valueToBeDeleted.comparator === defaultTimeFilter) {
+              return t(
+                `You cannot delete the last temporal filter as it's used for time range filters in dashboards.`,
+              );
+            }
+            props.actions.setControlValue(
+              name,
+              values.map(val => {
+                if (isEqual(val, valueToBeDeleted)) {
+                  return {
+                    ...val,
+                    comparator: defaultTimeFilter,
+                  };
+                }
+                return val;
+              }),
+            );
+            return false;
+          }
+        }
+        return true;
+      };
+    }
+
+    return (
+      <StashFormDataContainer
+        shouldStash={isVisible === false && disableStash !== true}
+        fieldNames={[name]}
+        key={`control-container-${name}`}
+      >
+        <Control
+          key={`control-${name}`}
+          name={name}
+          label={label}
+          description={description}
+          validationErrors={validationErrors}
+          actions={props.actions}
+          isVisible={isVisible}
+          hidden={isHidden}
+          {...restProps}
+        />
+      </StashFormDataContainer>
+    );
+  };
+
+  const sectionHasHadNoErrors = useResetOnChangeRef(
+    () => ({}),
+    form_data.viz_type,
+  );
+
+  const renderControlPanelSection = (
+    section: ExpandedControlPanelSectionConfig,
+  ) => {
+    const { controls, chart, exploreState, form_data, actions } = props;
+    const { label, description, visibility } = section;
 
     // Section label can be a ReactNode but in some places we want to
     // have a string ID. Using forced type conversion for now,
     // should probably add a `id` field to sections in the future.
     const sectionId = String(label);
-
+    const isVisible = visibility?.call(this, props, controls) !== false;
     const hasErrors = section.controlSetRows.some(rows =>
       rows.some(item => {
         const controlName =
           typeof item === 'string'
             ? item
             : item && 'name' in item
-            ? item.name
-            : null;
+              ? item.name
+              : null;
         return (
           controlName &&
           controlName in controls &&
@@ -304,155 +691,461 @@ export class ControlPanelsContainer extends React.Component<
         );
       }),
     );
+
+    if (!hasErrors) {
+      sectionHasHadNoErrors.current[sectionId] = true;
+    }
+
     const PanelHeader = () => (
-      <span>
-        <span>{label}</span>{' '}
+      <span data-test="collapsible-control-panel-header">
+        <span
+          css={(theme: SupersetTheme) => css`
+            font-size: ${theme.fontSize}px;
+            line-height: 1.3;
+          `}
+        >
+          {typeof label === 'function' ? (label as () => ReactNode)() : label}
+        </span>{' '}
         {description && (
-          // label is only used in tooltip id (should probably call this prop `id`)
-          <InfoTooltipWithTrigger label={sectionId} tooltip={description} />
+          <Tooltip
+            id={sectionId}
+            title={
+              typeof description === 'function'
+                ? (description as () => ReactNode)()
+                : description
+            }
+          >
+            <Icons.InfoCircleOutlined css={iconStyles} />
+          </Tooltip>
         )}
         {hasErrors && (
-          <InfoTooltipWithTrigger
-            label="validation-errors"
-            bsStyle="danger"
-            tooltip="This section contains validation errors"
-          />
+          <Tooltip
+            id={`${kebabCase('validation-errors')}-tooltip`}
+            title={t('This section contains validation errors')}
+          >
+            <Icons.ExclamationCircleOutlined iconColor={theme.colorError} />
+          </Tooltip>
         )}
       </span>
     );
 
-    return (
-      <Collapse.Panel
-        data-test="collapsible-control-panel"
-        css={theme => css`
-          margin-bottom: 0;
-          box-shadow: none;
+    let isInSubSection = false;
+    const PanelChildren = (
+      <>
+        <StashFormDataContainer
+          key={`sectionId-${sectionId}`}
+          shouldStash={!isVisible}
+          fieldNames={section.controlSetRows
+            .flat()
+            .map(item =>
+              item && typeof item === 'object'
+                ? 'name' in item
+                  ? item.name
+                  : ''
+                : String(item || ''),
+            )
+            .filter(Boolean)}
+        />
+        {isVisible && (
+          <div style={{ paddingLeft: theme.sizeUnit * 2 }}>
+            {section.controlSetRows.map((controlSets, i) => {
+              // Detect sub-section header rows (React elements with no name prop)
+              const isSubSectionHeaderRow = controlSets.some(
+                item =>
+                  isValidElement(item) &&
+                  !(item as React.ReactElement<Record<string, unknown>>).props
+                    ?.name,
+              );
+              if (isSubSectionHeaderRow) {
+                isInSubSection = true;
+              }
 
-          &:last-child {
-            padding-bottom: ${theme.gridUnit * 10}px;
-          }
+              const renderedControls = controlSets
+                .map(controlItem => {
+                  if (!controlItem) {
+                    // When the item is invalid
+                    return null;
+                  }
+                  if (isValidElement(controlItem)) {
+                    // When the item is a React element
+                    const element = controlItem as React.ReactElement<
+                      Record<string, unknown>
+                    >;
 
-          .panel-body {
-            margin-left: ${theme.gridUnit * 4}px;
-            padding-bottom: 0px;
-          }
+                    const controlName = (element.props as { name: string })
+                      .name;
+                    if (!controlName) {
+                      return element;
+                    }
+                    const controlState = controls[controlName];
 
-          span.label {
-            display: inline-block;
-          }
-        `}
-        header={PanelHeader()}
-        key={sectionId}
-      >
-        {section.controlSetRows.map((controlSets, i) => {
-          const renderedControls = controlSets
-            .map(controlItem => {
-              if (!controlItem) {
-                // When the item is invalid
+                    return cloneElement(element, {
+                      ...(element.props as Record<string, unknown>),
+                      actions,
+                      controls,
+                      chart,
+                      exploreState,
+                      form_data,
+                      ...(controlState && {
+                        value: controlState.value,
+                        validationErrors: controlState.validationErrors,
+                        default: controlState.default,
+                        onChange: (value: unknown, errors: unknown[]) =>
+                          setControlValue(controlName, value, errors),
+                      }),
+                    });
+                  }
+                  if (
+                    isCustomControlItem(controlItem) &&
+                    controlItem.name !== 'datasource'
+                  ) {
+                    return renderControl(controlItem);
+                  }
+                  return null;
+                })
+                .filter(x => x !== null);
+              // don't show the row if it is empty
+              if (renderedControls.length === 0) {
                 return null;
               }
-              if (React.isValidElement(controlItem)) {
-                // When the item is a React element
-                return controlItem;
-              }
-              if (
-                controlItem.name &&
-                controlItem.config &&
-                controlItem.name !== 'datasource'
-              ) {
-                return this.renderControl(controlItem);
-              }
-              return null;
-            })
-            .filter(x => x !== null);
-          // don't show the row if it is empty
-          if (renderedControls.length === 0) {
-            return null;
-          }
-          return (
-            <ControlRow
-              key={`controlsetrow-${i}`}
-              controls={renderedControls}
-            />
-          );
-        })}
-      </Collapse.Panel>
+              // Indent controls within sub-sections for visual hierarchy
+              const paddingLeft =
+                isInSubSection && !isSubSectionHeaderRow
+                  ? theme.sizeUnit * 3
+                  : 0;
+              return paddingLeft ? (
+                <div key={`controlsetrow-${i}`} style={{ paddingLeft }}>
+                  <ControlRow controls={renderedControls} />
+                </div>
+              ) : (
+                <ControlRow
+                  key={`controlsetrow-${i}`}
+                  controls={renderedControls}
+                />
+              );
+            })}
+          </div>
+        )}
+      </>
     );
-  }
 
-  render() {
-    const controlPanelRegistry = getChartControlPanelRegistry();
-    if (
-      (!controlPanelRegistry.has(this.props.form_data.viz_type) &&
-        this.context.loading) ||
-      this.state.loading
-    ) {
-      return <Loading />;
+    return {
+      key: String(section.label),
+      label: <PanelHeader />,
+      children: PanelChildren,
+      className: section.label ? '' : 'hidden-collapse-header',
+      style: { display: isVisible ? 'block' : 'none' },
+    };
+  };
+
+  const hasControlsTransferred =
+    ensureIsArray(props.exploreState.controlsTransferred).length > 0;
+
+  const DatasourceAlert = useCallback(
+    () =>
+      hasControlsTransferred ? (
+        <ExploreAlert
+          title={t('Keep control settings?')}
+          bodyText={t(
+            "You've changed datasets. Any controls with data (columns, metrics) that match this new dataset have been retained.",
+          )}
+          primaryButtonAction={handleContinueClick}
+          secondaryButtonAction={handleClearFormClick}
+          primaryButtonText={t('Continue')}
+          secondaryButtonText={t('Clear form')}
+          type="info"
+        />
+      ) : (
+        <ExploreAlert
+          title={t('No form settings were maintained')}
+          bodyText={t(
+            'We were unable to carry over any controls when switching to this new dataset.',
+          )}
+          primaryButtonAction={handleContinueClick}
+          primaryButtonText={t('Continue')}
+          type="warning"
+        />
+      ),
+    [handleClearFormClick, handleContinueClick, hasControlsTransferred],
+  );
+
+  const dataTabHasHadNoErrors = useResetOnChangeRef(
+    () => false,
+    form_data.viz_type,
+  );
+
+  const dataTabTitle = useMemo(() => {
+    if (!props.errorMessage) {
+      dataTabHasHadNoErrors.current = true;
     }
 
-    const showCustomizeTab = this.state.customizeSections.length > 0;
     return (
-      <Styles>
-        <ControlPanelsTabs
-          id="controlSections"
-          data-test="control-tabs"
-          fullWidth={showCustomizeTab}
-        >
-          <Tabs.TabPane key="query" tab={t('Data')}>
-            <Collapse
-              bordered
-              activeKey={this.state.expandedQuerySections}
-              expandIconPosition="right"
-              onChange={selection => {
-                this.setState({
-                  expandedQuerySections: ensureIsArray(selection),
-                });
-              }}
-              ghost
+      <>
+        <span>{t('Data')}</span>
+        {props.errorMessage && (
+          <span
+            css={(theme: SupersetTheme) => css`
+              margin-left: ${theme.sizeUnit * 2}px;
+            `}
+          >
+            {' '}
+            <Tooltip
+              id="query-error-tooltip"
+              placement="right"
+              title={props.errorMessage}
             >
-              {this.state.querySections.map(this.renderControlPanelSection)}
-            </Collapse>
-          </Tabs.TabPane>
-          {showCustomizeTab && (
-            <Tabs.TabPane key="display" tab={t('Customize')}>
-              <Collapse
-                bordered
-                activeKey={this.state.expandedCustomizeSections}
-                expandIconPosition="right"
-                onChange={selection => {
-                  this.setState({
-                    expandedCustomizeSections: ensureIsArray(selection),
-                  });
-                }}
-                ghost
-              >
-                {this.state.customizeSections.map(
-                  this.renderControlPanelSection,
-                )}
-              </Collapse>
-            </Tabs.TabPane>
-          )}
-        </ControlPanelsTabs>
-      </Styles>
+              <Icons.ExclamationCircleOutlined
+                data-test="query-error-tooltip-trigger"
+                iconColor={theme.colorError}
+                iconSize="s"
+              />
+            </Tooltip>
+          </span>
+        )}
+      </>
     );
-  }
-}
+  }, [
+    theme.colorErrorText,
+    theme.colorWarningText,
+    dataTabHasHadNoErrors,
+    props.errorMessage,
+  ]);
 
-export default connect(
-  function mapStateToProps(state: ExplorePageState) {
-    const { explore, charts } = state;
-    const chartKey = Object.keys(charts)[0];
-    const chart = charts[chartKey];
-    return {
-      chart,
-      isDatasourceMetaLoading: explore.isDatasourceMetaLoading,
-      controls: explore.controls,
-      exploreState: explore,
-    };
-  },
-  function mapDispatchToProps(dispatch) {
-    return {
-      actions: bindActionCreators(exploreActions, dispatch),
-    };
-  },
-)(ControlPanelsContainer);
+  const requiresSemanticReselection = Boolean(
+    props.exploreState.datasource?.semantic_selection_version &&
+    form_data.semantic_selection_version !==
+      props.exploreState.datasource.semantic_selection_version,
+  );
+  const showCustomizeTab = customizeSections.length > 0;
+  const showMatrixifyTab =
+    !requiresSemanticReselection &&
+    isFeatureEnabled(FeatureFlag.Matrixify) &&
+    !MATRIXIFY_INCOMPATIBLE_CHARTS.has(form_data.viz_type as VizType);
+
+  // Check if matrixify is enabled in form_data
+  const matrixifyIsEnabled =
+    form_data.matrixify_enable === true &&
+    ((form_data.matrixify_mode_rows !== undefined &&
+      form_data.matrixify_mode_rows !== 'disabled') ||
+      (form_data.matrixify_mode_columns !== undefined &&
+        form_data.matrixify_mode_columns !== 'disabled'));
+
+  // Auto-switch to Matrixify tab when it's enabled
+  useEffect(() => {
+    if (requiresSemanticReselection) {
+      setActiveTabKey(TABS_KEYS.DATA);
+    } else if (showMatrixifyTab && matrixifyIsEnabled) {
+      setActiveTabKey(TABS_KEYS.MATRIXIFY);
+    }
+  }, [requiresSemanticReselection, showMatrixifyTab, matrixifyIsEnabled]);
+
+  // Check if matrixify sections have validation errors
+  const matrixifyHasErrors = useMemo(() => {
+    if (!showMatrixifyTab) return false;
+
+    return matrixifySections.some(section =>
+      section.controlSetRows.some(rows =>
+        rows.some(item => {
+          const controlName =
+            typeof item === 'string'
+              ? item
+              : item && 'name' in item
+                ? item.name
+                : null;
+          return (
+            controlName &&
+            controlName in props.controls &&
+            props.controls[controlName].validationErrors &&
+            props.controls[controlName].validationErrors.length > 0
+          );
+        }),
+      ),
+    );
+  }, [showMatrixifyTab, matrixifySections, props.controls]);
+
+  // Create Matrixify tab label with Beta tag and validation errors
+  const matrixifyTabLabel = useMemo(
+    () => (
+      <>
+        <span>{t('Matrixify')}</span>
+        {matrixifyHasErrors && (
+          <span
+            css={(theme: SupersetTheme) => css`
+              margin-left: ${theme.sizeUnit * 2}px;
+            `}
+          >
+            {' '}
+            <Tooltip
+              id="matrixify-validation-error-tooltip"
+              placement="right"
+              title={t('This section contains validation errors')}
+            >
+              <Icons.ExclamationCircleOutlined
+                data-test="matrixify-validation-error-tooltip-trigger"
+                iconColor={theme.colorError}
+                iconSize="s"
+              />
+            </Tooltip>
+          </span>
+        )}{' '}
+        <Tooltip
+          title={t(
+            'This feature is experimental and may change or have limitations',
+          )}
+          placement="top"
+        >
+          <Label
+            type="info"
+            css={css`
+              margin-left: ${theme.sizeUnit}px;
+              font-size: ${theme.fontSizeSM}px;
+            `}
+          >
+            {t('beta')}
+          </Label>
+        </Tooltip>
+      </>
+    ),
+    [
+      matrixifyHasErrors,
+      theme.colorErrorText,
+      theme.sizeUnit,
+      theme.fontSizeSM,
+    ],
+  );
+
+  const controlPanelRegistry = getChartControlPanelRegistry();
+  if (!controlPanelRegistry.has(form_data.viz_type) && pluginContext.loading) {
+    return <Loading />;
+  }
+
+  return (
+    <>
+      <Styles ref={containerRef}>
+        <Tabs
+          id={CONTROL_SECTIONS_ID}
+          data-test="control-tabs"
+          allowOverflow={false}
+          activeKey={activeTabKey}
+          onChange={(key: string) => setActiveTabKey(key)}
+          items={[
+            {
+              key: TABS_KEYS.DATA,
+              label: dataTabTitle,
+              children: (
+                <>
+                  {requiresSemanticReselection && (
+                    <ExploreAlert
+                      title={t('Re-pick fields for this chart')}
+                      bodyText={t(
+                        "This chart was saved with an older format of field names for this semantic view, so the fields it refers to can't be confirmed. Re-pick the metrics and dimensions to keep using it. The saved chart doesn't change until you save.",
+                      )}
+                      primaryButtonText={t('Re-pick fields')}
+                      primaryButtonAction={() =>
+                        actions.resetSemanticSelections(form_data.slice_id)
+                      }
+                      type="warning"
+                    />
+                  )}
+                  {showDatasourceAlert && <DatasourceAlert />}
+                  {!requiresSemanticReselection && (
+                    <Collapse
+                      defaultActiveKey={expandedQuerySections}
+                      expandIconPosition="end"
+                      ghost
+                      bordered
+                      items={querySections.map(renderControlPanelSection)}
+                    />
+                  )}
+                </>
+              ),
+            },
+            ...(showCustomizeTab
+              ? [
+                  {
+                    key: TABS_KEYS.CUSTOMIZE,
+                    label: t('Customize'),
+                    children: (
+                      <Collapse
+                        defaultActiveKey={expandedCustomizeSections}
+                        expandIconPosition="end"
+                        ghost
+                        bordered
+                        items={customizeSections.map(renderControlPanelSection)}
+                      />
+                    ),
+                  },
+                ]
+              : []),
+            ...(showMatrixifyTab
+              ? [
+                  {
+                    key: TABS_KEYS.MATRIXIFY,
+                    label: matrixifyTabLabel,
+                    children: (
+                      <>
+                        {/* Render Enable Matrixify control outside collapsible sections */}
+                        {matrixifyEnableControl &&
+                          (
+                            matrixifyEnableControl as ControlPanelSectionConfig
+                          ).controlSetRows.map(
+                            (controlSetRow: CustomControlItem[], i: number) => (
+                              <div
+                                key={`matrixify-enable-${i}`}
+                                css={css`
+                                  padding: ${theme.sizeUnit * 4}px;
+                                  border-bottom: 1px solid ${theme.colorBorder};
+                                `}
+                              >
+                                {controlSetRow.map(
+                                  (control: CustomControlItem, j: number) => {
+                                    if (
+                                      !control ||
+                                      typeof control === 'string'
+                                    ) {
+                                      return null;
+                                    }
+                                    return (
+                                      <div key={`control-${i}-${j}`}>
+                                        {renderControl(control)}
+                                      </div>
+                                    );
+                                  },
+                                )}
+                              </div>
+                            ),
+                          )}
+                        <Collapse
+                          defaultActiveKey={expandedMatrixifySections}
+                          expandIconPosition="end"
+                          ghost
+                          bordered
+                          items={matrixifySections.map(
+                            renderControlPanelSection,
+                          )}
+                        />
+                      </>
+                    ),
+                  },
+                ]
+              : []),
+          ]}
+        />
+        <div css={actionButtonsContainerStyles}>
+          <RunQueryButton
+            onQuery={props.onQuery}
+            onStop={props.onStop}
+            errorMessage={props.buttonErrorMessage || props.errorMessage}
+            loading={props.chart.chartStatus === 'loading'}
+            isNewChart={!props.chart.queriesResponse}
+            canStopQuery={props.canStopQuery}
+            chartIsStale={props.chartIsStale}
+          />
+        </div>
+      </Styles>
+      {ConfirmModal}
+    </>
+  );
+};
+
+export default ControlPanelsContainer;

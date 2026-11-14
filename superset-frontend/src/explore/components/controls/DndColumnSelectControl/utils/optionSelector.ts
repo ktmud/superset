@@ -16,11 +16,26 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { ColumnMeta } from '@superset-ui/chart-controls';
-import { ensureIsArray } from '@superset-ui/core';
+import { ColumnMeta, isColumnMeta } from '@superset-ui/chart-controls';
+import { t } from '@apache-superset/core/translation';
+import {
+  AdhocColumn,
+  ensureIsArray,
+  QueryFormColumn,
+  isPhysicalColumn,
+} from '@superset-ui/core';
+
+const getColumnNameOrAdhocColumn = (
+  column: ColumnMeta | AdhocColumn,
+): QueryFormColumn => {
+  if (isColumnMeta(column)) {
+    return column.column_name;
+  }
+  return column as AdhocColumn;
+};
 
 export class OptionSelector {
-  values: ColumnMeta[];
+  values: (ColumnMeta | AdhocColumn)[];
 
   options: Record<string, ColumnMeta>;
 
@@ -29,23 +44,34 @@ export class OptionSelector {
   constructor(
     options: Record<string, ColumnMeta>,
     multi: boolean,
-    initialValues?: string[] | string | null,
+    initialValues?: QueryFormColumn[] | QueryFormColumn | null,
   ) {
     this.options = options;
     this.multi = multi;
     this.values = ensureIsArray(initialValues)
       .map(value => {
-        if (value && value in options) {
+        if (value && isPhysicalColumn(value) && value in options) {
           return options[value];
         }
-        return null;
+        if (!isPhysicalColumn(value)) {
+          return value;
+        }
+        return {
+          type_generic: 'UNKNOWN',
+          column_name: value,
+          error_text: t(
+            'This column might be incompatible with current dataset',
+          ),
+        };
       })
       .filter(Boolean) as ColumnMeta[];
   }
 
-  add(value: string) {
-    if (value in this.options) {
+  add(value: QueryFormColumn) {
+    if (isPhysicalColumn(value) && value in this.options) {
       this.values.push(this.options[value]);
+    } else if (!isPhysicalColumn(value)) {
+      this.values.push(value as AdhocColumn);
     }
   }
 
@@ -53,24 +79,41 @@ export class OptionSelector {
     this.values.splice(idx, 1);
   }
 
-  replace(idx: number, value: string) {
+  replace(idx: number, value: QueryFormColumn) {
     if (this.values[idx]) {
-      this.values[idx] = this.options[value];
+      this.values[idx] = isPhysicalColumn(value) ? this.options[value] : value;
     }
   }
 
-  swap(a: number, b: number) {
-    [this.values[a], this.values[b]] = [this.values[b], this.values[a]];
+  move(dragIndex: number, hoverIndex: number) {
+    // @dnd-kit reports the final indices at drag-end, so reorder by removing
+    // the dragged item and reinserting it, rather than swapping in place,
+    // which only produces the correct result for adjacent drags.
+    const [moved] = this.values.splice(dragIndex, 1);
+    this.values.splice(hoverIndex, 0, moved);
   }
 
-  has(value: string): boolean {
-    return ensureIsArray(this.getValues()).includes(value);
+  has(value: QueryFormColumn): boolean {
+    return this.values.some(col => {
+      if (isPhysicalColumn(value)) {
+        return (
+          (col as ColumnMeta).column_name === value ||
+          (col as AdhocColumn).label === value
+        );
+      }
+      return (
+        (col as ColumnMeta).column_name === value.label ||
+        (col as AdhocColumn).label === value.label
+      );
+    });
   }
 
-  getValues(): string[] | string | undefined {
+  getValues(): QueryFormColumn[] | QueryFormColumn | undefined {
     if (!this.multi) {
-      return this.values.length > 0 ? this.values[0].column_name : undefined;
+      return this.values.length > 0
+        ? getColumnNameOrAdhocColumn(this.values[0])
+        : undefined;
     }
-    return this.values.map(option => option.column_name);
+    return this.values.map(getColumnNameOrAdhocColumn);
   }
 }

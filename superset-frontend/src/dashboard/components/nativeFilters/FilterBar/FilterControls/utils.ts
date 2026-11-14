@@ -16,32 +16,28 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { debounce } from 'lodash';
+import { debounce } from 'lodash-es';
 import { Dispatch } from 'react';
 import {
   setFocusedNativeFilter,
   unsetFocusedNativeFilter,
+  setHoveredNativeFilter,
+  unsetHoveredNativeFilter,
+  setHoveredChartCustomization,
+  unsetHoveredChartCustomization,
 } from 'src/dashboard/actions/nativeFilters';
-import { Filter } from '../../types';
-import { CascadeFilter } from '../CascadeFilters/types';
-import { mapParentFiltersToChildren } from '../utils';
+import { Constants } from '@superset-ui/core/components';
 
-// eslint-disable-next-line import/prefer-default-export
-export function buildCascadeFiltersTree(filters: Filter[]): CascadeFilter[] {
-  const cascadeChildren = mapParentFiltersToChildren(filters);
-
-  const getCascadeFilter = (filter: Filter): CascadeFilter => {
-    const children = cascadeChildren[filter.id] || [];
-    return {
-      ...filter,
-      cascadeChildren: children.map(getCascadeFilter),
-    };
-  };
-
-  return filters
-    .filter(filter => !filter.cascadeParentIds?.length)
-    .map(getCascadeFilter);
-}
+export const dispatchHoverAction = debounce(
+  (dispatch: Dispatch<any>, id?: string) => {
+    if (id) {
+      dispatch(setHoveredNativeFilter(id));
+    } else {
+      dispatch(unsetHoveredNativeFilter());
+    }
+  },
+  Constants.FAST_DEBOUNCE,
+);
 
 export const dispatchFocusAction = debounce(
   (dispatch: Dispatch<any>, id?: string) => {
@@ -51,5 +47,16 @@ export const dispatchFocusAction = debounce(
       dispatch(unsetFocusedNativeFilter());
     }
   },
-  300,
+  Constants.FAST_DEBOUNCE,
+);
+
+export const dispatchChartCustomizationHoverAction = debounce(
+  (dispatch: Dispatch<any>, id?: string) => {
+    if (id) {
+      dispatch(setHoveredChartCustomization(id));
+    } else {
+      dispatch(unsetHoveredChartCustomization());
+    }
+  },
+  Constants.FAST_DEBOUNCE,
 );

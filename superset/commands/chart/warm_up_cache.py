@@ -1,0 +1,149 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+from collections.abc import Mapping
+from typing import Any, cast, Optional, Union
+
+from superset.commands.base import BaseCommand
+from superset.commands.chart.data.get_data_command import ChartDataCommand
+from superset.commands.chart.exceptions import (
+    ChartAccessDeniedError,
+    ChartInvalidError,
+    WarmUpCacheChartNotFoundError,
+)
+from superset.common.db_query_status import QueryStatus
+from superset.exceptions import SupersetSecurityException
+from superset.extensions import db, security_manager
+from superset.models.slice import Slice
+from superset.semantic_layers.access import (
+    is_semantic_layers_enabled,
+    SemanticLayersDisabledError,
+)
+from superset.utils import json
+from superset.utils.core import error_msg_from_exception, QueryObjectFilterClause
+from superset.views.utils import get_dashboard_extra_filters
+
+
+class ChartWarmUpCacheCommand(BaseCommand):
+    def __init__(
+        self,
+        chart_or_id: Union[int, Slice],
+        dashboard_id: Optional[int],
+        extra_filters: Optional[str],
+    ):
+        self._chart_or_id = chart_or_id
+        self._dashboard_id = dashboard_id
+        self._extra_filters = extra_filters
+
+    def _get_dashboard_filters(self, chart_id: int) -> list[dict[str, Any]]:
+        """Retrieve dashboard filters from extra_filters or dashboard metadata."""
+        if not self._dashboard_id:
+            return []
+
+        if self._extra_filters:
+            return json.loads(self._extra_filters)
+
+        return get_dashboard_extra_filters(chart_id, self._dashboard_id)
+
+    def _warm_up_non_legacy_cache(self, chart: Slice) -> tuple[Any, Any]:
+        """Warm up cache for non-legacy visualizations."""
+        query_context = chart.get_query_context()
+
+        if not query_context:
+            raise ChartInvalidError(
+                "Chart's query context does not exist. Open the chart in "
+                "Explore once (or re-save it) to generate it."
+            )
+
+        # Apply dashboard filters if dashboard_id is provided
+        if dashboard_filters := self._get_dashboard_filters(chart.id):
+            # These filters enter after QueryObjectFactory has stripped private
+            # discovery flags from the saved chart query.
+            if any(
+                isinstance(predicate, Mapping) and "is_literal" in predicate
+                for predicate in dashboard_filters
+            ):
+                dashboard_filters = [
+                    {
+                        key: value
+                        for key, value in predicate.items()
+                        if key != "is_literal"
+                    }
+                    if isinstance(predicate, Mapping) and "is_literal" in predicate
+                    else predicate
+                    for predicate in dashboard_filters
+                ]
+            for query in query_context.queries:
+                query.filter = (
+                    cast(list[QueryObjectFilterClause], dashboard_filters)
+                    + query.filter
+                )
+
+        query_context.force = True
+        command = ChartDataCommand(query_context)
+        command.validate()
+        payload = command.run()
+
+        # Report the first error.
+        for query_result in cast(list[dict[str, Any]], payload["queries"]):
+            error = query_result.get("error")
+            status = query_result.get("status")
+            if error is not None:
+                return error, status
+
+        return None, QueryStatus.SUCCESS
+
+    def run(self, *, skip_disabled: bool = False) -> dict[str, Any]:
+        """Warm one chart, optionally returning a disabled result for batch callers."""
+        try:
+            self.validate()
+        except SemanticLayersDisabledError:
+            if not skip_disabled:
+                raise
+            disabled_chart: Slice = cast(Slice, self._chart_or_id)
+            return {
+                "chart_id": disabled_chart.id,
+                "viz_error": SemanticLayersDisabledError.message,
+                "viz_status": None,
+            }
+        chart: Slice = cast(Slice, self._chart_or_id)
+
+        try:
+            error, status = self._warm_up_non_legacy_cache(chart)
+        except Exception as ex:  # pylint: disable=broad-except
+            error = error_msg_from_exception(ex)
+            status = None
+
+        return {"chart_id": chart.id, "viz_error": error, "viz_status": status}
+
+    def validate(self) -> None:
+        if isinstance(self._chart_or_id, Slice):
+            chart = self._chart_or_id
+        else:
+            chart = db.session.query(Slice).filter_by(id=self._chart_or_id).scalar()
+            if not chart:
+                raise WarmUpCacheChartNotFoundError()
+            self._chart_or_id = chart
+        if (
+            chart.datasource_type == "semantic_view"
+            and not is_semantic_layers_enabled()
+        ):
+            raise SemanticLayersDisabledError()
+        try:
+            security_manager.raise_for_access(chart=chart)
+        except SupersetSecurityException as ex:
+            raise ChartAccessDeniedError() from ex

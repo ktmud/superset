@@ -14,29 +14,48 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-from marshmallow import fields, Schema
+from flask_babel import lazy_gettext as _
+from marshmallow import fields, Schema, ValidationError
 from marshmallow.validate import Length
 
+
+def validate_label(value: str | None) -> None:
+    """Reject blank or whitespace-only saved query labels."""
+    if value is None or not value.strip():
+        raise ValidationError(_("Label must not be empty."))
+
+
 openapi_spec_methods_override = {
-    "get": {"get": {"description": "Get a saved query",}},
+    "get": {"get": {"summary": "Get a saved query"}},
     "get_list": {
         "get": {
-            "description": "Get a list of saved queries, use Rison or JSON "
+            "summary": "Get a list of saved queries",
+            "description": "Gets a list of saved queries, use Rison or JSON "
             "query parameters for filtering, sorting,"
             " pagination and for selecting specific"
             " columns and metadata.",
         }
     },
-    "post": {"post": {"description": "Create a saved query"}},
-    "put": {"put": {"description": "Update a saved query"}},
-    "delete": {"delete": {"description": "Delete saved query"}},
+    "post": {"post": {"summary": "Create a saved query"}},
+    "put": {"put": {"summary": "Update a saved query"}},
+    "delete": {"delete": {"summary": "Delete a saved query"}},
+    "info": {"get": {"summary": "Get metadata information about this API resource"}},
 }
 
-get_delete_ids_schema = {"type": "array", "items": {"type": "integer"}}
-get_export_ids_schema = {"type": "array", "items": {"type": "integer"}}
+get_delete_ids_schema = {
+    "type": "array",
+    "items": {"type": "integer"},
+    "example": [1, 2, 3],
+}
+get_export_ids_schema = {
+    "type": "array",
+    "items": {"type": "integer"},
+    "example": [1, 2, 3],
+}
 
 
 class ImportV1SavedQuerySchema(Schema):
+    catalog = fields.String(allow_none=True, validate=Length(0, 128))
     schema = fields.String(allow_none=True, validate=Length(0, 128))
     label = fields.String(allow_none=True, validate=Length(0, 256))
     description = fields.String(allow_none=True)

@@ -16,15 +16,24 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React from 'react';
-import { render, screen, waitFor } from 'spec/helpers/testing-library';
+import {
+  render,
+  screen,
+  userEvent,
+  waitFor,
+} from 'spec/helpers/testing-library';
 import fetchMock from 'fetch-mock';
-import * as utils from 'src/utils/getClientErrorObject';
-import { Column, JsonObject } from '@superset-ui/core';
-import userEvent from '@testing-library/user-event';
+import { Column, JsonObject, getClientErrorObject } from '@superset-ui/core';
 import { ColumnSelect } from './ColumnSelect';
 
-fetchMock.get('http://localhost/api/v1/dataset/123', {
+jest.mock('@superset-ui/core', () => ({
+  ...jest.requireActual('@superset-ui/core'),
+  getClientErrorObject: jest.fn(() => Promise.resolve({ error: 'Error' })),
+}));
+
+const mockedGetClientErrorObject = getClientErrorObject as jest.Mock;
+
+fetchMock.get('glob:*/api/v1/dataset/123?*', {
   body: {
     result: {
       columns: [
@@ -35,7 +44,7 @@ fetchMock.get('http://localhost/api/v1/dataset/123', {
     },
   },
 });
-fetchMock.get('http://localhost/api/v1/dataset/456', {
+fetchMock.get('glob:*/api/v1/dataset/456?*', {
   body: {
     result: {
       columns: [
@@ -47,7 +56,7 @@ fetchMock.get('http://localhost/api/v1/dataset/456', {
   },
 });
 
-fetchMock.get('http://localhost/api/v1/dataset/789', { status: 404 });
+fetchMock.get('glob:*/api/v1/dataset/789?*', { status: 404 });
 
 const createProps = (extraProps: JsonObject = {}) => ({
   filterId: 'filterId',
@@ -59,7 +68,7 @@ const createProps = (extraProps: JsonObject = {}) => ({
 });
 
 afterAll(() => {
-  fetchMock.restore();
+  fetchMock.clearHistory().removeRoutes();
 });
 
 test('Should render', async () => {
@@ -68,9 +77,13 @@ test('Should render', async () => {
     useRedux: true,
   });
   expect(container.children).toHaveLength(1);
-  userEvent.type(screen.getByRole('combobox'), 'column_name');
+  await userEvent.type(screen.getByRole('combobox'), 'column_name');
   await waitFor(() => {
-    expect(screen.getByTitle('column_name_01')).toBeInTheDocument();
+    expect(
+      screen.getByRole('option', {
+        name: 'column_name_01',
+      }),
+    ).toBeInTheDocument();
   });
   await waitFor(() => {
     expect(screen.getByTitle('column_name_02')).toBeInTheDocument();
@@ -85,26 +98,25 @@ test('Should call "setFields" when "datasetId" changes', () => {
   const { rerender } = render(<ColumnSelect {...(props as any)} />, {
     useRedux: true,
   });
-  expect(props.form.setFields).not.toBeCalled();
+  expect(props.form.setFields).not.toHaveBeenCalled();
 
   props.datasetId = 456;
   rerender(<ColumnSelect {...(props as any)} />);
 
-  expect(props.form.setFields).toBeCalled();
+  expect(props.form.setFields).toHaveBeenCalled();
 });
 
 test('Should call "getClientErrorObject" when api returns an error', async () => {
   const props = createProps();
 
   props.datasetId = 789;
-  const spy = jest.spyOn(utils, 'getClientErrorObject');
 
-  expect(spy).not.toBeCalled();
+  expect(mockedGetClientErrorObject).not.toHaveBeenCalled();
   render(<ColumnSelect {...(props as any)} />, {
     useRedux: true,
   });
   await waitFor(() => {
-    expect(spy).toBeCalled();
+    expect(mockedGetClientErrorObject).toHaveBeenCalled();
   });
 });
 
@@ -116,9 +128,13 @@ test('Should filter results', async () => {
     useRedux: true,
   });
   expect(container.children).toHaveLength(1);
-  userEvent.type(screen.getByRole('combobox'), 'column_name');
+  await userEvent.type(screen.getByRole('combobox'), 'column_name');
   await waitFor(() => {
-    expect(screen.getByTitle('column_name_01')).toBeInTheDocument();
+    expect(
+      screen.getByRole('option', {
+        name: 'column_name_01',
+      }),
+    ).toBeInTheDocument();
   });
   await waitFor(() => {
     expect(screen.queryByTitle('column_name_02')).not.toBeInTheDocument();
@@ -126,4 +142,43 @@ test('Should filter results', async () => {
   await waitFor(() => {
     expect(screen.queryByTitle('column_name_03')).not.toBeInTheDocument();
   });
+});
+
+test('ignores a slower response for a datasource the user already switched away from', async () => {
+  fetchMock.get(
+    'glob:*/api/v1/dataset/901?*',
+    { result: { columns: [{ column_name: 'stale_col', filterable: true }] } },
+    { delay: 150 },
+  );
+  fetchMock.get('glob:*/api/v1/dataset/902?*', {
+    result: { columns: [{ column_name: 'current_col', filterable: true }] },
+  });
+  const onColumnsLoaded = jest.fn();
+  const props = createProps({
+    datasetId: 901,
+    value: [],
+    mode: 'multiple',
+    onColumnsLoaded,
+  });
+  const { rerender } = render(<ColumnSelect {...(props as any)} />, {
+    useRedux: true,
+  });
+
+  props.datasetId = 902;
+  rerender(<ColumnSelect {...(props as any)} />);
+
+  await waitFor(() =>
+    expect(onColumnsLoaded).toHaveBeenCalledWith(['current_col'], '902__table'),
+  );
+  // Let the slow 901 response arrive; it must be dropped.
+  await waitFor(() =>
+    expect(
+      fetchMock.callHistory.calls('glob:*/api/v1/dataset/901?*'),
+    ).toHaveLength(1),
+  );
+  await new Promise(resolve => setTimeout(resolve, 250));
+  expect(onColumnsLoaded).toHaveBeenCalledTimes(1);
+  await userEvent.click(screen.getByRole('combobox'));
+  expect(await screen.findByTitle('current_col')).toBeInTheDocument();
+  expect(screen.queryByTitle('stale_col')).not.toBeInTheDocument();
 });

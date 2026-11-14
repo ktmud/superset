@@ -16,23 +16,27 @@
 # under the License.
 # isort:skip_file
 """Unit tests for Superset"""
+
 from datetime import datetime, timedelta
-import json
+from unittest import mock
 import random
 import string
 
 import pytest
-import prison
+import rison
 from sqlalchemy.sql import func
 
-import tests.integration_tests.test_app
+import tests.integration_tests.test_app  # noqa: F401
 from superset import db, security_manager
 from superset.common.db_query_status import QueryStatus
 from superset.models.core import Database
-from superset.utils.core import get_example_database, get_main_database
+from superset.utils.database import get_example_database, get_main_database
+from superset.utils import json
 from superset.models.sql_lab import Query
+from superset.queries.api import QueryRestApi
 
 from tests.integration_tests.base_tests import SupersetTestCase
+from tests.integration_tests.constants import ADMIN_USERNAME, GAMMA_SQLLAB_USERNAME
 
 QUERIES_FIXTURE_COUNT = 10
 
@@ -51,6 +55,10 @@ class TestQueryApi(SupersetTestCase):
         rows: int = 100,
         tab_name: str = "",
         status: str = "success",
+        changed_on: datetime = datetime(2020, 1, 1),
+        start_time: float | None = None,
+        start_running_time: float | None = None,
+        end_time: float | None = None,
     ) -> Query:
         database = db.session.query(Database).get(database_id)
         user = db.session.query(security_manager.user_model).get(user_id)
@@ -66,13 +74,16 @@ class TestQueryApi(SupersetTestCase):
             rows=rows,
             tab_name=tab_name,
             status=status,
-            changed_on=datetime(2020, 1, 1),
+            changed_on=changed_on,
+            start_time=start_time,
+            start_running_time=start_running_time,
+            end_time=end_time,
         )
         db.session.add(query)
         db.session.commit()
         return query
 
-    @pytest.fixture()
+    @pytest.fixture
     def create_queries(self):
         with self.create_app().app_context():
             queries = []
@@ -86,7 +97,7 @@ class TestQueryApi(SupersetTestCase):
                         example_database_id,
                         admin_id,
                         self.get_random_string(),
-                        sql=f"SELECT col1, col2 from table{cx}",
+                        sql=f"SELECT col1, col2 from table{cx}",  # noqa: S608
                         rows=cx,
                         status=QueryStatus.SUCCESS
                         if (cx % 2) == 0
@@ -98,7 +109,7 @@ class TestQueryApi(SupersetTestCase):
                     main_database_id,
                     alpha_id,
                     self.get_random_string(),
-                    sql=f"SELECT col1, col2 from table{QUERIES_FIXTURE_COUNT}",
+                    sql=f"SELECT col1, col2 from table{QUERIES_FIXTURE_COUNT}",  # noqa: S608
                     rows=QUERIES_FIXTURE_COUNT,
                     status=QueryStatus.SUCCESS,
                 )
@@ -114,7 +125,7 @@ class TestQueryApi(SupersetTestCase):
     @staticmethod
     def get_random_string(length: int = 10):
         letters = string.ascii_letters
-        return "".join(random.choice(letters) for i in range(length))
+        return "".join(random.choice(letters) for i in range(length))  # noqa: S311
 
     def test_get_query(self):
         """
@@ -131,10 +142,10 @@ class TestQueryApi(SupersetTestCase):
             select_sql="SELECT col1, col2 from table1",
             executed_sql="SELECT col1, col2 from table1 LIMIT 100",
         )
-        self.login(username="admin")
+        self.login(ADMIN_USERNAME)
         uri = f"api/v1/query/{query.id}"
         rv = self.client.get(uri)
-        self.assertEqual(rv.status_code, 200)
+        assert rv.status_code == 200
 
         expected_result = {
             "database": {"id": example_db.id},
@@ -159,7 +170,7 @@ class TestQueryApi(SupersetTestCase):
             "tracking_url": None,
         }
         data = json.loads(rv.data.decode("utf-8"))
-        self.assertIn("changed_on", data["result"])
+        assert "changed_on" in data["result"]
         for key, value in data["result"].items():
             # We can't assert timestamp
             if key not in (
@@ -169,7 +180,7 @@ class TestQueryApi(SupersetTestCase):
                 "start_time",
                 "id",
             ):
-                self.assertEqual(value, expected_result[key])
+                assert value == expected_result[key]
         # rollback changes
         db.session.delete(query)
         db.session.commit()
@@ -182,10 +193,10 @@ class TestQueryApi(SupersetTestCase):
         client_id = self.get_random_string()
         query = self.insert_query(get_example_database().id, admin.id, client_id)
         max_id = db.session.query(func.max(Query.id)).scalar()
-        self.login(username="admin")
+        self.login(ADMIN_USERNAME)
         uri = f"api/v1/query/{max_id + 1}"
         rv = self.client.get(uri)
-        self.assertEqual(rv.status_code, 404)
+        assert rv.status_code == 404
 
         db.session.delete(query)
         db.session.commit()
@@ -200,6 +211,10 @@ class TestQueryApi(SupersetTestCase):
         gamma2 = self.create_user(
             "gamma_2", "password", "Gamma", email="gamma2@superset.org"
         )
+        # Add SQLLab role to these gamma users, so they have access to queries
+        sqllab_role = self.get_role("sql_lab")
+        gamma1.roles.append(sqllab_role)
+        gamma2.roles.append(sqllab_role)
 
         gamma1_client_id = self.get_random_string()
         gamma2_client_id = self.get_random_string()
@@ -210,34 +225,34 @@ class TestQueryApi(SupersetTestCase):
             get_example_database().id, gamma2.id, gamma2_client_id
         )
 
-        # Gamma1 user, only sees his own queries
-        self.login(username="gamma_1", password="password")
+        # Gamma1 user, only sees their own queries
+        self.login(username="gamma_1", password="password")  # noqa: S106
         uri = f"api/v1/query/{query_gamma2.id}"
         rv = self.client.get(uri)
-        self.assertEqual(rv.status_code, 404)
+        assert rv.status_code == 404
         uri = f"api/v1/query/{query_gamma1.id}"
         rv = self.client.get(uri)
-        self.assertEqual(rv.status_code, 200)
+        assert rv.status_code == 200
 
-        # Gamma2 user, only sees his own queries
+        # Gamma2 user, only sees their own queries
         self.logout()
-        self.login(username="gamma_2", password="password")
+        self.login(username="gamma_2", password="password")  # noqa: S106
         uri = f"api/v1/query/{query_gamma1.id}"
         rv = self.client.get(uri)
-        self.assertEqual(rv.status_code, 404)
+        assert rv.status_code == 404
         uri = f"api/v1/query/{query_gamma2.id}"
         rv = self.client.get(uri)
-        self.assertEqual(rv.status_code, 200)
+        assert rv.status_code == 200
 
         # Admin's have the "all query access" permission
         self.logout()
-        self.login(username="admin")
+        self.login(ADMIN_USERNAME)
         uri = f"api/v1/query/{query_gamma1.id}"
         rv = self.client.get(uri)
-        self.assertEqual(rv.status_code, 200)
+        assert rv.status_code == 200
         uri = f"api/v1/query/{query_gamma2.id}"
         rv = self.client.get(uri)
-        self.assertEqual(rv.status_code, 200)
+        assert rv.status_code == 200
 
         # rollback changes
         db.session.delete(query_gamma1)
@@ -251,14 +266,14 @@ class TestQueryApi(SupersetTestCase):
         """
         Query API: Test get list query
         """
-        self.login(username="admin")
+        self.login(ADMIN_USERNAME)
         uri = "api/v1/query/"
         rv = self.client.get(uri)
-        self.assertEqual(rv.status_code, 200)
+        assert rv.status_code == 200
         data = json.loads(rv.data.decode("utf-8"))
         assert data["count"] == QUERIES_FIXTURE_COUNT
         # check expected columns
-        assert sorted(list(data["result"][0].keys())) == [
+        assert sorted(list(data["result"][0].keys())) == [  # noqa: C414
             "changed_on",
             "database",
             "end_time",
@@ -268,6 +283,7 @@ class TestQueryApi(SupersetTestCase):
             "schema",
             "sql",
             "sql_tables",
+            "start_running_time",
             "start_time",
             "status",
             "tab_name",
@@ -275,11 +291,10 @@ class TestQueryApi(SupersetTestCase):
             "tracking_url",
             "user",
         ]
-        assert sorted(list(data["result"][0]["user"].keys())) == [
+        assert sorted(list(data["result"][0]["user"].keys())) == [  # noqa: C414
             "first_name",
             "id",
             "last_name",
-            "username",
         ]
         assert list(data["result"][0]["database"].keys()) == [
             "database_name",
@@ -290,9 +305,9 @@ class TestQueryApi(SupersetTestCase):
         """
         Query API: Test get list query filter
         """
-        self.login(username="admin")
+        self.login(ADMIN_USERNAME)
         arguments = {"filters": [{"col": "sql", "opr": "ct", "value": "table2"}]}
-        uri = f"api/v1/query/?q={prison.dumps(arguments)}"
+        uri = f"api/v1/query/?q={rison.dumps(arguments)}"
         rv = self.client.get(uri)
         assert rv.status_code == 200
         data = json.loads(rv.data.decode("utf-8"))
@@ -303,12 +318,12 @@ class TestQueryApi(SupersetTestCase):
         """
         Query API: Test get list query filter database
         """
-        self.login(username="admin")
+        self.login(ADMIN_USERNAME)
         database_id = get_main_database().id
         arguments = {
             "filters": [{"col": "database", "opr": "rel_o_m", "value": database_id}]
         }
-        uri = f"api/v1/query/?q={prison.dumps(arguments)}"
+        uri = f"api/v1/query/?q={rison.dumps(arguments)}"
         rv = self.client.get(uri)
         assert rv.status_code == 200
         data = json.loads(rv.data.decode("utf-8"))
@@ -319,10 +334,10 @@ class TestQueryApi(SupersetTestCase):
         """
         Query API: Test get list query filter user
         """
-        self.login(username="admin")
+        self.login(ADMIN_USERNAME)
         alpha_id = self.get_user("alpha").id
         arguments = {"filters": [{"col": "user", "opr": "rel_o_m", "value": alpha_id}]}
-        uri = f"api/v1/query/?q={prison.dumps(arguments)}"
+        uri = f"api/v1/query/?q={rison.dumps(arguments)}"
         rv = self.client.get(uri)
         assert rv.status_code == 200
         data = json.loads(rv.data.decode("utf-8"))
@@ -333,14 +348,14 @@ class TestQueryApi(SupersetTestCase):
         """
         Query API: Test get list query filter changed_on
         """
-        self.login(username="admin")
+        self.login(ADMIN_USERNAME)
         arguments = {
             "filters": [
                 {"col": "changed_on", "opr": "lt", "value": "2020-02-01T00:00:00Z"},
                 {"col": "changed_on", "opr": "gt", "value": "2019-12-30T00:00:00Z"},
             ]
         }
-        uri = f"api/v1/query/?q={prison.dumps(arguments)}"
+        uri = f"api/v1/query/?q={rison.dumps(arguments)}"
         rv = self.client.get(uri)
         assert rv.status_code == 200
         data = json.loads(rv.data.decode("utf-8"))
@@ -351,10 +366,11 @@ class TestQueryApi(SupersetTestCase):
         """
         Query API: Test get list query filter changed_on
         """
-        self.login(username="admin")
+        self.login(ADMIN_USERNAME)
         order_columns = [
             "changed_on",
             "database.database_name",
+            "duration",
             "rows",
             "schema",
             "sql",
@@ -364,9 +380,81 @@ class TestQueryApi(SupersetTestCase):
 
         for order_column in order_columns:
             arguments = {"order_column": order_column, "order_direction": "asc"}
-            uri = f"api/v1/query/?q={prison.dumps(arguments)}"
+            uri = f"api/v1/query/?q={rison.dumps(arguments)}"
             rv = self.client.get(uri)
             assert rv.status_code == 200
+
+    def test_get_list_query_order_duration(self):
+        """
+        Query API: Test that sorting by duration orders by end_time - start_time,
+        falling back to start_time when start_running_time is absent, and treating
+        NULL durations (no end_time) as zero.
+        """
+        admin = self.get_user("admin")
+        example_db = get_example_database()
+        base_time = 1_000_000.0
+
+        # duration = 0.031 (uses start_running_time as start)
+        q_long = self.insert_query(
+            example_db.id,
+            admin.id,
+            self.get_random_string(),
+            start_time=base_time,
+            start_running_time=base_time + 0.005,
+            end_time=base_time + 0.036,
+        )
+        # duration = 0.021
+        q_medium = self.insert_query(
+            example_db.id,
+            admin.id,
+            self.get_random_string(),
+            start_time=base_time,
+            start_running_time=None,
+            end_time=base_time + 0.021,
+        )
+        # duration = 0 (no end_time, NULL treated as 0)
+        q_null = self.insert_query(
+            example_db.id,
+            admin.id,
+            self.get_random_string(),
+            start_time=base_time,
+            start_running_time=None,
+            end_time=None,
+        )
+
+        # Use a unique sql_editor_id to isolate these test queries
+        test_editor_id = self.get_random_string()
+        q_long.sql_editor_id = test_editor_id
+        q_medium.sql_editor_id = test_editor_id
+        q_null.sql_editor_id = test_editor_id
+        db.session.commit()
+
+        self.login(ADMIN_USERNAME)
+        arguments = {
+            "order_column": "duration",
+            "order_direction": "asc",
+            "filters": [{"col": "sql_editor_id", "opr": "eq", "value": test_editor_id}],
+        }
+        uri = f"api/v1/query/?q={rison.dumps(arguments)}"
+        rv = self.client.get(uri)
+        assert rv.status_code == 200
+        data = rv.get_json()
+        ids = [r["id"] for r in data["result"]]
+        assert ids == [q_null.id, q_medium.id, q_long.id]
+
+        # descending should be the reverse
+        arguments["order_direction"] = "desc"
+        uri = f"api/v1/query/?q={rison.dumps(arguments)}"
+        rv = self.client.get(uri)
+        assert rv.status_code == 200
+        data = rv.get_json()
+        ids = [r["id"] for r in data["result"]]
+        assert ids == [q_long.id, q_medium.id, q_null.id]
+
+        db.session.delete(q_long)
+        db.session.delete(q_medium)
+        db.session.delete(q_null)
+        db.session.commit()
 
     def test_get_list_query_no_data_access(self):
         """
@@ -381,9 +469,9 @@ class TestQueryApi(SupersetTestCase):
             sql="SELECT col1, col2 from table1",
         )
 
-        self.login(username="gamma")
+        self.login(GAMMA_SQLLAB_USERNAME)
         arguments = {"filters": [{"col": "sql", "opr": "sw", "value": "SELECT col1"}]}
-        uri = f"api/v1/query/?q={prison.dumps(arguments)}"
+        uri = f"api/v1/query/?q={rison.dumps(arguments)}"
         rv = self.client.get(uri)
         assert rv.status_code == 200
         data = json.loads(rv.data.decode("utf-8"))
@@ -392,3 +480,159 @@ class TestQueryApi(SupersetTestCase):
         # rollback changes
         db.session.delete(query)
         db.session.commit()
+
+    def test_get_updated_since(self):
+        """
+        Query API: Test get queries updated since timestamp
+        """
+        now = datetime.utcnow()
+        client_id = self.get_random_string()
+
+        admin = self.get_user("admin")
+        example_db = get_example_database()
+
+        old_query = self.insert_query(
+            example_db.id,
+            admin.id,
+            self.get_random_string(),
+            sql="SELECT col1, col2 from table1",
+            select_sql="SELECT col1, col2 from table1",
+            executed_sql="SELECT col1, col2 from table1 LIMIT 100",
+            changed_on=now - timedelta(days=3),
+        )
+        updated_query = self.insert_query(
+            example_db.id,
+            admin.id,
+            client_id,
+            sql="SELECT col1, col2 from table1",
+            select_sql="SELECT col1, col2 from table1",
+            executed_sql="SELECT col1, col2 from table1 LIMIT 100",
+            changed_on=now - timedelta(days=1),
+        )
+
+        self.login(ADMIN_USERNAME)
+        timestamp = datetime.timestamp(now - timedelta(days=2)) * 1000
+        uri = f"api/v1/query/updated_since?q={rison.dumps({'last_updated_ms': timestamp})}"  # noqa: E501
+        rv = self.client.get(uri)
+        assert rv.status_code == 200
+
+        expected_result = updated_query.to_dict()
+        data = json.loads(rv.data.decode("utf-8"))
+        assert len(data["result"]) == 1
+        for key, value in data["result"][0].items():
+            # We can't assert timestamp
+            if key not in (
+                "changed_on",
+                "end_time",
+                "start_running_time",
+                "start_time",
+                "id",
+            ):
+                assert value == expected_result[key]
+        # rollback changes
+        db.session.delete(old_query)
+        db.session.delete(updated_query)
+        db.session.commit()
+
+    def test_stop_query_not_found(self):
+        """
+        Handles stop query when the DB engine spec does not
+        have a cancel query method (with invalid client_id).
+        """
+        form_data = {"client_id": "foo2"}
+        self.login(ADMIN_USERNAME)
+        rv = self.client.post(
+            "/api/v1/query/stop",
+            data=json.dumps(form_data),
+            content_type="application/json",
+        )
+
+        assert rv.status_code == 404
+        data = json.loads(rv.data.decode("utf-8"))
+        assert data["message"] == "Query with client_id foo2 not found"
+
+    def test_stop_query(self):
+        """
+        Handles stop query when the DB engine spec does not
+        have a cancel query method.
+        """
+        form_data = {"client_id": "foo"}
+        admin = self.get_user("admin")
+        example_db = get_example_database()
+        query1 = self.insert_query(
+            example_db.id,
+            admin.id,
+            form_data["client_id"],
+            sql="SELECT col1, col2 from table1",
+            select_sql="SELECT col1, col2 from table1",
+            executed_sql="SELECT col1, col2 from table1 LIMIT 100",
+            changed_on=datetime.utcnow() - timedelta(days=1),
+            status=QueryStatus.RUNNING,
+        )
+        self.login(ADMIN_USERNAME)
+        rv = self.client.post(
+            "/api/v1/query/stop",
+            data=json.dumps(form_data),
+            content_type="application/json",
+        )
+
+        assert rv.status_code == 200
+        data = json.loads(rv.data.decode("utf-8"))
+        assert data["result"] == "OK"
+        db.session.delete(query1)
+        db.session.commit()
+
+    def test_stop_query_already_finished(self) -> None:
+        """Return the completed query rather than reporting a successful stop."""
+        self.login(ADMIN_USERNAME)
+        query = self.insert_query(
+            get_example_database().id,
+            self.get_user("admin").id,
+            "done-stop",
+            sql="SELECT 1",
+            status=QueryStatus.SUCCESS,
+        )
+        try:
+            response = self.client.post(
+                "/api/v1/query/stop",
+                json={"client_id": query.client_id},
+            )
+
+            assert response.status_code == 422
+            assert response.json == {
+                "message": "Could not cancel query",
+                "query": query.to_dict(),
+            }
+            db.session.refresh(query)
+            assert query.status == QueryStatus.SUCCESS
+        finally:
+            db.session.delete(query)
+            db.session.commit()
+
+    @mock.patch("superset.queries.api.QueryDAO.stop_query")
+    def test_stop_query_missing_client_id(self, mock_stop_query: mock.Mock) -> None:
+        """Return 400 on the first attempt when client_id is missing."""
+        schema = QueryRestApi.stop_query_schema
+        self.login(ADMIN_USERNAME)
+        with mock.patch.object(schema, "load", wraps=schema.load) as mock_load:
+            rv = self.client.post("/api/v1/query/stop", json={})
+
+        assert rv.status_code == 400
+        assert rv.json == {
+            "message": {"client_id": ["Missing data for required field."]}
+        }
+        assert mock_load.call_count == 1
+        mock_stop_query.assert_not_called()
+
+    @mock.patch("superset.queries.api.QueryDAO.stop_query")
+    def test_stop_query_invalid_client_id(self, mock_stop_query: mock.Mock) -> None:
+        """Return 400 on the first attempt when client_id has the wrong type."""
+        schema = QueryRestApi.stop_query_schema
+        self.login(ADMIN_USERNAME)
+        with mock.patch.object(schema, "load", wraps=schema.load) as mock_load:
+            rv = self.client.post("/api/v1/query/stop", json={"client_id": 123})
+
+        assert rv.status_code == 400
+        assert rv.json == {"message": {"client_id": ["Not a valid string."]}}
+        assert mock_load.call_count == 1
+        mock_stop_query.assert_not_called()

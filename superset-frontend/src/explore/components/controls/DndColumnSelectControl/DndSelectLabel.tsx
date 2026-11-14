@@ -16,9 +16,13 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React, { ReactNode } from 'react';
-import { useDrop } from 'react-dnd';
-import { t, useTheme } from '@superset-ui/core';
+import { ReactNode, useCallback, useContext, useEffect, useMemo } from 'react';
+import { useDroppable } from '@dnd-kit/core';
+import {
+  SortableContext,
+  verticalListSortingStrategy,
+} from '@dnd-kit/sortable';
+import { t } from '@apache-superset/core/translation';
 import ControlHeader from 'src/explore/components/ControlHeader';
 import {
   AddControlLabel,
@@ -29,46 +33,130 @@ import {
   DatasourcePanelDndItem,
   DndItemValue,
 } from 'src/explore/components/DatasourcePanel/types';
-import Icons from 'src/components/Icons';
+import { Icons } from '@superset-ui/core/components/Icons';
 import { DndItemType } from '../../DndItemType';
+import { DraggingContext, DropzoneContext } from '../../ExploreContainer';
+
+export type ActiveDragData = {
+  type: string;
+  value?: unknown;
+  items?: DatasourcePanelDndItem[];
+};
+
+/**
+ * Pure, folder-aware `canDrop` logic for the currently dragged item, extracted
+ * so it can be unit-tested directly: @dnd-kit's PointerSensor only reacts to
+ * real pointer events, which jsdom cannot meaningfully dispatch (see
+ * ExploreDndContext's `resolveDragEnd` for the same pattern).
+ */
+export function resolveCanDrop(
+  activeData: ActiveDragData | undefined,
+  acceptTypes: DndItemType[],
+  dropValidator: (item: DatasourcePanelDndItem) => boolean,
+): boolean {
+  if (!activeData) return false;
+  if (!acceptTypes.includes(activeData.type as DndItemType)) return false;
+  // A folder can drop here when at least one of its items is acceptable.
+  if (activeData.type === DndItemType.Folder) {
+    const items = Array.isArray(activeData.items) ? activeData.items : [];
+    return items.some(
+      item =>
+        acceptTypes.includes(item.type as DndItemType) && dropValidator(item),
+    );
+  }
+  return dropValidator({
+    type: activeData.type as DndItemType,
+    value: activeData.value as DndItemValue,
+  });
+}
 
 export type DndSelectLabelProps = {
   name: string;
   accept: DndItemType | DndItemType[];
-  ghostButtonText?: string;
+  ghostButtonText: string;
   onDrop: (item: DatasourcePanelDndItem) => void;
   canDrop: (item: DatasourcePanelDndItem) => boolean;
   canDropValue?: (value: DndItemValue) => boolean;
   onDropValue?: (value: DndItemValue) => void;
+  onDropFolder?: (items: DatasourcePanelDndItem[]) => void;
   valuesRenderer: () => ReactNode;
   displayGhostButton?: boolean;
-  onClickGhostButton?: () => void;
+  onClickGhostButton: () => void;
+  isLoading?: boolean;
+  // For sortable items - the type string and count to generate sortable IDs
+  sortableType?: string;
+  itemCount?: number;
 };
 
 export default function DndSelectLabel({
   displayGhostButton = true,
   accept,
+  valuesRenderer,
+  isLoading,
+  sortableType,
+  itemCount = 0,
   ...props
 }: DndSelectLabelProps) {
-  const theme = useTheme();
+  const canDropProp = props.canDrop;
+  const canDropValueProp = props.canDropValue;
 
-  const [{ isOver, canDrop }, datasourcePanelDrop] = useDrop({
-    accept,
+  const acceptTypes = useMemo(
+    () => (Array.isArray(accept) ? accept : [accept]),
+    [accept],
+  );
 
-    drop: (item: DatasourcePanelDndItem) => {
-      props.onDrop(item);
-      props.onDropValue?.(item.value);
+  const dropValidator = useCallback(
+    (item: DatasourcePanelDndItem) =>
+      canDropProp(item) && (canDropValueProp?.(item.value) ?? true),
+    [canDropProp, canDropValueProp],
+  );
+
+  const { setNodeRef, isOver, active } = useDroppable({
+    id: `dropzone-${props.name}`,
+    disabled: isLoading,
+    data: {
+      accept: acceptTypes,
+      // Mirrors react-dnd's `canDrop`: the drop only fires when this returns
+      // true, so duplicate/selection gating is preserved post-migration.
+      canDrop: dropValidator,
+      onDrop: props.onDrop,
+      onDropValue: props.onDropValue,
+      onDropFolder: props.onDropFolder,
     },
-
-    canDrop: (item: DatasourcePanelDndItem) =>
-      props.canDrop(item) && (props.canDropValue?.(item.value) ?? true),
-
-    collect: monitor => ({
-      isOver: monitor.isOver(),
-      canDrop: monitor.canDrop(),
-      type: monitor.getItemType(),
-    }),
   });
+
+  // Check if the active dragged item can be dropped here
+  const canDrop = useMemo(
+    () =>
+      resolveCanDrop(
+        active?.data.current as ActiveDragData | undefined,
+        acceptTypes,
+        dropValidator,
+      ),
+    [active, acceptTypes, dropValidator],
+  );
+
+  const [, dispatch] = useContext(DropzoneContext);
+
+  useEffect(() => {
+    dispatch({ key: props.name, canDrop: dropValidator });
+    return () => {
+      dispatch({ key: props.name });
+    };
+  }, [dispatch, props.name, dropValidator]);
+
+  const isDragging = useContext(DraggingContext);
+
+  const values = useMemo(() => valuesRenderer(), [valuesRenderer]);
+
+  // Generate sortable item IDs for SortableContext
+  const sortableItemIds = useMemo(() => {
+    if (!sortableType || itemCount === 0) return [];
+    return Array.from(
+      { length: itemCount },
+      (_, i) => `sortable-${sortableType}-${i}`,
+    );
+  }, [sortableType, itemCount]);
 
   function renderGhostButton() {
     return (
@@ -76,19 +164,42 @@ export default function DndSelectLabel({
         cancelHover={!props.onClickGhostButton}
         onClick={props.onClickGhostButton}
       >
-        <Icons.PlusSmall iconColor={theme.colors.grayscale.light1} />
-        {t(props.ghostButtonText || 'Drop columns here')}
+        <Icons.PlusOutlined iconSize="m" />
+        {t(props.ghostButtonText)}
       </AddControlLabel>
     );
   }
 
+  // The actual drop is handled in ExploreDndContext's onDragEnd.
+
+  // Wrap values in SortableContext if sortable
+  const renderSortableValues = () => {
+    if (sortableItemIds.length > 0) {
+      return (
+        <SortableContext
+          items={sortableItemIds}
+          strategy={verticalListSortingStrategy}
+        >
+          {values}
+        </SortableContext>
+      );
+    }
+    return values;
+  };
+
   return (
-    <div ref={datasourcePanelDrop}>
+    <div ref={setNodeRef}>
       <HeaderContainer>
         <ControlHeader {...props} />
       </HeaderContainer>
-      <DndLabelsContainer canDrop={canDrop} isOver={isOver}>
-        {props.valuesRenderer()}
+      <DndLabelsContainer
+        data-test="dnd-labels-container"
+        canDrop={canDrop}
+        isOver={isOver}
+        isDragging={isDragging}
+        isLoading={isLoading}
+      >
+        {renderSortableValues()}
         {displayGhostButton && renderGhostButton()}
       </DndLabelsContainer>
     </div>

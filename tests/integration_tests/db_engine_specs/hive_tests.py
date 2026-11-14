@@ -15,16 +15,22 @@
 # specific language governing permissions and limitations
 # under the License.
 # isort:skip_file
-from datetime import datetime
+from datetime import date, timedelta
 from unittest import mock
+import unittest
 
 import pytest
 import pandas as pd
+from sqlalchemy import text
 from sqlalchemy.sql import select
 
+from superset.constants import TimeGrain
 from superset.db_engine_specs.hive import HiveEngineSpec, upload_to_s3
 from superset.exceptions import SupersetException
-from superset.sql_parse import Table, ParsedQuery
+from superset.sql.parse import Table
+from superset.utils.database import get_example_database
+from tests.common.assert_utils import assert_any_call_with_text
+from tests.integration_tests.base_tests import SupersetTestCase
 from tests.integration_tests.test_app import app
 
 
@@ -32,18 +38,14 @@ def test_0_progress():
     log = """
         17/02/07 18:26:27 INFO log.PerfLogger: <PERFLOG method=compile from=org.apache.hadoop.hive.ql.Driver>
         17/02/07 18:26:27 INFO log.PerfLogger: <PERFLOG method=parse from=org.apache.hadoop.hive.ql.Driver>
-    """.split(
-        "\n"
-    )
+    """.split("\n")  # noqa: E501
     assert HiveEngineSpec.progress(log) == 0
 
 
 def test_number_of_jobs_progress():
     log = """
         17/02/07 19:15:55 INFO ql.Driver: Total jobs = 2
-    """.split(
-        "\n"
-    )
+    """.split("\n")
     assert HiveEngineSpec.progress(log) == 0
 
 
@@ -51,9 +53,7 @@ def test_job_1_launched_progress():
     log = """
         17/02/07 19:15:55 INFO ql.Driver: Total jobs = 2
         17/02/07 19:15:55 INFO ql.Driver: Launching Job 1 out of 2
-    """.split(
-        "\n"
-    )
+    """.split("\n")
     assert HiveEngineSpec.progress(log) == 0
 
 
@@ -62,9 +62,7 @@ def test_job_1_launched_stage_1():
         17/02/07 19:15:55 INFO ql.Driver: Total jobs = 2
         17/02/07 19:15:55 INFO ql.Driver: Launching Job 1 out of 2
         17/02/07 19:16:09 INFO exec.Task: 2017-02-07 19:16:09,173 Stage-1 map = 0%,  reduce = 0%
-    """.split(
-        "\n"
-    )
+    """.split("\n")  # noqa: E501
     assert HiveEngineSpec.progress(log) == 0
 
 
@@ -74,9 +72,7 @@ def test_job_1_launched_stage_1_map_40_progress():  # pylint: disable=invalid-na
         17/02/07 19:15:55 INFO ql.Driver: Launching Job 1 out of 2
         17/02/07 19:16:09 INFO exec.Task: 2017-02-07 19:16:09,173 Stage-1 map = 0%,  reduce = 0%
         17/02/07 19:16:09 INFO exec.Task: 2017-02-07 19:16:09,173 Stage-1 map = 40%,  reduce = 0%
-    """.split(
-        "\n"
-    )
+    """.split("\n")  # noqa: E501
     assert HiveEngineSpec.progress(log) == 10
 
 
@@ -87,9 +83,7 @@ def test_job_1_launched_stage_1_map_80_reduce_40_progress():  # pylint: disable=
         17/02/07 19:16:09 INFO exec.Task: 2017-02-07 19:16:09,173 Stage-1 map = 0%,  reduce = 0%
         17/02/07 19:16:09 INFO exec.Task: 2017-02-07 19:16:09,173 Stage-1 map = 40%,  reduce = 0%
         17/02/07 19:16:09 INFO exec.Task: 2017-02-07 19:16:09,173 Stage-1 map = 80%,  reduce = 40%
-    """.split(
-        "\n"
-    )
+    """.split("\n")  # noqa: E501
     assert HiveEngineSpec.progress(log) == 30
 
 
@@ -102,9 +96,7 @@ def test_job_1_launched_stage_2_stages_progress():  # pylint: disable=invalid-na
         17/02/07 19:16:09 INFO exec.Task: 2017-02-07 19:16:09,173 Stage-1 map = 80%,  reduce = 40%
         17/02/07 19:16:09 INFO exec.Task: 2017-02-07 19:16:09,173 Stage-2 map = 0%,  reduce = 0%
         17/02/07 19:16:09 INFO exec.Task: 2017-02-07 19:16:09,173 Stage-1 map = 100%,  reduce = 0%
-    """.split(
-        "\n"
-    )
+    """.split("\n")  # noqa: E501
     assert HiveEngineSpec.progress(log) == 12
 
 
@@ -116,9 +108,7 @@ def test_job_2_launched_stage_2_stages_progress():  # pylint: disable=invalid-na
         17/02/07 19:15:55 INFO ql.Driver: Launching Job 2 out of 2
         17/02/07 19:16:09 INFO exec.Task: 2017-02-07 19:16:09,173 Stage-1 map = 0%,  reduce = 0%
         17/02/07 19:16:09 INFO exec.Task: 2017-02-07 19:16:09,173 Stage-1 map = 40%,  reduce = 0%
-    """.split(
-        "\n"
-    )
+    """.split("\n")  # noqa: E501
     assert HiveEngineSpec.progress(log) == 60
 
 
@@ -149,23 +139,13 @@ def test_hive_error_msg():
     )
 
 
-def test_hive_get_view_names_return_empty_list():  # pylint: disable=invalid-name
-    assert HiveEngineSpec.get_view_names(mock.ANY, mock.ANY, mock.ANY) == []
-
-
-def test_convert_dttm():
-    dttm = datetime.strptime("2019-01-02 03:04:05.678900", "%Y-%m-%d %H:%M:%S.%f")
-    assert HiveEngineSpec.convert_dttm("DATE", dttm) == "CAST('2019-01-02' AS DATE)"
-    assert (
-        HiveEngineSpec.convert_dttm("TIMESTAMP", dttm)
-        == "CAST('2019-01-02 03:04:05.678900' AS TIMESTAMP)"
-    )
-
-
 def test_df_to_csv() -> None:
     with pytest.raises(SupersetException):
         HiveEngineSpec.df_to_sql(
-            mock.MagicMock(), Table("foobar"), pd.DataFrame(), {"if_exists": "append"},
+            mock.MagicMock(),
+            Table("foobar"),
+            pd.DataFrame(),
+            {"if_exists": "append"},
         )
 
 
@@ -181,6 +161,9 @@ def test_df_to_sql_if_exists_fail(mock_g):
 
 
 @mock.patch("superset.db_engine_specs.hive.g", spec={})
+@unittest.skipUnless(
+    SupersetTestCase.is_module_installed("thrift"), "thrift not installed"
+)
 def test_df_to_sql_if_exists_fail_with_schema(mock_g):
     mock_g.user = True
     mock_database = mock.MagicMock()
@@ -196,15 +179,22 @@ def test_df_to_sql_if_exists_fail_with_schema(mock_g):
 
 @mock.patch("superset.db_engine_specs.hive.g", spec={})
 @mock.patch("superset.db_engine_specs.hive.upload_to_s3")
+@unittest.skipUnless(
+    SupersetTestCase.is_module_installed("boto3"), "boto3 not installed"
+)
 def test_df_to_sql_if_exists_replace(mock_upload_to_s3, mock_g):
     config = app.config.copy()
-    app.config["CSV_TO_HIVE_UPLOAD_DIRECTORY_FUNC"]: lambda *args: ""
+    app.config["CSV_TO_HIVE_UPLOAD_DIRECTORY_FUNC"]: lambda *args: ""  # noqa: F722
     mock_upload_to_s3.return_value = "mock-location"
     mock_g.user = True
+    mock_execute = mock.MagicMock(return_value=True)
+    mock_connection = mock.MagicMock()
+    mock_connection.execute = mock_execute
+    mock_engine = mock.MagicMock()
+    mock_engine.begin().__enter__.return_value = mock_connection
     mock_database = mock.MagicMock()
     mock_database.get_df.return_value.empty = False
-    mock_execute = mock.MagicMock(return_value=True)
-    mock_database.get_sqla_engine.return_value.execute = mock_execute
+    mock_database.get_sqla_engine().__enter__.return_value = mock_engine
     table_name = "foobar"
 
     with app.app_context():
@@ -215,7 +205,10 @@ def test_df_to_sql_if_exists_replace(mock_upload_to_s3, mock_g):
             {"if_exists": "replace", "header": 1, "na_values": "mock", "sep": "mock"},
         )
 
-    mock_execute.assert_any_call(f"DROP TABLE IF EXISTS {table_name}")
+    assert_any_call_with_text(
+        mock_execute,
+        f"DROP TABLE IF EXISTS {table_name}",
+    )
     app.config = config
 
 
@@ -223,13 +216,17 @@ def test_df_to_sql_if_exists_replace(mock_upload_to_s3, mock_g):
 @mock.patch("superset.db_engine_specs.hive.upload_to_s3")
 def test_df_to_sql_if_exists_replace_with_schema(mock_upload_to_s3, mock_g):
     config = app.config.copy()
-    app.config["CSV_TO_HIVE_UPLOAD_DIRECTORY_FUNC"]: lambda *args: ""
+    app.config["CSV_TO_HIVE_UPLOAD_DIRECTORY_FUNC"]: lambda *args: ""  # noqa: F722
     mock_upload_to_s3.return_value = "mock-location"
     mock_g.user = True
+    mock_execute = mock.MagicMock(return_value=True)
+    mock_connection = mock.MagicMock()
+    mock_connection.execute = mock_execute
+    mock_engine = mock.MagicMock()
+    mock_engine.begin().__enter__.return_value = mock_connection
     mock_database = mock.MagicMock()
     mock_database.get_df.return_value.empty = False
-    mock_execute = mock.MagicMock(return_value=True)
-    mock_database.get_sqla_engine.return_value.execute = mock_execute
+    mock_database.get_sqla_engine().__enter__.return_value = mock_engine
     table_name = "foobar"
     schema = "schema"
 
@@ -241,21 +238,10 @@ def test_df_to_sql_if_exists_replace_with_schema(mock_upload_to_s3, mock_g):
             {"if_exists": "replace", "header": 1, "na_values": "mock", "sep": "mock"},
         )
 
-    mock_execute.assert_any_call(f"DROP TABLE IF EXISTS {schema}.{table_name}")
+    assert_any_call_with_text(
+        mock_execute, f"DROP TABLE IF EXISTS {schema}.{table_name}"
+    )
     app.config = config
-
-
-def test_is_readonly():
-    def is_readonly(sql: str) -> bool:
-        return HiveEngineSpec.is_readonly_query(ParsedQuery(sql))
-
-    assert not is_readonly("UPDATE t1 SET col1 = NULL")
-    assert not is_readonly("INSERT OVERWRITE TABLE tabB SELECT a.Age FROM TableA")
-    assert is_readonly("SHOW LOCKS test EXTENDED")
-    assert is_readonly("SET hivevar:desc='Legislators'")
-    assert is_readonly("EXPLAIN SELECT 1")
-    assert is_readonly("SELECT 1")
-    assert is_readonly("WITH (SELECT 1) bla SELECT * from bla")
 
 
 @pytest.mark.parametrize(
@@ -274,6 +260,9 @@ def test_s3_upload_prefix(schema: str, upload_prefix: str) -> None:
     )
 
 
+@unittest.skipUnless(
+    SupersetTestCase.is_module_installed("boto3"), "boto3 not installed"
+)
 def test_upload_to_s3_no_bucket_path():
     with app.app_context():
         with pytest.raises(
@@ -283,6 +272,9 @@ def test_upload_to_s3_no_bucket_path():
             upload_to_s3("filename", "prefix", Table("table"))
 
 
+@unittest.skipUnless(
+    SupersetTestCase.is_module_installed("boto3"), "boto3 not installed"
+)
 @mock.patch("boto3.client")
 def test_upload_to_s3_client_error(client):
     config = app.config.copy()
@@ -300,6 +292,9 @@ def test_upload_to_s3_client_error(client):
     app.config = config
 
 
+@unittest.skipUnless(
+    SupersetTestCase.is_module_installed("boto3"), "boto3 not installed"
+)
 @mock.patch("boto3.client")
 def test_upload_to_s3_success(client):
     config = app.config.copy()
@@ -308,11 +303,14 @@ def test_upload_to_s3_success(client):
 
     with app.app_context():
         location = upload_to_s3("filename", "prefix", Table("table"))
-        assert f"s3a://bucket/prefix/table" == location
+        assert "s3a://bucket/prefix/table" == location  # noqa: F541
 
     app.config = config
 
 
+@unittest.skipUnless(
+    SupersetTestCase.is_module_installed("thrift"), "thrift not installed"
+)
 def test_fetch_data_query_error():
     from TCLIService import ttypes
 
@@ -324,6 +322,9 @@ def test_fetch_data_query_error():
         HiveEngineSpec.fetch_data(cursor)
 
 
+@unittest.skipUnless(
+    SupersetTestCase.is_module_installed("thrift"), "thrift not installed"
+)
 @mock.patch("superset.db_engine_specs.base.BaseEngineSpec.fetch_data")
 def test_fetch_data_programming_error(fetch_data_mock):
     from pyhive.exc import ProgrammingError
@@ -333,6 +334,9 @@ def test_fetch_data_programming_error(fetch_data_mock):
     assert HiveEngineSpec.fetch_data(cursor) == []
 
 
+@unittest.skipUnless(
+    SupersetTestCase.is_module_installed("thrift"), "thrift not installed"
+)
 @mock.patch("superset.db_engine_specs.base.BaseEngineSpec.fetch_data")
 def test_fetch_data_success(fetch_data_mock):
     return_value = ["a", "b"]
@@ -344,27 +348,35 @@ def test_fetch_data_success(fetch_data_mock):
 @mock.patch("superset.db_engine_specs.hive.HiveEngineSpec._latest_partition_from_df")
 def test_where_latest_partition(mock_method):
     mock_method.return_value = ("01-01-19", 1)
-    db = mock.Mock()
-    db.get_indexes = mock.Mock(return_value=[{"column_names": ["ds", "hour"]}])
-    db.get_extra = mock.Mock(return_value={})
-    db.get_df = mock.Mock()
+    database = mock.Mock()
+    database.get_indexes = mock.Mock(return_value=[{"column_names": ["ds", "hour"]}])
+    database.get_extra = mock.Mock(return_value={})
+    database.get_df = mock.Mock()
     columns = [{"name": "ds"}, {"name": "hour"}]
     with app.app_context():
         result = HiveEngineSpec.where_latest_partition(
-            "test_table", "test_schema", db, select(), columns
+            database,
+            Table("test_table", "test_schema"),
+            select(),
+            columns,
         )
     query_result = str(result.compile(compile_kwargs={"literal_binds": True}))
-    assert "SELECT  \nWHERE ds = '01-01-19' AND hour = 1" == query_result
+    # SQLAlchemy 2.0 changed how select() with no columns renders - a single
+    # trailing space before the newline instead of two under 1.4.
+    assert "SELECT \nWHERE ds = '01-01-19' AND hour = 1" == query_result
 
 
 @mock.patch("superset.db_engine_specs.presto.PrestoEngineSpec.latest_partition")
 def test_where_latest_partition_super_method_exception(mock_method):
     mock_method.side_effect = Exception()
-    db = mock.Mock()
+    database = mock.Mock()
     columns = [{"name": "ds"}, {"name": "hour"}]
     with app.app_context():
         result = HiveEngineSpec.where_latest_partition(
-            "test_table", "test_schema", db, select(), columns
+            database,
+            Table("test_table", "test_schema"),
+            select(),
+            columns,
         )
     assert result is None
     mock_method.assert_called()
@@ -376,6 +388,93 @@ def test_where_latest_partition_no_columns_no_values(mock_method):
     db = mock.Mock()
     with app.app_context():
         result = HiveEngineSpec.where_latest_partition(
-            "test_table", "test_schema", db, select()
+            db,
+            Table("test_table", "test_schema"),
+            select(),
         )
     assert result is None
+
+
+def test__latest_partition_from_df():
+    def is_correct_result(data: list, result: list) -> bool:
+        df = pd.DataFrame({"partition": data})
+        return HiveEngineSpec._latest_partition_from_df(df) == result
+
+    assert is_correct_result(["ds=01-01-19"], ["01-01-19"])
+    assert is_correct_result(
+        ["ds=01-01-19", "ds=01-03-19", "ds=01-02-19"], ["01-03-19"]
+    )
+    assert is_correct_result(["ds=01-01-19/hour=1"], ["01-01-19", "1"])
+    assert is_correct_result(
+        ["ds=01-01-19/hour=1", "ds=01-03-19/hour=1", "ds=01-02-19/hour=1"],
+        ["01-03-19", "1"],
+    )
+    assert is_correct_result(
+        ["ds=01-01-19/hour=1", "ds=01-03-19/hour=1", "ds=01-02-19/hour=2"],
+        ["01-03-19", "1"],
+    )
+
+
+def test_get_view_names_with_schema():
+    database = mock.MagicMock()
+    mock_execute = mock.MagicMock()
+    database.get_raw_connection().__enter__().cursor().execute = mock_execute
+    database.get_raw_connection().__enter__().cursor().fetchall = mock.MagicMock(
+        return_value=[["a", "b,", "c"], ["d", "e"]]
+    )
+
+    schema = "schema"
+    result = HiveEngineSpec.get_view_names(database, mock.Mock(), schema)
+    mock_execute.assert_called_once_with(f"SHOW VIEWS IN `{schema}`")
+    assert result == {"a", "d"}
+
+
+def test_get_view_names_without_schema():
+    database = mock.MagicMock()
+    mock_execute = mock.MagicMock()
+    database.get_raw_connection().__enter__().cursor().execute = mock_execute
+    database.get_raw_connection().__enter__().cursor().fetchall = mock.MagicMock(
+        return_value=[["a", "b,", "c"], ["d", "e"]]
+    )
+    result = HiveEngineSpec.get_view_names(database, mock.Mock(), None)
+    mock_execute.assert_called_once_with("SHOW VIEWS")
+    assert result == {"a", "d"}
+
+
+@mock.patch("superset.db_engine_specs.base.BaseEngineSpec.get_table_names")
+@mock.patch("superset.db_engine_specs.hive.HiveEngineSpec.get_view_names")
+def test_get_table_names(
+    mock_get_view_names,
+    mock_get_table_names,
+):
+    mock_get_view_names.return_value = {"view1", "view2"}
+    mock_get_table_names.return_value = {"table1", "table2", "view1", "view2"}
+    tables = HiveEngineSpec.get_table_names(mock.Mock(), mock.Mock(), None)
+    assert tables == {"table1", "table2"}
+
+
+@pytest.mark.hive_engine_spec
+@pytest.mark.usefixtures("app_context")
+def test_week_time_grain_buckets_to_monday_on_hive() -> None:
+    """
+    Run the ``WEEK`` grain expression on a real Hive and check that every day
+    over two weeks is bucketed to the Monday of its week.
+    """
+    database = get_example_database()
+    if database.backend != "hive":
+        pytest.skip("Requires a Hive examples database")
+
+    days = [date(2025, 1, 6) + timedelta(days=i) for i in range(14)]
+    literals = ", ".join(f"'{day}'" for day in days)
+    expression = HiveEngineSpec._time_grain_expressions[TimeGrain.WEEK].format(
+        col="CAST(d AS DATE)"
+    )
+    sql = f"SELECT d, {expression} FROM (SELECT explode(array({literals})) AS d) t"  # noqa: S608
+
+    with database.get_sqla_engine() as engine:
+        with engine.connect() as conn:
+            rows = conn.execute(text(sql)).fetchall()
+
+    assert dict(rows) == {
+        str(day): f"{day - timedelta(days=day.weekday())} 00:00:00" for day in days
+    }

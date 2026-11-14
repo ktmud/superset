@@ -17,11 +17,19 @@
  * under the License.
  */
 
-import React from 'react';
-import { render, screen } from 'spec/helpers/testing-library';
-import userEvent from '@testing-library/user-event';
-import DatabaseErrorMessage from './DatabaseErrorMessage';
-import { ErrorLevel, ErrorSource, ErrorTypeEnum } from './types';
+import { ErrorLevel, ErrorSource, ErrorTypeEnum } from '@superset-ui/core';
+import { render, screen, userEvent } from 'spec/helpers/testing-library';
+import { DatabaseErrorMessage } from './DatabaseErrorMessage';
+
+jest.mock(
+  '@superset-ui/core/components/Icons/AsyncIcon',
+  () =>
+    ({ fileName }: { fileName: string }) =>
+      (
+        // eslint-disable-next-line jsx-a11y/prefer-tag-over-role -- mirrors AsyncIcon's real span+role="img" shape
+        <span role="img" aria-label={fileName.replace('_', '-')} />
+      ),
+);
 
 const mockedProps = {
   error: {
@@ -38,7 +46,7 @@ const mockedProps = {
           message: 'Issue code message B',
         },
       ],
-      owners: ['Owner A', 'Owner B'],
+      editors: ['Owner A', 'Owner B'],
     },
     level: 'error' as ErrorLevel,
     message: 'Error message',
@@ -47,22 +55,61 @@ const mockedProps = {
   subtitle: 'Error message',
 };
 
+const mockedPropsWithCustomError = {
+  ...mockedProps,
+  error: {
+    ...mockedProps.error,
+    extra: {
+      ...mockedProps.error.extra,
+      custom_doc_links: [
+        {
+          label: 'Custom Doc Link 1',
+          url: 'https://example.com/custom-doc-1',
+        },
+        {
+          label: 'Custom Doc Link 2',
+          url: 'https://example.com/custom-doc-2',
+        },
+      ],
+      show_issue_info: false,
+    },
+  },
+};
+
+const mockedPropsWithCustomErrorAndBadLinks = {
+  ...mockedProps,
+  error: {
+    ...mockedProps.error,
+    extra: {
+      ...mockedProps.error.extra,
+      custom_doc_links: true,
+    },
+  },
+};
+
 test('should render', () => {
-  const { container } = render(<DatabaseErrorMessage {...mockedProps} />);
+  const nullExtraProps = {
+    ...mockedProps,
+    error: {
+      ...mockedProps.error,
+      extra: null,
+    },
+  };
+  const { container } = render(<DatabaseErrorMessage {...nullExtraProps} />);
   expect(container).toBeInTheDocument();
 });
 
-test('should render the error message', () => {
+test('should render the error message', async () => {
   render(<DatabaseErrorMessage {...mockedProps} />, { useRedux: true });
   const button = screen.getByText('See more');
-  userEvent.click(button);
+  await userEvent.click(button);
   expect(screen.getByText('Error message')).toBeInTheDocument();
 });
 
-test('should render the issue codes', () => {
+test('should render the issue codes', async () => {
   render(<DatabaseErrorMessage {...mockedProps} />, { useRedux: true });
   const button = screen.getByText('See more');
-  userEvent.click(button);
+  await userEvent.click(button);
   expect(screen.getByText(/This may be triggered by:/)).toBeInTheDocument();
   expect(screen.getByText(/Issue code message A/)).toBeInTheDocument();
   expect(screen.getByText(/Issue code message B/)).toBeInTheDocument();
@@ -73,19 +120,19 @@ test('should render the engine name', () => {
   expect(screen.getByText(/Engine name/)).toBeInTheDocument();
 });
 
-test('should render the owners', () => {
+test('should render the editors', async () => {
   render(<DatabaseErrorMessage {...mockedProps} />, { useRedux: true });
   const button = screen.getByText('See more');
-  userEvent.click(button);
+  await userEvent.click(button);
   expect(
-    screen.getByText('Please reach out to the Chart Owners for assistance.'),
+    screen.getByText('Please reach out to the Chart Editors for assistance.'),
   ).toBeInTheDocument();
   expect(
-    screen.getByText('Chart Owners: Owner A, Owner B'),
+    screen.getByText('Chart Editors: Owner A, Owner B'),
   ).toBeInTheDocument();
 });
 
-test('should NOT render the owners', () => {
+test('should NOT render the editors', async () => {
   const noVisualizationProps = {
     ...mockedProps,
     source: 'sqllab' as ErrorSource,
@@ -94,8 +141,33 @@ test('should NOT render the owners', () => {
     useRedux: true,
   });
   const button = screen.getByText('See more');
-  userEvent.click(button);
+  await userEvent.click(button);
   expect(
-    screen.queryByText('Chart Owners: Owner A, Owner B'),
+    screen.queryByText('Chart Editors: Owner A, Owner B'),
   ).not.toBeInTheDocument();
+});
+
+test('should render custom documentation links when provided', () => {
+  render(<DatabaseErrorMessage {...mockedPropsWithCustomError} />, {
+    useRedux: true,
+  });
+  expect(screen.getByText('Custom Doc Link 1')).toBeInTheDocument();
+  expect(screen.getByText('Custom Doc Link 2')).toBeInTheDocument();
+});
+
+test('should NOT render see more button when show_issue_info is false', () => {
+  render(<DatabaseErrorMessage {...mockedPropsWithCustomError} />, {
+    useRedux: true,
+  });
+  const button = screen.queryByText('See more');
+  expect(button).not.toBeInTheDocument();
+});
+
+test('should render message when wrong value provided for custom_doc_urls', () => {
+  // @ts-expect-error
+  render(<DatabaseErrorMessage {...mockedPropsWithCustomErrorAndBadLinks} />, {
+    useRedux: true,
+  });
+  const button = screen.queryByText('Error message');
+  expect(button).toBeInTheDocument();
 });

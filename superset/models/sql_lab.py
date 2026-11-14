@@ -15,16 +15,24 @@
 # specific language governing permissions and limitations
 # under the License.
 """A collection of ORM sqlalchemy models for SQL Lab"""
-import re
-from datetime import datetime
-from typing import Any, Dict, List
 
-import simplejson as json
+import builtins
+import inspect
+import logging
+import re
+from collections.abc import Hashable
+from datetime import datetime
+from functools import cache
+from typing import Any, Callable, cast, Optional, TYPE_CHECKING
+
 import sqlalchemy as sqla
-from flask import Markup
+from flask import current_app as app
 from flask_appbuilder import Model
 from flask_appbuilder.models.decorators import renders
+from flask_babel import gettext as __
 from humanize import naturaltime
+from jinja2.exceptions import TemplateError
+from markupsafe import Markup
 from sqlalchemy import (
     Boolean,
     Column,
@@ -37,30 +45,100 @@ from sqlalchemy import (
     Text,
 )
 from sqlalchemy.engine.url import URL
+from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import backref, relationship
+from sqlalchemy.sql.elements import ColumnElement, literal_column
+from superset_core.queries.models import (
+    Query as CoreQuery,
+    SavedQuery as CoreSavedQuery,
+)
 
 from superset import security_manager
+from superset.exceptions import (
+    SupersetException,
+    SupersetParseError,
+    SupersetSecurityException,
+)
+from superset.explorables.base import TimeGrainDict
+from superset.jinja_context import BaseTemplateProcessor, get_template_processor
 from superset.models.helpers import (
     AuditMixinNullable,
+    ExploreMixin,
     ExtraJSONMixin,
     ImportExportMixin,
+    SqlExpressionContext,
 )
-from superset.models.tags import QueryUpdater
-from superset.sql_parse import CtasMethod, ParsedQuery, Table
+from superset.sql.parse import (
+    CTASMethod,
+    process_jinja_sql,
+    Table,
+)
 from superset.sqllab.limiting_factor import LimitingFactor
-from superset.utils.core import QueryStatus, user_label
+from superset.superset_typing import DatasetColumnData, ExplorableData, QueryObjectDict
+from superset.utils import json
+from superset.utils.core import (
+    GenericDataType,
+    get_column_name,
+    LongText,
+    MediumText,
+    QueryStatus,
+    user_label,
+)
+from superset.utils.dates import naive_utcnow
+
+if TYPE_CHECKING:
+    from superset.connectors.sqla.models import TableColumn
+    from superset.db_engine_specs import BaseEngineSpec
+    from superset.utils.rls import RLSSchema
 
 
-class Query(Model, ExtraJSONMixin):
+logger = logging.getLogger(__name__)
+
+
+class SqlTablesMixin:  # pylint: disable=too-few-public-methods
+    @property
+    def sql_tables(self) -> list[Table]:
+        try:
+            return list(
+                process_jinja_sql(
+                    self.sql,  # type: ignore
+                    self.database,  # type: ignore
+                ).tables
+            )
+        except (SupersetSecurityException, SupersetParseError, TemplateError):
+            return []
+        except SupersetException as ex:
+            # Jinja macros such as ``{{ dataset(id) }}`` or ``{{ metric(...) }}``
+            # may reference resources that no longer exist (e.g. a deleted
+            # dataset). Surfacing the failure here would break list endpoints
+            # that include ``sql_tables`` in their payload, hiding every saved
+            # query from the user. Treat it as a parse failure instead.
+            logger.warning("Unable to extract tables from SQL via Jinja: %s", ex)
+            return []
+
+
+class Query(
+    CoreQuery,
+    SqlTablesMixin,
+    ExtraJSONMixin,
+    ExploreMixin,
+):  # pylint: disable=abstract-method,too-many-public-methods
     """ORM model for SQL query
 
     Now that SQL Lab support multi-statement execution, an entry in this
     table may represent multiple SQL statements executed sequentially"""
 
     __tablename__ = "query"
+    type = "query"
+
+    # Query results are raw rows, so samples are meaningful. Declared
+    # explicitly (rather than relying on a fail-open ``getattr`` default)
+    # so every member of ``DatasourceDAO.sources`` carries the capability.
+    supports_samples: bool = True
+
     id = Column(Integer, primary_key=True)
     client_id = Column(String(11), unique=True, nullable=False)
-
+    query_language = "sql"
     database_id = Column(Integer, ForeignKey("dbs.id"), nullable=False)
 
     # Store the tmp table into the DB only if the user asks for it.
@@ -69,13 +147,14 @@ class Query(Model, ExtraJSONMixin):
     user_id = Column(Integer, ForeignKey("ab_user.id"), nullable=True)
     status = Column(String(16), default=QueryStatus.PENDING)
     tab_name = Column(String(256))
-    sql_editor_id = Column(String(256))
+    sql_editor_id = Column(String(256), index=True)
     schema = Column(String(256))
-    sql = Column(Text)
+    catalog = Column(String(256), nullable=True, default=None)
+    sql = Column(LongText())
     # Query to retrieve the results,
     # used only in case of select_as_cta_used is true.
-    select_sql = Column(Text)
-    executed_sql = Column(Text)
+    select_sql = Column(LongText())
+    executed_sql = Column(LongText())
     # Could be configured in the superset config.
     limit = Column(Integer)
     limiting_factor = Column(
@@ -83,7 +162,7 @@ class Query(Model, ExtraJSONMixin):
     )
     select_as_cta = Column(Boolean)
     select_as_cta_used = Column(Boolean, default=False)
-    ctas_method = Column(String(16), default=CtasMethod.TABLE)
+    ctas_method = Column(String(16), default=CTASMethod.TABLE.name)
 
     progress = Column(Integer, default=0)  # 1..100
     # # of rows in the result set or rows modified.
@@ -98,27 +177,50 @@ class Query(Model, ExtraJSONMixin):
     start_running_time = Column(Numeric(precision=20, scale=6))
     end_time = Column(Numeric(precision=20, scale=6))
     end_result_backend_time = Column(Numeric(precision=20, scale=6))
-    tracking_url = Column(Text)
+    tracking_url_raw = Column(Text, name="tracking_url")
 
     changed_on = Column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=True
+        DateTime, default=naive_utcnow, onupdate=naive_utcnow, nullable=True
     )
+
+    @hybrid_property
+    def duration(self) -> Optional[float]:
+        start = self.start_running_time or self.start_time
+        if self.end_time is not None and start is not None:
+            return float(self.end_time - start)
+        return None
+
+    @duration.expression  # type: ignore[no-redef]
+    def duration(cls) -> ColumnElement:  # noqa: N805
+        return sqla.func.coalesce(
+            cls.end_time - sqla.func.coalesce(cls.start_running_time, cls.start_time),
+            0,
+        )
 
     database = relationship(
         "Database",
         foreign_keys=[database_id],
-        backref=backref("queries", cascade="all, delete-orphan"),
+        backref=backref(
+            "queries",
+            cascade="all, delete-orphan",
+            # SQLAlchemy 2.0 behavior: assigning `query.database` no longer
+            # cascades the Query into the Database's session; callers must
+            # add objects to a session explicitly.
+            cascade_backrefs=False,
+        ),
     )
     user = relationship(security_manager.user_model, foreign_keys=[user_id])
 
     __table_args__ = (sqla.Index("ti_user_id_changed_on", user_id, changed_on),)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def get_template_processor(self, **kwargs: Any) -> BaseTemplateProcessor:
+        return get_template_processor(query=self, database=self.database, **kwargs)
+
+    def to_dict(self) -> dict[str, Any]:
         return {
-            "changedOn": self.changed_on,
             "changed_on": self.changed_on.isoformat(),
             "dbId": self.database_id,
-            "db": self.database.database_name,
+            "db": self.database.database_name if self.database else None,
             "endDttm": self.end_time,
             "errorMessage": self.error_message,
             "executedSql": self.executed_sql,
@@ -128,6 +230,7 @@ class Query(Model, ExtraJSONMixin):
             "limitingFactor": self.limiting_factor,
             "progress": self.progress,
             "rows": self.rows,
+            "catalog": self.catalog,
             "schema": self.schema,
             "ctas": self.select_as_cta,
             "serverId": self.id,
@@ -163,45 +266,353 @@ class Query(Model, ExtraJSONMixin):
         return self.user.username
 
     @property
-    def sql_tables(self) -> List[Table]:
-        return list(ParsedQuery(self.sql).tables)
+    def columns(self) -> list["TableColumn"]:
+        from superset.connectors.sqla.models import (  # pylint: disable=import-outside-toplevel
+            TableColumn,
+        )
+
+        return [
+            TableColumn(
+                column_name=col["column_name"],
+                database=self.database,
+                is_dttm=col["is_dttm"],
+                filterable=True,
+                groupby=True,
+                type=col["type"],
+            )
+            for col in self.extra.get("columns", [])
+        ]
+
+    @property
+    def db_extra(self) -> Optional[dict[str, Any]]:
+        return None
+
+    @property
+    def data(self) -> ExplorableData:
+        """Returns query data for the frontend"""
+        order_by_choices = []
+        for col in self.columns:
+            column_name = str(col.column_name or "")
+            order_by_choices.append(
+                (json.dumps([column_name, True]), f"{column_name} " + __("[asc]"))
+            )
+            order_by_choices.append(
+                (json.dumps([column_name, False]), f"{column_name} " + __("[desc]"))
+            )
+
+        return {
+            "time_grain_sqla": [
+                (g.duration, g.name) for g in self.database.grains() or []
+            ],
+            "filter_select": True,
+            "name": self.tab_name,
+            "columns": [cast(DatasetColumnData, o.data) for o in self.columns],
+            "metrics": [],
+            "id": self.id,
+            "type": self.type,
+            "sql": self.sql,
+            "database": {"id": self.database_id, "backend": self.database.backend},
+            "order_by_choices": order_by_choices,
+            "catalog": self.catalog,
+            "schema": self.schema,
+            "verbose_map": {},
+        }
 
     def raise_for_access(self) -> None:
         """
         Raise an exception if the user cannot access the resource.
 
+        Re-validation of a SQL Lab query uses the same strict scoping as the
+        initial execute path (``force_dataset_match=True``) so that fetching
+        results, exporting CSV, and streaming-exporting all enforce the same
+        per-table dataset-match requirement. ``raise_for_access`` parses
+        ``executed_sql`` (the Jinja-rendered query that actually ran) when
+        set, keeping the table set aligned with execution even though the
+        original ``template_params`` are not persisted on the query record.
+
         :raises SupersetSecurityException: If the user cannot access the resource
         """
 
-        security_manager.raise_for_access(query=self)
+        security_manager.raise_for_access(query=self, force_dataset_match=True)
+
+    @property
+    def db_engine_spec(
+        self,
+    ) -> builtins.type["BaseEngineSpec"]:  # pylint: disable=unsubscriptable-object
+        return self.database.db_engine_spec
+
+    @property
+    def uid(self) -> str:
+        return f"{self.id}__{self.type}"
+
+    @property
+    def is_rls_supported(self) -> bool:
+        return False
+
+    @property
+    def cache_timeout(self) -> int:
+        return 0
+
+    @property
+    def column_names(self) -> list[Any]:
+        return [col.column_name for col in self.columns]
+
+    @property
+    def offset(self) -> int:
+        return 0
+
+    @property
+    def main_dttm_col(self) -> Optional[str]:
+        for col in self.columns:
+            if col.get("is_dttm"):
+                return col.get("column_name")
+        return None
+
+    @property
+    def dttm_cols(self) -> list[Any]:
+        return [col.column_name for col in self.columns if col.is_dttm]
+
+    @property
+    def schema_perm(self) -> str:
+        if not self.database:
+            return ""
+        return (
+            security_manager.get_schema_perm(
+                self.database.database_name,
+                self.catalog or self.database.get_default_catalog(),
+                self.schema,
+            )
+            or ""
+        )
+
+    @property
+    def perm(self) -> str:
+        return f"[{self.database.database_name}].[{self.tab_name}](id:{self.id})"
+
+    @property
+    def default_endpoint(self) -> str:
+        return ""
+
+    def get_extra_cache_keys(self, query_obj: QueryObjectDict) -> list[Hashable]:
+        """
+        Include the RLS predicates that apply to this ad-hoc query's
+        underlying tables in the cache key, mirroring what
+        ``SqlaTable.get_extra_cache_keys`` already does for virtual datasets.
+
+        ``is_rls_supported`` is ``False`` for a SQL Lab query (it has no RLS
+        rules of its own to look up via ``get_rls_cache_key``), which left
+        ``security_manager.get_rls_cache_key()`` contributing nothing here.
+        Without this, two viewers of the same not-yet-saved query-backed
+        chart (e.g. via a shared Explore permalink) with different RLS on
+        the tables the query references would collide on the same cache
+        entry, regardless of their own access.
+        """
+        if not self.sql:
+            return []
+        resolve_catalog = cache(self.database.get_default_catalog)
+        resolve_schema = cache(self._get_rls_schema)
+        predicates = self.get_inner_rls_cache_key(
+            resolve_catalog=resolve_catalog, resolve_schema=resolve_schema
+        )
+        predicates.extend(
+            self._get_query_rls_cache_keys(
+                query_obj,
+                resolve_catalog=resolve_catalog,
+                resolve_schema=resolve_schema,
+            )
+        )
+        return list(dict.fromkeys(predicates))
+
+    def get_inner_rls_cache_key(
+        self,
+        *,
+        resolve_catalog: Callable[[], str | None] | None = None,
+        resolve_schema: Callable[[], "RLSSchema"] | None = None,
+    ) -> list[str]:
+        """Key query-backed caches on the RLS execution injects into inner tables."""
+        from superset.utils.rls import collect_rls_predicates_for_sql
+
+        if not self.sql:
+            return []
+        return collect_rls_predicates_for_sql(
+            self.sql,
+            self.database,
+            self.catalog,
+            self.schema,
+            # Match ``get_from_clause``: a Query has no outer RLS application.
+            include_global_guest_rls=True,
+            resolve_catalog=resolve_catalog,
+            resolve_schema=resolve_schema or self._get_rls_schema,
+        )
+
+    def get_time_grains(self) -> list[TimeGrainDict]:
+        """
+        Get available time granularities from the database.
+
+        Delegates to the database's time grain definitions.
+        """
+        return [
+            {
+                "name": grain.name,
+                "function": grain.function,
+                "duration": grain.duration,
+            }
+            for grain in (self.database.grains() or [])
+        ]
+
+    def has_drill_by_columns(self, column_names: list[str]) -> bool:
+        """
+        Check if the specified columns support drill-by operations.
+
+        For Query objects, all columns are considered drillable since they
+        come from ad-hoc SQL queries without predefined metadata.
+        """
+        if not column_names:
+            return False
+        return set(column_names).issubset(set(self.column_names))
+
+    @property
+    def tracking_url(self) -> Optional[str]:
+        """
+        Transform tracking url at run time because the exact URL may depend
+        on query properties such as execution and finish time.
+        """
+        transform = app.config.get("TRACKING_URL_TRANSFORMER")
+        url = self.tracking_url_raw
+        if url and transform:
+            sig = inspect.signature(transform)
+            # for backward compatibility, users may define a transformer function
+            # with only one parameter (`url`).
+            args = [url, self][: len(sig.parameters)]
+            url = transform(*args)
+            logger.debug("Transformed tracking url: %s", url)
+        return url
+
+    @tracking_url.setter
+    def tracking_url(self, value: str) -> None:
+        self.tracking_url_raw = value
+
+    def get_column(self, column_name: Optional[str]) -> Optional["TableColumn"]:
+        if not column_name:
+            return None
+        for col in self.columns:
+            if col.column_name == column_name:
+                return col
+        return None
+
+    def adhoc_column_to_sqla(
+        self,
+        col: "AdhocColumn",  # type: ignore  # noqa: F821
+        force_type_check: bool = False,
+        template_processor: Optional[BaseTemplateProcessor] = None,
+        apply_dataset_offset: bool = False,
+        sql_shifted_temporal_labels: set[str] | None = None,
+    ) -> tuple[ColumnElement, Optional[GenericDataType]]:
+        """
+        Turn an adhoc column into a sqlalchemy column.
+        :param col: Adhoc column definition
+        :param template_processor: template_processor instance
+        :returns: A tuple of (SQLAlchemy column, generic column type). The
+            generic type is resolved from query result column metadata when
+            the adhoc label matches a known column; otherwise ``None``.
+        :rtype: tuple[sqlalchemy.sql.ColumnElement, Optional[GenericDataType]]
+        """
+        label = get_column_name(col)
+        sql_expression = col["sqlExpression"]
+        time_grain = col.get("timeGrain")
+        has_timegrain = col.get("columnType") == "BASE_AXIS" and time_grain
+        is_dttm = False
+        pdf = None
+
+        if col_in_metadata := self.get_column(sql_expression):
+            is_dttm = col_in_metadata.is_temporal
+            pdf = col_in_metadata.python_date_format
+
+        expression = self._process_sql_expression(
+            sql_expression,
+            SqlExpressionContext(
+                self.database.backend,
+                self.schema,
+                template_processor,
+            ),
+        )
+        sqla_column = literal_column(expression)
+
+        if is_dttm and has_timegrain:
+            sqla_column = self.db_engine_spec.get_timestamp_expr(
+                col=sqla_column,
+                pdf=pdf,
+                time_grain=time_grain,
+            )
+
+        col_meta = next((c for c in self.columns if c.column_name == label), None)
+        generic_type = col_meta.type_generic if col_meta else None
+        return self.make_sqla_column_compatible(sqla_column, label), generic_type
 
 
-class SavedQuery(Model, AuditMixinNullable, ExtraJSONMixin, ImportExportMixin):
+class SavedQuery(
+    CoreSavedQuery,
+    SqlTablesMixin,
+    AuditMixinNullable,
+    ExtraJSONMixin,
+    ImportExportMixin,
+):
     """ORM model for SQL query"""
 
     __tablename__ = "saved_query"
+
+    # Saved queries are backed by raw rows, so samples are meaningful.
+    # Declared explicitly (rather than relying on a fail-open ``getattr``
+    # default) so every member of ``DatasourceDAO.sources`` carries the
+    # capability.
+    supports_samples: bool = True
+
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("ab_user.id"), nullable=True)
     db_id = Column(Integer, ForeignKey("dbs.id"), nullable=True)
     schema = Column(String(128))
+    catalog = Column(String(256), nullable=True, default=None)
     label = Column(String(256))
     description = Column(Text)
-    sql = Column(Text)
+    sql = Column(MediumText())
+    template_parameters = Column(Text)
     user = relationship(
         security_manager.user_model,
-        backref=backref("saved_queries", cascade="all, delete-orphan"),
+        backref=backref(
+            "saved_queries",
+            cascade="all, delete-orphan",
+            # SQLAlchemy 2.0 behavior: assigning `saved_query.user` no longer
+            # cascades the SavedQuery into the User's session; callers must
+            # add objects to a session explicitly.
+            cascade_backrefs=False,
+        ),
         foreign_keys=[user_id],
     )
     database = relationship(
         "Database",
         foreign_keys=[db_id],
-        backref=backref("saved_queries", cascade="all, delete-orphan"),
+        backref=backref(
+            "saved_queries",
+            cascade="all, delete-orphan",
+            # SQLAlchemy 2.0 behavior: see `user` above.
+            cascade_backrefs=False,
+        ),
     )
     rows = Column(Integer, nullable=True)
     last_run = Column(DateTime, nullable=True)
+    tags = relationship(
+        "Tag",
+        secondary="tagged_object",
+        overlaps="objects,tag,tags",
+        primaryjoin="and_(SavedQuery.id == TaggedObject.object_id, "
+        "TaggedObject.object_type == 'query')",
+        secondaryjoin="TaggedObject.tag_id == Tag.id",
+        viewonly=True,  # cascading deletion already handled by superset.tags.models.ObjectUpdater.after_delete  # noqa: E501
+    )
 
     export_parent = "database"
     export_fields = [
+        "catalog",
         "schema",
         "label",
         "description",
@@ -211,11 +622,16 @@ class SavedQuery(Model, AuditMixinNullable, ExtraJSONMixin, ImportExportMixin):
     def __repr__(self) -> str:
         return str(self.label)
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+        }
+
     @property
     def pop_tab_link(self) -> Markup:
         return Markup(
             f"""
-            <a href="/superset/sqllab?savedQueryId={self.id}">
+            <a href="/sqllab?savedQueryId={self.id}">
                 <i class="fa fa-link"></i>
             </a>
         """
@@ -230,11 +646,7 @@ class SavedQuery(Model, AuditMixinNullable, ExtraJSONMixin, ImportExportMixin):
         return self.database.sqlalchemy_uri
 
     def url(self) -> str:
-        return "/superset/sqllab?savedQueryId={0}".format(self.id)
-
-    @property
-    def sql_tables(self) -> List[Table]:
-        return list(ParsedQuery(self.sql).tables)
+        return f"/sqllab?savedQueryId={self.id}"
 
     @property
     def last_run_humanized(self) -> str:
@@ -249,8 +661,7 @@ class SavedQuery(Model, AuditMixinNullable, ExtraJSONMixin, ImportExportMixin):
         return self._last_run_delta_humanized
 
 
-class TabState(Model, AuditMixinNullable, ExtraJSONMixin):
-
+class TabState(AuditMixinNullable, ExtraJSONMixin, Model):
     __tablename__ = "tab_state"
 
     # basic info
@@ -260,9 +671,10 @@ class TabState(Model, AuditMixinNullable, ExtraJSONMixin):
     active = Column(Boolean, default=False)
 
     # selected DB and schema
-    database_id = Column(Integer, ForeignKey("dbs.id"))
+    database_id = Column(Integer, ForeignKey("dbs.id", ondelete="CASCADE"))
     database = relationship("Database", foreign_keys=[database_id])
     schema = Column(String(256))
+    catalog = Column(String(256), nullable=True, default=None)
 
     # tables that are open in the schema browser and their data previews
     table_schemas = relationship(
@@ -273,11 +685,13 @@ class TabState(Model, AuditMixinNullable, ExtraJSONMixin):
     )
 
     # the query in the textarea, and results (if any)
-    sql = Column(Text)
+    sql = Column(MediumText())
     query_limit = Column(Integer)
 
     # latest query that was run
-    latest_query_id = Column(Integer, ForeignKey("query.client_id"))
+    latest_query_id = Column(
+        String(11), ForeignKey("query.client_id", ondelete="SET NULL")
+    )
     latest_query = relationship("Query")
 
     # other properties
@@ -285,34 +699,60 @@ class TabState(Model, AuditMixinNullable, ExtraJSONMixin):
     template_params = Column(Text)
     hide_left_bar = Column(Boolean, default=False)
 
-    def to_dict(self) -> Dict[str, Any]:
+    # any saved queries that are associated with the Tab State
+    saved_query_id = Column(
+        Integer, ForeignKey("saved_query.id", ondelete="SET NULL"), nullable=True
+    )
+    saved_query = relationship("SavedQuery", foreign_keys=[saved_query_id])
+
+    def to_dict(self) -> dict[str, Any]:
+        latest_query = None
+        try:
+            if self.latest_query:
+                latest_query = self.latest_query.to_dict()
+        except Exception:
+            query = self.__dict__.get("latest_query")
+            logger.warning(
+                "Failed to load/serialize latest_query for tab state %s "
+                "(latest_query_id=%s, query_status=%s)",
+                self.id,
+                self.latest_query_id,
+                getattr(query, "status", "N/A"),
+                exc_info=True,
+            )
+
         return {
             "id": self.id,
             "user_id": self.user_id,
             "label": self.label,
             "active": self.active,
             "database_id": self.database_id,
+            "catalog": self.catalog,
             "schema": self.schema,
             "table_schemas": [ts.to_dict() for ts in self.table_schemas],
             "sql": self.sql,
             "query_limit": self.query_limit,
-            "latest_query": self.latest_query.to_dict() if self.latest_query else None,
+            "latest_query": latest_query,
             "autorun": self.autorun,
             "template_params": self.template_params,
             "hide_left_bar": self.hide_left_bar,
+            "saved_query": self.saved_query.to_dict() if self.saved_query else None,
+            "extra_json": self.extra,
         }
 
 
-class TableSchema(Model, AuditMixinNullable, ExtraJSONMixin):
-
+class TableSchema(AuditMixinNullable, ExtraJSONMixin, Model):
     __tablename__ = "table_schema"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     tab_state_id = Column(Integer, ForeignKey("tab_state.id", ondelete="CASCADE"))
 
-    database_id = Column(Integer, ForeignKey("dbs.id"), nullable=False)
+    database_id = Column(
+        Integer, ForeignKey("dbs.id", ondelete="CASCADE"), nullable=False
+    )
     database = relationship("Database", foreign_keys=[database_id])
     schema = Column(String(256))
+    catalog = Column(String(256), nullable=True, default=None)
     table = Column(String(256))
 
     # JSON describing the schema, partitions, latest partition, etc.
@@ -320,7 +760,7 @@ class TableSchema(Model, AuditMixinNullable, ExtraJSONMixin):
 
     expanded = Column(Boolean, default=False)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         try:
             description = json.loads(self.description)
         except json.JSONDecodeError:
@@ -330,14 +770,9 @@ class TableSchema(Model, AuditMixinNullable, ExtraJSONMixin):
             "id": self.id,
             "tab_state_id": self.tab_state_id,
             "database_id": self.database_id,
+            "catalog": self.catalog,
             "schema": self.schema,
             "table": self.table,
             "description": description,
             "expanded": self.expanded,
         }
-
-
-# events for updating tags
-sqla.event.listen(SavedQuery, "after_insert", QueryUpdater.after_insert)
-sqla.event.listen(SavedQuery, "after_update", QueryUpdater.after_update)
-sqla.event.listen(SavedQuery, "after_delete", QueryUpdater.after_delete)

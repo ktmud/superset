@@ -25,6 +25,8 @@ const assetsConfig = {
   path: [`${workspaceDirectory}/superset/static/assets`],
   hashFiles: [
     `${workspaceDirectory}/superset-frontend/src/**/*`,
+    `${workspaceDirectory}/superset-frontend/packages/**/*`,
+    `${workspaceDirectory}/superset-frontend/plugins/**/*`,
     `${workspaceDirectory}/superset-frontend/*.js`,
     `${workspaceDirectory}/superset-frontend/*.json`,
   ],
@@ -47,10 +49,4 @@ module.exports = {
   // one is built with `npm run build`,
   // another is built with `npm run build-instrumented`
   'instrumented-assets': assetsConfig,
-  cypress: {
-    path: [`${homeDirectory}/.cache/Cypress`],
-    hashFiles: [
-      `${workspaceDirectory}/superset-frontend/cypress-base/package-lock.json`,
-    ],
-  },
 };

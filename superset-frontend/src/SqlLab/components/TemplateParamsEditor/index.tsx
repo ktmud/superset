@@ -16,34 +16,49 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React, { useState, useEffect } from 'react';
-import Badge from 'src/components/Badge';
-import { t, styled } from '@superset-ui/core';
-import { InfoTooltipWithTrigger } from '@superset-ui/chart-controls';
-import { debounce } from 'lodash';
+import { useState, useEffect } from 'react';
+import { t } from '@apache-superset/core/translation';
+import { styled } from '@apache-superset/core/theme';
+import { debounce } from 'lodash-es';
+import {
+  Badge,
+  InfoTooltip,
+  ModalTrigger,
+  Tooltip,
+  Constants,
+} from '@superset-ui/core/components';
+import { EditorHost } from 'src/core/editors';
+import useQueryEditor from 'src/SqlLab/hooks/useQueryEditor';
 
-import ModalTrigger from 'src/components/ModalTrigger';
-import { ConfigEditor } from 'src/components/AsyncAceEditor';
-import { FAST_DEBOUNCE } from 'src/constants';
-import { Tooltip } from 'src/components/Tooltip';
-
-const StyledConfigEditor = styled(ConfigEditor)`
-  &.ace_editor {
-    border: 1px solid ${({ theme }) => theme.colors.grayscale.light2};
-  }
+const EditorOutline = styled.div`
+  border: 1px solid ${({ theme }) => theme.colorBorder};
+  border-radius: ${({ theme }) => theme.borderRadius}px;
 `;
 
-function TemplateParamsEditor({
-  code = '{}',
+const StyledParagraph = styled.p`
+  margin-top: 0;
+`;
+
+const Code = styled.code`
+  color: ${({ theme }) => theme.colorPrimary};
+`;
+
+export type TemplateParamsEditorProps = {
+  queryEditorId: string;
+  language: 'yaml' | 'json';
+  onChange: (params: any) => void;
+};
+
+const TemplateParamsEditor = ({
+  queryEditorId,
   language,
   onChange = () => {},
-}: {
-  code: string;
-  language: 'yaml' | 'json';
-  onChange: () => void;
-}) {
+}: TemplateParamsEditorProps) => {
   const [parsedJSON, setParsedJSON] = useState({});
   const [isValid, setIsValid] = useState(true);
+
+  const { templateParams } = useQueryEditor(queryEditorId, ['templateParams']);
+  const code = templateParams ?? '{}';
 
   useEffect(() => {
     try {
@@ -57,33 +72,30 @@ function TemplateParamsEditor({
 
   const modalBody = (
     <div>
-      <p>
-        Assign a set of parameters as
-        <code>JSON</code>
-        below (example:
-        <code>{'{"my_table": "foo"}'}</code>
-        ), and they become available in your SQL (example:
-        <code>SELECT * FROM {'{{ my_table }}'} </code>) by using&nbsp;
+      <StyledParagraph>
+        {t('Assign a set of parameters as')} <Code>JSON</Code>{' '}
+        {t('below (example:')} <Code>{'{"my_table": "foo"}'}</Code>
+        {t('), and they become available in your SQL (example:')}{' '}
+        <Code>SELECT * FROM {'{{ my_table }}'} </Code>) {t('by using')}&nbsp;
         <a
           href="https://superset.apache.org/sqllab.html#templating-with-jinja"
           target="_blank"
           rel="noopener noreferrer"
         >
-          Jinja templating
+          {t('Jinja templating')}
         </a>{' '}
-        syntax.
-      </p>
-      <StyledConfigEditor
-        keywords={[]}
-        mode={language}
-        minLines={25}
-        maxLines={50}
-        onChange={debounce(onChange, FAST_DEBOUNCE)}
-        width="100%"
-        editorProps={{ $blockScrolling: true }}
-        enableLiveAutocompletion
-        value={code}
-      />
+        {t('syntax.')}
+      </StyledParagraph>
+      <EditorOutline>
+        <EditorHost
+          id={`template-params-${queryEditorId}`}
+          height="360px"
+          onChange={debounce(onChange, Constants.FAST_DEBOUNCE)}
+          language={language === 'yaml' ? 'yaml' : 'json'}
+          width="100%"
+          value={code}
+        />
+      </EditorOutline>
     </div>
   );
 
@@ -99,13 +111,14 @@ function TemplateParamsEditor({
           title={t('Edit template parameters')}
           trigger={['hover']}
         >
-          <div role="button">
-            {`${t('Parameters')} `}
+          {/* ModalTrigger's own wrapper div already provides role="button"
+              and the click handler; this inner div is just layout. */}
+          <div css={{ width: 'inherit' }}>
+            {t('Parameters ')}
             <Badge count={paramCount} />
             {!isValid && (
-              <InfoTooltipWithTrigger
-                icon="exclamation-triangle"
-                bsStyle="danger"
+              <InfoTooltip
+                type="error"
                 tooltip={t('Invalid JSON')}
                 label="invalid-json"
               />
@@ -116,6 +129,6 @@ function TemplateParamsEditor({
       modalBody={modalBody}
     />
   );
-}
+};
 
 export default TemplateParamsEditor;

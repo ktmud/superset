@@ -16,64 +16,129 @@
 # under the License.
 from __future__ import annotations
 
+import inspect
 import logging
+import pickle
 from datetime import datetime, timedelta
 from functools import wraps
-from typing import Any, Callable, Dict, Optional, TYPE_CHECKING, Union
+from typing import Any, Callable
 
 from flask import current_app as app, request
 from flask_caching import Cache
 from flask_caching.backends import NullCache
-from werkzeug.wrappers.etag import ETagResponseMixin
+from werkzeug.wrappers import Response
 
 from superset import db
+from superset.constants import CACHE_DISABLED_TIMEOUT
 from superset.extensions import cache_manager
 from superset.models.cache import CacheKey
-from superset.utils.core import json_int_dttm_ser
-from superset.utils.hashing import md5_sha_from_dict
+from superset.utils.cache_manager import configurable_hash_method
+from superset.utils.dates import naive_utcnow
+from superset.utils.hashing import hash_from_dict
+from superset.utils.json import json_int_dttm_ser
 
-if TYPE_CHECKING:
-    from superset.stats_logger import BaseStatsLogger
-
-config = app.config
-stats_logger: BaseStatsLogger = config["STATS_LOGGER"]
 logger = logging.getLogger(__name__)
 
 
-def generate_cache_key(values_dict: Dict[str, Any], key_prefix: str = "") -> str:
-    hash_str = md5_sha_from_dict(values_dict, default=json_int_dttm_ser)
-    return f"{key_prefix}{hash_str}"
+def generate_cache_key(values_dict: dict[str, Any], key_prefix: str = "") -> str:
+    hash_str = hash_from_dict(values_dict, default=json_int_dttm_ser)
+    cache_key = f"{key_prefix}{hash_str}"
+
+    if logger.isEnabledFor(logging.DEBUG):
+        # Log cache key generation for debugging
+        logger.debug(
+            "Cache key generated: %s from dict keys: %s",
+            cache_key,
+            list(values_dict.keys()),
+        )
+
+    return cache_key
 
 
 def set_and_log_cache(
     cache_instance: Cache,
     cache_key: str,
-    cache_value: Dict[str, Any],
-    cache_timeout: Optional[int] = None,
-    datasource_uid: Optional[str] = None,
-) -> None:
-    if isinstance(cache_instance.cache, NullCache):
-        return
+    cache_value: dict[str, Any],
+    cache_timeout: int | None = None,
+    datasource_uid: str | None = None,
+) -> bool:
+    """Write a value to the cache, logging outcomes.
 
-    timeout = cache_timeout if cache_timeout else config["CACHE_DEFAULT_TIMEOUT"]
+    :returns: ``True`` only when the value was actually persisted to the backend;
+        ``False`` when caching was skipped (null cache, disabled timeout, value
+        too large) or the backend write failed. Callers that need to know the
+        value is really cached (e.g. the forced-refresh idempotency marker) must
+        gate on this, since a silent skip would otherwise let a follow-up read
+        serve a stale value.
+    """
+    if isinstance(cache_instance.cache, NullCache):
+        return False
+
+    timeout = (
+        cache_timeout
+        if cache_timeout is not None
+        else app.config["CACHE_DEFAULT_TIMEOUT"]
+    )
+
+    # Skip caching if timeout is CACHE_DISABLED_TIMEOUT (no caching requested)
+    if timeout == CACHE_DISABLED_TIMEOUT:
+        return False
     try:
-        dttm = datetime.utcnow().isoformat().split(".")[0]
+        dttm: str = naive_utcnow().isoformat().split(".")[0]
         value = {**cache_value, "dttm": dttm}
-        cache_instance.set(cache_key, value, timeout=timeout)
+
+        # Skip caching results that are too large to protect the cache backend
+        # (e.g. Redis/Memcached) from being flooded by huge result sets. The chart
+        # still renders; the value is simply not cached, causing a re-query on the
+        # next load instead of a cache hit. Disabled when DATA_CACHE_MAX_VALUE_SIZE
+        # is None (the default), in which case no serialization overhead is incurred.
+        max_value_size = app.config.get("DATA_CACHE_MAX_VALUE_SIZE")
+        if max_value_size is not None:
+            value_size = len(pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL))
+            if value_size > max_value_size:
+                logger.warning(
+                    "Skipping cache set for key %s: serialized value size %d bytes "
+                    "exceeds DATA_CACHE_MAX_VALUE_SIZE (%d bytes)",
+                    cache_key,
+                    value_size,
+                    max_value_size,
+                )
+                app.config["STATS_LOGGER"].incr("skip_cache_value_too_large")
+                return False
+
+        # Flask-Caching's set() returns bool | None: cachelib backends can report
+        # a failed write by returning False without raising, while some backends
+        # return None (no status). Treat an explicit False as failure so callers
+        # that gate on persistence (the forced-refresh marker) don't claim a write
+        # that never landed; treat None as success.
+        if cache_instance.set(cache_key, value, timeout=timeout) is False:
+            logger.warning("Cache backend reported a failed set for key %s", cache_key)
+            return False
+        stats_logger = app.config["STATS_LOGGER"]
         stats_logger.incr("set_cache_key")
 
-        if datasource_uid and config["STORE_CACHE_KEYS_IN_METADATA_DB"]:
+        # Log cache key details for debugging
+        logger.debug(
+            "CACHE SET - Key: %s, Datasource: %s, Timeout: %s",
+            cache_key,
+            datasource_uid,
+            timeout,
+        )
+
+        if datasource_uid and app.config["STORE_CACHE_KEYS_IN_METADATA_DB"]:
             ck = CacheKey(
                 cache_key=cache_key,
                 cache_timeout=cache_timeout,
                 datasource_uid=datasource_uid,
             )
             db.session.add(ck)
+        return True
     except Exception as ex:  # pylint: disable=broad-except
         # cache.set call can fail if the backend is down or if
         # the key is too large or whatever other reasons
         logger.warning("Could not cache key %s", cache_key)
         logger.exception(ex)
+        return False
 
 
 # If a user sets `max_age` to 0, for long the browser should cache the
@@ -81,18 +146,20 @@ def set_and_log_cache(
 # to specify a "far future" date.
 ONE_YEAR = 365 * 24 * 60 * 60  # 1 year in seconds
 
-logger = logging.getLogger(__name__)
 
+def memoized_func(key: str, cache: Cache = cache_manager.cache) -> Callable[..., Any]:
+    """
+    Decorator with configurable key and cache backend.
 
-def view_cache_key(*args: Any, **kwargs: Any) -> str:  # pylint: disable=unused-argument
-    args_hash = hash(frozenset(request.args.items()))
-    return "view/{}/{}".format(request.path, args_hash)
+        @memoized_func(key="{a}+{b}", cache=cache_manager.data_cache)
+        def sum(a: int, b: int) -> int:
+            return a + b
 
+    In the example above the result for `1+2` will be stored under the key of name "1+2",
+    in the `cache_manager.data_cache` cache.
 
-def memoized_func(
-    key: Callable[..., str] = view_cache_key, cache: Cache = cache_manager.cache,
-) -> Callable[..., Any]:
-    """Use this decorator to cache functions that have predefined first arg.
+    Note: this decorator should be used only with functions that return primitives,
+    otherwise the deserialization might not work correctly.
 
     enable_cache is treated as True by default,
     except enable_cache = False is passed to the decorated function.
@@ -100,25 +167,47 @@ def memoized_func(
     force means whether to force refresh the cache and is treated as False by default,
     except force = True is passed to the decorated function.
 
-    timeout of cache is set to 600 seconds by default,
+    timeout of cache is set to CACHE_DEFAULT_TIMEOUT seconds by default,
     except cache_timeout = {timeout in seconds} is passed to the decorated function.
 
     :param key: a callable function that takes function arguments and returns
                 the caching key.
     :param cache: a FlaskCache instance that will store the cache.
-    """
+    """  # noqa: E501
 
     def wrap(f: Callable[..., Any]) -> Callable[..., Any]:
-        def wrapped_f(self: Any, *args: Any, **kwargs: Any) -> Any:
-            if not kwargs.get("cache", True):
-                return f(self, *args, **kwargs)
+        def wrapped_f(*args: Any, **kwargs: Any) -> Any:
+            should_cache = kwargs.pop("cache", True)
+            force = kwargs.pop("force", False)
+            # always popped, even when caching is skipped, so it is never forwarded
+            # to the decorated function as an unexpected keyword argument.
+            cache_timeout = kwargs.pop("cache_timeout", None)
 
-            cache_key = key(self, *args, **kwargs)
+            if not should_cache:
+                return f(*args, **kwargs)
+
+            # callers may explicitly pass ``cache_timeout=None`` (eg, when a database
+            # has no custom metadata cache timeout configured), which should fall back
+            # to the default timeout rather than be forwarded to the cache backend.
+            # the config lookup happens here so the uncached path stays independent
+            # of the Flask app config.
+            if cache_timeout is None:
+                cache_timeout = app.config["CACHE_DEFAULT_TIMEOUT"]
+
+            # format the key using args/kwargs passed to the decorated function
+            signature = inspect.signature(f)
+            bound_args = signature.bind(*args, **kwargs)
+            bound_args.apply_defaults()
+            cache_key = key.format(**bound_args.arguments)
+
             obj = cache.get(cache_key)
-            if not kwargs.get("force") and obj is not None:
+            if not force and obj is not None:
                 return obj
-            obj = f(self, *args, **kwargs)
-            cache.set(cache_key, obj, timeout=kwargs.get("cache_timeout"))
+            obj = f(*args, **kwargs)
+
+            # Skip caching if timeout is CACHE_DISABLED_TIMEOUT (no caching requested)
+            if cache_timeout != CACHE_DISABLED_TIMEOUT:
+                cache.set(cache_key, obj, timeout=cache_timeout)
             return obj
 
         return wrapped_f
@@ -126,12 +215,12 @@ def memoized_func(
     return wrap
 
 
-def etag_cache(
+def etag_cache(  # noqa: C901
     cache: Cache = cache_manager.cache,
-    get_last_modified: Optional[Callable[..., datetime]] = None,
-    max_age: Optional[Union[int, float]] = None,
-    raise_for_access: Optional[Callable[..., Any]] = None,
-    skip: Optional[Callable[..., bool]] = None,
+    get_last_modified: Callable[..., datetime] | None = None,
+    max_age: int | float | None = None,
+    raise_for_access: Callable[..., Any] | None = None,
+    skip: Callable[..., bool] | None = None,
 ) -> Callable[..., Any]:
     """
     A decorator for caching views and handling etag conditional requests.
@@ -145,12 +234,13 @@ def etag_cache(
     dataframe cache for requests that produce the same SQL.
 
     """
-    if max_age is None:
-        max_age = app.config["CACHE_DEFAULT_TIMEOUT"]
 
-    def decorator(f: Callable[..., Any]) -> Callable[..., Any]:
+    def decorator(f: Callable[..., Any]) -> Callable[..., Any]:  # noqa: C901
+        # Compute the actual timeout to use
+        timeout = max_age or app.config["CACHE_DEFAULT_TIMEOUT"]
+
         @wraps(f)
-        def wrapper(*args: Any, **kwargs: Any) -> ETagResponseMixin:
+        def wrapper(*args: Any, **kwargs: Any) -> Response:  # noqa: C901
             # Check if the user can access the resource
             if raise_for_access:
                 try:
@@ -184,7 +274,7 @@ def etag_cache(
 
             # Check if the cache is stale. Default the content_changed_time to now
             # if we don't know when it was last modified.
-            content_changed_time = datetime.utcnow()
+            content_changed_time: datetime = naive_utcnow()
             if get_last_modified:
                 content_changed_time = get_last_modified(*args, **kwargs)
                 if (
@@ -213,7 +303,7 @@ def etag_cache(
                     response.cache_control.public = True
 
                 response.last_modified = content_changed_time
-                expiration = max_age or ONE_YEAR  # max_age=0 also means far future
+                expiration = timeout or ONE_YEAR  # max_age=0 also means far future
                 response.expires = response.last_modified + timedelta(
                     seconds=expiration
                 )
@@ -221,7 +311,7 @@ def etag_cache(
 
                 # if we have a cache, store the response from the request
                 try:
-                    cache.set(cache_key, response, timeout=max_age)
+                    cache.set(cache_key, response, timeout=timeout)
                 except Exception:  # pylint: disable=broad-except
                     if app.debug:
                         raise
@@ -230,9 +320,9 @@ def etag_cache(
             return response.make_conditional(request)
 
         wrapper.uncached = f  # type: ignore
-        wrapper.cache_timeout = max_age  # type: ignore
+        wrapper.cache_timeout = timeout  # type: ignore
         wrapper.make_cache_key = cache._memoize_make_cache_key(  # type: ignore # pylint: disable=protected-access
-            make_name=None, timeout=max_age
+            make_name=None, hash_method=configurable_hash_method
         )
 
         return wrapper

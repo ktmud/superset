@@ -13,36 +13,1581 @@
 # "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
-# under the License.o
+# under the License.
+from __future__ import annotations
 
+import logging
+import re
+import time
 from datetime import datetime
-from typing import Optional
+from re import Pattern
+from typing import Any, Callable, cast, TYPE_CHECKING, TypedDict, Union
 
-from superset.db_engine_specs.base import BaseEngineSpec
-from superset.db_engine_specs.hive import HiveEngineSpec
+import sqlalchemy as sa
+from apispec import APISpec
+from apispec.ext.marshmallow import MarshmallowPlugin
+from celery.exceptions import SoftTimeLimitExceeded
+from flask import current_app as app, g
+from flask_babel import gettext as __
+from marshmallow import fields, Schema
+from marshmallow.validate import Range
+from sqlalchemy import text, types
+from sqlalchemy.engine.default import DefaultDialect
+from sqlalchemy.engine.reflection import Inspector
+from sqlalchemy.engine.url import URL
+from sqlalchemy.sql.elements import ColumnElement
+
+from superset import db
+from superset.constants import QUERY_CANCEL_KEY, QUERY_EARLY_CANCEL_KEY, TimeGrain
+from superset.databases.utils import make_url_safe
+from superset.db_engine_specs.base import (
+    BaseEngineSpec,
+    BasicParametersMixin,
+    DatabaseCategory,
+)
+from superset.db_engine_specs.hive import HiveEngineSpec, SparkSqlBooleanEqualityMixin
+from superset.errors import ErrorLevel, SupersetError, SupersetErrorType
+from superset.exceptions import OAuth2Error, SupersetTimeoutException
+from superset.models.sql_lab import Query
+from superset.utils import json
+from superset.utils.core import get_user_agent, QuerySource, QueryStatus
+from superset.utils.network import is_hostname_valid, is_port_open
+from superset.utils.oauth2 import is_oauth2_retry_active
+
+if TYPE_CHECKING:
+    from superset.models.core import Database
+    from superset.superset_typing import (
+        OAuth2ClientConfig,
+        OAuth2State,
+        OAuth2TokenResponse,
+    )
 
 
-class DatabricksHiveEngineSpec(HiveEngineSpec):
-    engine = "databricks"
-    engine_name = "Databricks Interactive Cluster"
-    driver = "pyhive"
-    _show_functions_column = "function"
+logger = logging.getLogger(__name__)
+
+INSUFFICIENT_PERMISSIONS_REGEX: Pattern[str] = re.compile(
+    r"\[INSUFFICIENT_PERMISSIONS\]|\bSQLSTATE:\s*42501\b"
+)
 
 
-class DatabricksODBCEngineSpec(BaseEngineSpec):
-    engine = "databricks"
-    engine_name = "Databricks SQL Endpoint"
-    driver = "pyodbc"
+try:
+    from databricks.sql.utils import ParamEscaper
+except ImportError:
 
-    # the syntax for the ODBC engine is identical to the Hive one, so
-    # we can reuse the expressions from `HiveEngineSpec`
-    # pylint: disable=protected-access
-    _time_grain_expressions = HiveEngineSpec._time_grain_expressions
+    class ParamEscaper:  # type: ignore
+        """Dummy class."""
+
+
+class DatabricksStringType(types.TypeDecorator):
+    impl = types.String
+    cache_ok = True
+    pe = ParamEscaper()
+
+    def process_literal_param(self, value: Any, dialect: Any) -> str:
+        return self.pe.escape_string(value)
+
+    def literal_processor(self, dialect: Any) -> Callable[[Any], str]:
+        def process(value: Any) -> str:
+            _step1 = self.process_literal_param(value, dialect="databricks")
+            if dialect.identifier_preparer._double_percents:
+                _step2 = _step1.replace("%", "%%")
+            else:
+                _step2 = _step1
+
+            return "%s" % _step2
+
+        return process
+
+
+def monkeypatch_dialect() -> None:
+    """
+    Monkeypatch dialect to correctly escape single quotes for Databricks.
+
+    This compatibility patch covers HiveDialect-based Databricks dialects from
+    sqlalchemy-databricks. The supported databricks-sqlalchemy dialect defines its
+    own colspecs and escaping; it is not a target of this patch.
+
+    A dialect-aware string type preserves ordinary Hive literal handling while
+    applying backslash escaping to Hive-based Databricks dialects.
+
+    PyHive's HiveDialect does not define ``colspecs``, so ``HiveDialect.colspecs`` is
+    SQLAlchemy's ``DefaultDialect.colspecs`` dict, shared by every dialect that does
+    not define its own. The patch therefore gives HiveDialect its own copy instead of
+    writing to the shared dict, which would change the string types of unrelated
+    dialects (and make ``sa.Enum`` fail to adapt on them).
+    """
+    try:
+        from pyhive.sqlalchemy_hive import HiveDialect
+
+        class ContextAwareStringType(types.TypeDecorator):
+            impl = types.String
+            cache_ok = True
+
+            def literal_processor(
+                self, dialect: DefaultDialect
+            ) -> Callable[[Any], str]:
+                if dialect.__class__.__name__ == "DatabricksDialect":
+                    return DatabricksStringType().literal_processor(dialect)
+                return super().literal_processor(dialect)
+
+        # Copy, never write to the shared parent dict. Enum is a String subclass;
+        # map it to itself so it is not adapted to the decorator, which cannot
+        # take Enum's arguments. Enum literals retain their own escaping.
+        HiveDialect.colspecs = {
+            **HiveDialect.colspecs,
+            types.String: ContextAwareStringType,
+            types.Enum: types.Enum,
+        }
+
+    except ImportError:
+        pass
+
+
+class DatabricksBaseSchema(Schema):
+    """
+    Fields that are required for both Databricks drivers that uses a
+    dynamic form.
+    """
+
+    access_token = fields.Str(required=True)
+    host = fields.Str(required=True)
+    port = fields.Integer(
+        required=True,
+        metadata={"description": __("Database port")},
+        validate=Range(min=0, max=2**16, max_inclusive=False),
+    )
+    encryption = fields.Boolean(
+        required=False,
+        metadata={"description": __("Use an encrypted connection to the database")},
+    )
+
+
+class DatabricksBaseParametersType(TypedDict):
+    """
+    The parameters are all the keys that do not exist on the Database model.
+    These are used to build the sqlalchemy uri.
+    """
+
+    access_token: str
+    host: str
+    port: int
+    encryption: bool
+
+
+class DatabricksNativeSchema(DatabricksBaseSchema):
+    """
+    Additional fields required only for the DatabricksNativeEngineSpec.
+    """
+
+    database = fields.Str(required=True)
+
+
+class DatabricksNativePropertiesSchema(DatabricksNativeSchema):
+    """
+    Properties required only for the DatabricksNativeEngineSpec.
+    """
+
+    http_path = fields.Str(required=True)
+
+
+class DatabricksNativeParametersType(DatabricksBaseParametersType):
+    """
+    Additional parameters required only for the DatabricksNativeEngineSpec.
+    """
+
+    database: str
+
+
+class DatabricksNativePropertiesType(TypedDict):
+    """
+    All properties that need to be available to the DatabricksNativeEngineSpec
+    in order tocreate a connection if the dynamic form is used.
+    """
+
+    parameters: DatabricksNativeParametersType
+    extra: str
+
+
+class DatabricksPythonConnectorSchema(DatabricksBaseSchema):
+    """
+    Additional fields required only for the DatabricksPythonConnectorEngineSpec.
+    """
+
+    http_path_field = fields.Str(required=True)
+    default_catalog = fields.Str(required=False)
+    default_schema = fields.Str(required=True)
+
+
+class DatabricksPythonConnectorParametersType(DatabricksBaseParametersType):
+    """
+    Additional parameters required only for the DatabricksPythonConnectorEngineSpec.
+    """
+
+    http_path_field: str
+    default_catalog: str
+    default_schema: str
+
+
+class DatabricksPythonConnectorPropertiesType(TypedDict):
+    """
+    All properties that need to be available to the DatabricksPythonConnectorEngineSpec
+    in order to create a connection if the dynamic form is used.
+    """
+
+    parameters: DatabricksPythonConnectorParametersType
+    extra: str
+
+
+time_grain_expressions: dict[str | None, str] = {
+    None: "{col}",
+    TimeGrain.SECOND: "date_trunc('second', {col})",
+    TimeGrain.MINUTE: "date_trunc('minute', {col})",
+    TimeGrain.HOUR: "date_trunc('hour', {col})",
+    TimeGrain.DAY: "date_trunc('day', {col})",
+    TimeGrain.WEEK: "date_trunc('week', {col})",
+    TimeGrain.MONTH: "date_trunc('month', {col})",
+    TimeGrain.QUARTER: "date_trunc('quarter', {col})",
+    TimeGrain.YEAR: "date_trunc('year', {col})",
+    TimeGrain.WEEK_ENDING_SATURDAY: (
+        "date_trunc('week', {col} + interval '1 day') + interval '5 days'"
+    ),
+    TimeGrain.WEEK_STARTING_SUNDAY: (
+        "date_trunc('week', {col} + interval '1 day') - interval '1 day'"
+    ),
+}
+
+
+class DatabricksBaseEngineSpec(SparkSqlBooleanEqualityMixin, BaseEngineSpec):
+    """Base engine specification for Databricks flavors and connection methods."""
+
+    # The engine's default text comparison is binary, so a mirrored
+    # ``partition_col = T(v)`` agrees with the ``col = v`` it stands in for.
+    binary_string_comparison = True
+
+    _time_grain_expressions = time_grain_expressions
+
+    # Databricks SQL is Spark SQL under the hood: identifiers are quoted with
+    # backticks, not the inherited ANSI double quotes.
+    identifier_quote_start: str = "`"
+    identifier_quote_end: str = "`"
+
+    # Databricks SQL documents native MEDIAN/STDDEV_SAMP/VAR_SAMP aggregate
+    # functions (docs.databricks.com/aws/en/sql/language-manual/functions/
+    # {median,stddev_samp,var_samp}), confirmed against that reference, not a
+    # live Databricks instance. All three are plain function calls, same
+    # spelling as Postgres/DuckDB, so no dialect-specific rewriting is needed.
+    _extended_aggregations: dict[str, Callable[[ColumnElement], ColumnElement]] = {
+        "MEDIAN": sa.func.median,
+        "STDDEV_SAMP": sa.func.stddev_samp,
+        "VAR_SAMP": sa.func.var_samp,
+    }
 
     @classmethod
-    def convert_dttm(cls, target_type: str, dttm: datetime) -> Optional[str]:
-        return HiveEngineSpec.convert_dttm(target_type, dttm)
+    def convert_dttm(
+        cls, target_type: str, dttm: datetime, db_extra: dict[str, Any] | None = None
+    ) -> str | None:
+        return HiveEngineSpec.convert_dttm(target_type, dttm, db_extra=db_extra)
 
     @classmethod
     def epoch_to_dttm(cls) -> str:
         return HiveEngineSpec.epoch_to_dttm()
+
+    @classmethod
+    def extract_errors(
+        cls,
+        ex: Exception,
+        context: dict[str, Any] | None = None,
+        database_name: str | None = None,
+    ) -> list[SupersetError]:
+        raw_message = cls._extract_error_message(ex)
+        if INSUFFICIENT_PERMISSIONS_REGEX.search(raw_message):
+            return [
+                SupersetError(
+                    error_type=SupersetErrorType.CONNECTION_DATABASE_PERMISSIONS_ERROR,
+                    message=raw_message,
+                    level=ErrorLevel.WARNING,
+                    extra={"engine_name": cls.engine_name},
+                )
+            ]
+        return super().extract_errors(ex, context, database_name)
+
+
+# Credential connect args of databricks-sql-connector. With impersonation on, all
+# of them are dropped from ``extra`` and the secure extra; ``impersonate_user``
+# then writes the user's OAuth2 token as ``access_token`` (when ``extra`` set one),
+# so that token is the only credential the connector receives.
+DATABRICKS_SHARED_CREDENTIAL_CONNECT_ARGS = frozenset(
+    {
+        "access_token",
+        "auth_type",
+        "credentials_provider",
+        "oauth_client_id",
+        "oauth_client_secret",
+        "azure_client_id",
+        "azure_client_secret",
+        "azure_tenant_id",
+        "azure_workspace_resource_id",
+    }
+)
+
+
+class DatabricksDynamicBaseEngineSpec(BasicParametersMixin, DatabricksBaseEngineSpec):
+    default_driver = ""
+    encryption_parameters = {"ssl": "1"}
+    required_parameters = {"access_token", "host", "port"}
+    context_key_mapping = {
+        "access_token": "password",
+        "host": "hostname",
+        "port": "port",
+    }
+
+    # The Databricks SQL driver has no dedicated authentication exception, so an
+    # expired or missing token surfaces as a generic driver error. These case-
+    # insensitive substrings flag the errors that should bootstrap a re-auth.
+    oauth2_auth_failure_signals = (
+        "http 401",
+        "unauthorized",
+        "unauthenticated",
+        "invalid access token",
+        "invalid token",
+        "expired token",
+        "token expired",
+        # Raised by the databricks-sql-connector when no usable credentials are
+        # present (e.g. an OAuth2 token that has been cleared/expired).
+        "no valid authentication settings",
+    )
+
+    @classmethod
+    def _workspace_oauth2_endpoint(cls, database: Database, path: str) -> str:
+        """
+        Build a Databricks OAuth2 (U2M) endpoint from the workspace host.
+
+        Databricks fronts the user-to-machine OAuth2 flow on every workspace at
+        ``https://<workspace-host>/oidc/v1/{authorize,token}`` across AWS, Azure
+        and GCP, so the endpoints derive directly from the connection host and
+        need no account or tenant identifier.
+        """
+        host = database.url_object.host
+        if not host:
+            raise OAuth2Error(
+                "Databricks OAuth2 endpoint could not be resolved: the database "
+                "connection has no host."
+            )
+        return f"https://{host}/oidc/v1/{path}"
+
+    @classmethod
+    def resolve_oauth2_client_info(
+        cls,
+        database: Database,
+        client_info: Any,
+    ) -> Any:
+        """
+        Derive missing OAuth2 endpoints from the workspace host.
+
+        ``authorization_request_uri`` and ``token_request_uri`` are required by
+        ``OAuth2ClientConfigSchema``; without them the database's OAuth2 was
+        disabled (``is_oauth2_enabled`` returned False) and every connection
+        failed with a ValidationError. Each missing or empty endpoint becomes
+        ``https://<workspace-host>/oidc/v1/{authorize,token}``; explicit values
+        win. A connection without a host raises ``OAuth2Error``. A non-dict
+        value is returned unchanged for ``OAuth2ClientConfigSchema`` to reject.
+        """
+        endpoints = {
+            "authorization_request_uri": "authorize",
+            "token_request_uri": "token",
+        }
+        if not isinstance(client_info, dict):
+            # Leave malformed values to ``OAuth2ClientConfigSchema`` to reject.
+            return client_info
+        missing = [key for key in endpoints if not client_info.get(key)]
+        if not missing:
+            return client_info
+        return {
+            **client_info,
+            **{
+                key: cls._workspace_oauth2_endpoint(database, endpoints[key])
+                for key in missing
+            },
+        }
+
+    @classmethod
+    def needs_oauth2(cls, ex: Exception) -> bool:
+        """
+        Identify driver errors that should trigger the OAuth2 dance.
+
+        Unlike Trino (``TrinoAuthError``) or GSheets (``UnauthenticatedError``),
+        the Databricks driver raises no dedicated auth exception, so in addition
+        to the base ``isinstance`` check we match the auth signals above on the
+        error message (mirrors ``GSheetsEngineSpec.needs_oauth2``).
+        """
+        if not (g and hasattr(g, "user")):
+            return False
+        if isinstance(ex, cls.oauth2_exception):
+            return True
+        message = str(ex).lower()
+        if any(signal in message for signal in cls.oauth2_auth_failure_signals):
+            return True
+        # A rejected bearer token fails the request with HTTP 401 and a message
+        # such as "Credential was not sent or was of an unsupported type for this
+        # API", which no signal above matches; the connector reports the status
+        # in ``RequestError.context["http-code"]``. 403 is left out on purpose: it
+        # also means a missing permission, which re-authorizing cannot fix.
+        error = getattr(ex, "orig", None) or ex
+        context = getattr(error, "context", None)
+        if isinstance(context, dict):
+            try:
+                return int(context.get("http-code") or 0) == 401
+            except (TypeError, ValueError):
+                return False
+        return False
+
+    @classmethod
+    def get_oauth2_authorization_uri(
+        cls,
+        config: "OAuth2ClientConfig",
+        state: "OAuth2State",
+        code_verifier: str | None = None,
+    ) -> str:
+        """
+        Return the URI for the initial OAuth2 request.
+
+        A fully-resolved ``authorization_request_uri`` from
+        ``DATABASE_OAUTH2_CLIENTS`` is preserved; otherwise the endpoint is
+        derived from the workspace host (``https://<host>/oidc/v1/authorize``),
+        which is valid on AWS, Azure and GCP.
+        """
+        if not config.get("authorization_request_uri"):
+            from superset import db
+            from superset.models.core import Database
+
+            database_id = state["database_id"]
+            if database := db.session.get(Database, database_id):
+                config = cast(
+                    "OAuth2ClientConfig",
+                    cls.resolve_oauth2_client_info(database, dict(config)),
+                )
+
+        return super().get_oauth2_authorization_uri(config, state, code_verifier)
+
+    @classmethod
+    def get_oauth2_token(
+        cls,
+        config: "OAuth2ClientConfig",
+        code: str,
+        code_verifier: str | None = None,
+    ) -> "OAuth2TokenResponse":
+        """
+        Exchange the authorization code for refresh/access tokens.
+
+        Token exchange runs in a separate request with no database context, so
+        the workspace host is not available to derive the endpoint here. Require
+        a configured ``token_request_uri``
+        (``https://<workspace-host>/oidc/v1/token``) and fail fast rather than
+        POST to an unresolved endpoint.
+        """
+        if not config.get("token_request_uri"):
+            raise OAuth2Error(
+                "Databricks OAuth2 token endpoint is not configured: set "
+                "`token_request_uri` to https://<workspace-host>/oidc/v1/token "
+                "in DATABASE_OAUTH2_CLIENTS."
+            )
+
+        return super().get_oauth2_token(config, code, code_verifier)
+
+    @classmethod
+    def impersonate_user(
+        cls,
+        database: Database,
+        username: str | None,
+        user_token: str | None,
+        url: URL,
+        engine_kwargs: dict[str, Any],
+    ) -> tuple[URL, dict[str, Any]]:
+        """
+        Update connection with the user's OAuth2 access token for impersonation.
+
+        When impersonation is enabled but no user token is available yet (e.g. the
+        first connection, before the OAuth2 dance has run), the stored credential
+        is cleared rather than left in place. The driver then raises a "no valid
+        authentication settings" error, which ``needs_oauth2`` catches to bootstrap
+        the OAuth2 flow instead of silently connecting with a stale credential.
+        """
+        # Replace the credential in the URL with the user's OAuth2 token, falling
+        # back to an empty string to force re-authentication when none is set.
+        url = url.set(password=user_token or "")
+
+        # Drop shared credentials from ``extra`` (a PAT, OAuth M2M client, Azure
+        # service principal) so none of them reaches the connector next to the
+        # user's token. The secure extra is filtered the same way in
+        # ``update_params_from_encrypted_extra``.
+        connect_args = engine_kwargs.get("connect_args") or {}
+        filtered_connect_args = {
+            key: value
+            for key, value in connect_args.items()
+            if key not in DATABRICKS_SHARED_CREDENTIAL_CONNECT_ARGS
+        }
+        # The Python connector passes the token via ``connect_args`` instead of the
+        # URL password, so keep it in sync (clearing it likewise forces re-auth).
+        if "access_token" in connect_args:
+            filtered_connect_args["access_token"] = user_token or ""
+        engine_kwargs["connect_args"] = filtered_connect_args
+
+        return url, engine_kwargs
+
+    @classmethod
+    def start_oauth2_dance(cls, database: Database) -> None:
+        """
+        Start the OAuth2 dance only when the database impersonates the user.
+
+        The user's OAuth2 token only reaches the connection through
+        ``impersonate_user``. Without impersonation the connection uses the
+        shared credential, so an authorization prompt cannot fix an auth failure
+        (e.g. a revoked shared token returning HTTP 401). Return instead, so the
+        caller raises the original error for an admin to act on.
+        """
+        if not database.impersonate_user:
+            return
+
+        super().start_oauth2_dance(database)
+
+    @staticmethod
+    def update_params_from_encrypted_extra(
+        database: Database, params: dict[str, Any]
+    ) -> None:
+        """
+        Merge ``encrypted_extra`` into the connection params, dropping the
+        ``oauth2_client_info`` block.
+
+        ``oauth2_client_info`` holds the per-database OAuth2 client configuration
+        consumed by ``Database.get_oauth2_config``; it is not a Databricks driver
+        connection argument, so it must be stripped here to avoid poisoning the
+        connection when OAuth2 is configured on the database itself.
+
+        ``connect_args`` are merged key by key, so credentials kept in the secure
+        extra (an access token, an OAuth M2M client secret) do not discard the
+        ``connect_args`` from ``extra`` or Superset's own (e.g. the User-Agent).
+        With user impersonation enabled, shared credentials in the secure extra
+        are dropped (``impersonate_user`` drops the ones from ``extra``): the
+        user's OAuth2 token is the only credential, instead of being silently
+        replaced by a shared one.
+        """
+        if not database.encrypted_extra:
+            return
+        try:
+            encrypted_extra = json.loads(database.encrypted_extra)
+        except json.JSONDecodeError as ex:
+            logger.error(ex, exc_info=True)
+            raise
+        encrypted_extra.pop("oauth2_client_info", None)
+        secure_connect_args = encrypted_extra.pop("connect_args", None)
+        params.update(encrypted_extra)
+        if secure_connect_args is not None and not isinstance(
+            secure_connect_args, dict
+        ):
+            params["connect_args"] = secure_connect_args
+            return
+        if secure_connect_args is None and "connect_args" not in params:
+            return
+
+        secure_connect_args = secure_connect_args or {}
+        connect_args = dict(params.get("connect_args") or {})
+        if database.impersonate_user:
+            secure_connect_args = {
+                key: value
+                for key, value in secure_connect_args.items()
+                if key not in DATABRICKS_SHARED_CREDENTIAL_CONNECT_ARGS
+            }
+        params["connect_args"] = {**connect_args, **secure_connect_args}
+
+    @staticmethod
+    def get_extra_params(
+        database: Database, source: QuerySource | None = None
+    ) -> dict[str, Any]:
+        """
+        Add a user agent to be used in the requests.
+        Trim whitespace from connect_args to avoid databricks driver errors
+        """
+        extra: dict[str, Any] = BaseEngineSpec.get_extra_params(database, source)
+        engine_params: dict[str, Any] = extra.setdefault("engine_params", {})
+        connect_args: dict[str, Any] = engine_params.setdefault("connect_args", {})
+
+        user_agent = get_user_agent(database, source)
+        connect_args.setdefault("http_headers", [("User-Agent", user_agent)])
+        connect_args.setdefault("_user_agent_entry", user_agent)
+
+        # trim whitespace from http_path to avoid databricks errors on connecting
+        if http_path := connect_args.get("http_path"):
+            connect_args["http_path"] = http_path.strip()
+
+        return extra
+
+    @classmethod
+    def get_table_names(
+        cls,
+        database: Database,
+        inspector: Inspector,
+        schema: str | None,
+    ) -> set[str]:
+        return super().get_table_names(
+            database, inspector, schema
+        ) - cls.get_view_names(database, inspector, schema)
+
+    @classmethod
+    def extract_errors(
+        cls,
+        ex: Exception,
+        context: dict[str, Any] | None = None,
+        database_name: str | None = None,
+    ) -> list[SupersetError]:
+        context = context or {}
+
+        # access_token isn't currently parseable from the
+        # databricks error response, but adding it in here
+        # for reference if their error message changes
+        for key, value in cls.context_key_mapping.items():
+            context[key] = context.get(value)
+
+        return super().extract_errors(ex, context, database_name)
+
+    @classmethod
+    def validate_parameters(  # type: ignore
+        cls,
+        properties: Union[
+            DatabricksNativePropertiesType,
+            DatabricksPythonConnectorPropertiesType,
+        ],
+    ) -> list[SupersetError]:
+        errors: list[SupersetError] = []
+        connect_args: dict[str, Any] = {}
+        if extra := json.loads(properties.get("extra")):  # type: ignore
+            engine_params = extra.get("engine_params", {})
+            connect_args = engine_params.get("connect_args", {})
+        parameters = {
+            **properties,
+            **properties.get("parameters", {}),
+        }
+        if connect_args.get("http_path"):
+            parameters["http_path"] = connect_args.get("http_path")
+
+        present = {key for key in parameters if parameters.get(key, ())}
+
+        if missing := sorted(cls.required_parameters - present):
+            errors.append(
+                SupersetError(
+                    message=f"One or more parameters are missing: {', '.join(missing)}",
+                    error_type=SupersetErrorType.CONNECTION_MISSING_PARAMETERS_ERROR,
+                    level=ErrorLevel.WARNING,
+                    extra={"missing": missing},
+                ),
+            )
+
+        host = parameters.get("host", None)
+        if not host:
+            return errors
+
+        if not is_hostname_valid(host):  # type: ignore
+            errors.append(
+                SupersetError(
+                    message="The hostname provided can't be resolved.",
+                    error_type=SupersetErrorType.CONNECTION_INVALID_HOSTNAME_ERROR,
+                    level=ErrorLevel.ERROR,
+                    extra={"invalid": ["host"]},
+                ),
+            )
+            return errors
+
+        port = parameters.get("port", None)
+        if not port:
+            return errors
+        try:
+            port = int(port)  # type: ignore
+        except (ValueError, TypeError):
+            errors.append(
+                SupersetError(
+                    message="Port must be a valid integer.",
+                    error_type=SupersetErrorType.CONNECTION_INVALID_PORT_ERROR,
+                    level=ErrorLevel.ERROR,
+                    extra={"invalid": ["port"]},
+                ),
+            )
+        if not (isinstance(port, int) and 0 <= port < 2**16):
+            errors.append(
+                SupersetError(
+                    message=(
+                        "The port must be an integer between 0 and 65535 (inclusive)."
+                    ),
+                    error_type=SupersetErrorType.CONNECTION_INVALID_PORT_ERROR,
+                    level=ErrorLevel.ERROR,
+                    extra={"invalid": ["port"]},
+                ),
+            )
+        elif not is_port_open(host, port):  # type: ignore
+            errors.append(
+                SupersetError(
+                    message="The port is closed.",
+                    error_type=SupersetErrorType.CONNECTION_PORT_CLOSED_ERROR,
+                    level=ErrorLevel.ERROR,
+                    extra={"invalid": ["port"]},
+                ),
+            )
+        return errors
+
+
+# NOTE: The order in which the concrete Databricks specs are defined in this file
+# matters. `get_engine_spec` in `superset/db_engine_specs/__init__.py` resolves a
+# (backend, driver) pair by exact driver match first, but when the stored
+# SQLAlchemy URI carries a driver string that matches no registered spec exactly
+# (e.g. a legacy or hand-written suffix) it falls back to the *first*
+# backend-matching spec in module-definition order. This general-purpose Python
+# connector spec must therefore be defined *before* the other, more niche
+# Databricks specs so the ambiguous-driver fallback lands here rather than on the
+# legacy Hive spec — whose `HiveEngineSpec.execute()` passes an `async` kwarg that
+# the real `databricks.sql.client.Cursor` rejects (SUPERSET-PYTHON-179V,
+# apache/superset#24786).
+class DatabricksPythonConnectorEngineSpec(DatabricksDynamicBaseEngineSpec):
+    engine = "databricks"
+    engine_name = "Databricks"
+    default_driver = "databricks"
+    default_driver_aliases: tuple[str, ...] = ("databricks-sql-python",)
+    drivers = {
+        "databricks": "Databricks SQL Python",
+        "databricks-sql-python": "Databricks SQL Python",
+    }
+
+    parameters_schema = DatabricksPythonConnectorSchema()
+
+    # The driver only populates `cursor.active_command_id` once a statement has
+    # been submitted, so the cancel id can't be captured up front like it can
+    # for engines where it's tied to the session rather than the query.
+    has_query_id_before_execute = False
+
+    # Query ``extra`` key recording that statements run asynchronously over SEA,
+    # so a stop that arrives while no statement id is published (before the
+    # first submit, or between statements) is routed to the polling loop.
+    sea_async_execution_key = "databricks_sea_async"
+
+    # Consecutive failed status requests tolerated while polling a statement
+    # before it's cancelled and the error is raised.
+    sea_max_poll_failures = 10
+
+    sqlalchemy_uri_placeholder = (
+        "databricks://token:{access_token}@{host}:{port}?http_path={http_path}"
+        "&catalog={default_catalog}&schema={default_schema}"
+    )
+
+    metadata = {
+        "description": (
+            "Databricks is a unified analytics platform built on Apache "
+            "Spark, providing data engineering, data science, and machine "
+            "learning capabilities in the cloud. Use the Python Connector "
+            "for SQL warehouses and clusters."
+        ),
+        "logo": "databricks.png",
+        "homepage_url": "https://www.databricks.com/",
+        "categories": [
+            DatabaseCategory.CLOUD_DATA_WAREHOUSES,
+            DatabaseCategory.ANALYTICAL_DATABASES,
+            DatabaseCategory.HOSTED_OPEN_SOURCE,
+        ],
+        "pypi_packages": ["apache-superset[databricks]"],
+        "install_instructions": "pip install apache-superset[databricks]",
+        "version_requirements": (
+            "The Databricks extra requires databricks-sqlalchemy 2.x (at least 2.0.1)."
+            " The 1.x dialect requires SQLAlchemy below 2."
+        ),
+        "connection_string": (
+            "databricks://token:{access_token}@{host}:{port}"
+            "?http_path={http_path}&catalog={catalog}&schema={schema}"
+        ),
+        "parameters": {
+            "access_token": "Personal access token from Settings > User Settings",
+            "host": "Server hostname from cluster JDBC/ODBC settings",
+            "port": "Port (default 443)",
+            "http_path": "HTTP path from cluster JDBC/ODBC settings",
+        },
+        "drivers": [
+            {
+                "name": "Databricks Python Connector (Recommended)",
+                "pypi_package": "databricks-sql-connector",
+                "connection_string": (
+                    "databricks://token:{access_token}@{host}:{port}"
+                    "?http_path={http_path}&catalog={catalog}&schema={schema}"
+                ),
+                "is_recommended": True,
+                "notes": (
+                    "Official Databricks connector. Best for SQL warehouses "
+                    "and clusters."
+                ),
+            },
+            {
+                "name": "Hive Connector (Interactive Clusters)",
+                "pypi_package": "databricks-dbapi[sqlalchemy]",
+                "connection_string": (
+                    "databricks+pyhive://token:{access_token}@{host}:{port}/{database}"
+                ),
+                "is_recommended": False,
+                "notes": (
+                    "For Interactive Clusters. Requires http_path in engine parameters."
+                ),
+            },
+            {
+                "name": "ODBC (SQL Endpoints)",
+                "pypi_package": "pyodbc",
+                "connection_string": (
+                    "databricks+pyodbc://token:{access_token}@{host}:{port}/{database}"
+                ),
+                "is_recommended": False,
+                "notes": "Requires ODBC driver. For serverless SQL warehouses.",
+            },
+            {
+                "name": "Field-based connection",
+                "pypi_package": "apache-superset[databricks]",
+                "connection_string": (
+                    "databricks://token:{access_token}@{host}:{port}/{database}"
+                ),
+                "is_recommended": False,
+                "notes": (
+                    "Use the dynamic form to enter connection fields individually."
+                ),
+            },
+        ],
+    }
+
+    context_key_mapping = {
+        **DatabricksDynamicBaseEngineSpec.context_key_mapping,
+        "default_catalog": "catalog",
+        "default_schema": "schema",
+        "http_path_field": "http_path",
+    }
+
+    required_parameters = DatabricksDynamicBaseEngineSpec.required_parameters | {
+        "default_schema",
+        "http_path_field",
+    }
+
+    supports_dynamic_schema = supports_catalog = supports_dynamic_catalog = True
+
+    # OAuth 2.0 support. The flow (endpoint resolution from the workspace host,
+    # `needs_oauth2` detection) is shared via `DatabricksDynamicBaseEngineSpec`.
+    supports_oauth2 = True
+    oauth2_scope = "sql"
+
+    # Authorization endpoint is derived from the workspace host at runtime; the
+    # token endpoint must be configured (no DB context at exchange time).
+    oauth2_authorization_request_uri = ""
+    oauth2_token_request_uri = ""
+
+    @classmethod
+    def build_sqlalchemy_uri(  # type: ignore
+        cls, parameters: DatabricksPythonConnectorParametersType, *_
+    ) -> str:
+        query = {}
+        if http_path := parameters.get("http_path_field"):
+            query["http_path"] = http_path
+        if catalog := parameters.get("default_catalog"):
+            query["catalog"] = catalog
+        if schema := parameters.get("default_schema"):
+            query["schema"] = schema
+        if parameters.get("encryption"):
+            query.update(cls.encryption_parameters)
+
+        # SQLAlchemy 2.0 made URL.__str__() hide the password by default
+        # (it rendered in full under 1.4); render_as_string(hide_password=
+        # False) is required here since this URI is stored/used to actually
+        # connect, not just displayed.
+        return URL.create(
+            cls.engine,
+            username="token",
+            password=parameters.get("access_token"),
+            host=parameters["host"],
+            port=parameters["port"],
+            query=query,
+        ).render_as_string(hide_password=False)
+
+    @classmethod
+    def get_parameters_from_uri(  # type: ignore
+        cls, uri: str, *_: Any, **__: Any
+    ) -> DatabricksPythonConnectorParametersType:
+        url = make_url_safe(uri)
+        query = {
+            key: value
+            for (key, value) in url.query.items()
+            if (key, value) not in cls.encryption_parameters.items()
+        }
+        encryption = all(
+            item in url.query.items() for item in cls.encryption_parameters.items()
+        )
+        return {
+            "access_token": url.password,
+            "host": url.host,
+            "port": url.port,
+            "http_path_field": query.get("http_path", ""),
+            "default_catalog": query.get("catalog", ""),
+            "default_schema": query.get("schema", url.database or ""),
+            "encryption": encryption,
+        }
+
+    @classmethod
+    def get_parameters_from_database(
+        cls, database: Database, encrypted_extra: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Expose legacy connect_args in the native connector's field-based form."""
+        parameters = super().get_parameters_from_database(database, encrypted_extra)
+        query = database.url_object.query
+        for field, key in (
+            ("http_path_field", "http_path"),
+            ("default_catalog", "catalog"),
+            ("default_schema", "schema"),
+        ):
+            if key not in query and key in database.connect_args:
+                parameters[field] = database.connect_args[key]
+        return parameters
+
+    @classmethod
+    def get_extra_from_parameters(
+        cls, parameters: dict[str, Any], extra: str | None
+    ) -> str | None:
+        """Remove legacy overrides when a native form explicitly clears a field."""
+        try:
+            settings = json.loads(extra or "{}")
+            connect_args = settings.get("engine_params", {}).get("connect_args", {})
+        except (ValueError, AttributeError, TypeError):
+            return extra
+        if not isinstance(connect_args, dict):
+            return extra
+        changed = False
+        for field, key in (
+            ("http_path_field", "http_path"),
+            ("default_catalog", "catalog"),
+            ("default_schema", "schema"),
+        ):
+            if field in parameters and not parameters[field] and key in connect_args:
+                del connect_args[key]
+                changed = True
+        return json.dumps(settings) if changed else extra
+
+    @classmethod
+    def get_connection_identity(cls, uri: URL, connect_args: dict[str, Any]) -> URL:
+        """
+        Describe legacy connect_args and native query settings identically.
+
+        Mirrors ``adjust_engine_params``: query settings take precedence over
+        connect_args, and the URI path is the schema when neither sets one.
+        """
+        query: dict[str, str | tuple[str, ...]] = {
+            key: str(connect_args[key])
+            for key in ("http_path", "catalog", "schema")
+            if key in connect_args
+        }
+        query.update(uri.query)
+        if "schema" not in query and uri.database:
+            query["schema"] = uri.database
+        return uri._replace(database=None).set(query=query)
+
+    @classmethod
+    def get_default_catalog(
+        cls,
+        database: Database,
+    ) -> str | None:
+        if catalog := database.url_object.query.get(
+            "catalog"
+        ) or database.connect_args.get("catalog"):
+            return catalog
+        # Converted rows retain the runtime catalog used by legacy permissions.
+        if database.get_extra().get("migrated_from_databricks_connector_uri"):
+            return DatabricksNativeEngineSpec.get_default_catalog(database)
+        return None
+
+    @classmethod
+    def get_catalog_names(
+        cls,
+        database: Database,
+        inspector: Inspector,
+    ) -> set[str]:
+        with inspector.engine.connect() as conn:
+            return {catalog for (catalog,) in conn.execute(text("SHOW CATALOGS"))}
+
+    @classmethod
+    def adjust_engine_params(
+        cls,
+        uri: URL,
+        connect_args: dict[str, Any],
+        catalog: str | None = None,
+        schema: str | None = None,
+    ) -> tuple[URL, dict[str, Any]]:
+        if catalog:
+            uri = uri.update_query_dict({"catalog": catalog})
+
+        if schema:
+            uri = uri.update_query_dict({"schema": schema})
+        elif (
+            "schema" not in uri.query and "schema" not in connect_args and uri.database
+        ):
+            # The SQLAlchemy 2 dialect reads schema from the query, not the path.
+            uri = uri.update_query_dict({"schema": uri.database})
+
+        # Edits made in the native form take precedence over legacy connect_args.
+        for key in ("http_path", "catalog", "schema"):
+            if key in uri.query:
+                connect_args.pop(key, None)
+
+        return uri, connect_args
+
+    @staticmethod
+    def _uses_sea(cursor: Any) -> bool:
+        """Whether ``cursor`` runs over the Statement Execution API (SEA)."""
+        session = getattr(getattr(cursor, "connection", None), "session", None)
+        return bool(getattr(session, "use_sea", False))
+
+    @classmethod
+    def execute_with_cursor(cls, cursor: Any, sql: str, query: Query) -> None:
+        """
+        Run a statement so a stop can cancel it while it is still executing.
+
+        On SEA connections the statement is submitted with ``execute_async``,
+        which publishes its statement id before returning. The id is recorded
+        as the query's cancel id, and the statement is polled with
+        ``is_query_pending`` until it finishes or a stop is requested, in which
+        case the live cursor cancels it. Once the statement is no longer
+        running its id is retired, so a stop between statements of a
+        multi-statement script never targets an already finished statement.
+
+        Thrift connections keep the synchronous execution path, as their
+        statements can't be cancelled from the stop request's connection.
+        """
+        if not cls._uses_sea(cursor):
+            super().execute_with_cursor(cursor, sql, query)
+            return
+
+        logger.debug("Query %d: Running query: %s", query.id, sql)
+        if not query.extra.get(cls.sea_async_execution_key):
+            query.set_extra_json_key(cls.sea_async_execution_key, True)
+            db.session.commit()  # pylint: disable=consider-using-transaction
+
+        if cls.arraysize:
+            cursor.arraysize = cls.arraysize
+        try:
+            cursor.execute_async(sql)
+        except Exception as ex:
+            if cls._is_oauth2_failure(query, ex):
+                cls.start_oauth2_dance(query.database)
+            raise cls.get_dbapi_mapped_exception(ex) from ex
+
+        try:
+            if (cancel_query_id := cls.get_cancel_query_id(cursor, query)) is not None:
+                query.set_extra_json_key(QUERY_CANCEL_KEY, cancel_query_id)
+                db.session.commit()  # pylint: disable=consider-using-transaction
+            stopped = cls._poll_statement(cursor, query)
+        finally:
+            cls._retire_cancel_query_id(query)
+
+        if not stopped:
+            cls._load_results(cursor, query)
+
+    @classmethod
+    def _load_results(cls, cursor: Any, query: Query) -> None:
+        """
+        Load the finished statement's result set onto the cursor, so it can be
+        fetched exactly as after a synchronous ``execute``.
+        """
+        try:
+            cursor.get_async_execution_result()
+        except Exception as ex:
+            if cls._is_oauth2_failure(query, ex):
+                cls.start_oauth2_dance(query.database)
+                raise cls.get_dbapi_mapped_exception(ex) from ex
+            try:
+                cls._raise_statement_error(cursor)
+            except Exception as statement_error:  # pylint: disable=broad-except
+                raise cls.get_dbapi_mapped_exception(
+                    statement_error
+                ) from statement_error
+            raise cls.get_dbapi_mapped_exception(ex) from ex
+
+    @classmethod
+    def _is_oauth2_failure(cls, query: Query, ex: Exception) -> bool:
+        """
+        Whether ``ex`` is an auth failure the OAuth2 dance can resolve.
+
+        The same check ``BaseEngineSpec.execute`` applies to a failed
+        statement, so an expired user token is handled alike whether it's
+        rejected on submission, while polling, or while loading results.
+        """
+        return (
+            cls.needs_oauth2(ex)
+            and not is_oauth2_retry_active()
+            and query.database.is_oauth2_enabled()
+        )
+
+    @staticmethod
+    def _raise_statement_error(cursor: Any) -> None:
+        """
+        Raise the warehouse's error for a statement that didn't succeed.
+
+        ``get_async_execution_result`` reports any unsuccessful statement with
+        a generic "Operation status FAILED" error. The synchronous ``execute``
+        instead raises the server's error code and message, through the SEA
+        backend's state check. The driver exposes no public accessor for that
+        detail, so the same check is applied to the statement's latest status.
+        Returns without raising if the detail can't be retrieved, leaving the
+        caller to raise the driver's generic error.
+        """
+        backend = getattr(cursor, "backend", None)
+        poll_query = getattr(backend, "_poll_query", None)
+        check_state = getattr(
+            backend, "_check_command_not_in_failed_or_closed_state", None
+        )
+        command_id = getattr(cursor, "active_command_id", None)
+        if poll_query is None or check_state is None or command_id is None:
+            return
+        try:
+            status = poll_query(command_id).status
+        except SoftTimeLimitExceeded:
+            raise
+        except Exception:  # pylint: disable=broad-except
+            return
+        check_state(status, command_id)
+
+    @classmethod
+    def _poll_statement(cls, cursor: Any, query: Query) -> bool:
+        """
+        Wait for the cursor's statement to finish, cancelling it on a stop.
+
+        A failed status request doesn't mean the statement finished, so it's
+        treated as still running and polled again; the statement stays
+        cancellable meanwhile. After ``sea_max_poll_failures`` consecutive
+        failures the statement is cancelled and the error is raised. An auth
+        failure the OAuth2 dance can resolve isn't retried: the statement is
+        cancelled and the user is prompted to re-authorize.
+
+        :return: True if the query was stopped, False if the statement finished
+        """
+        # Short statements finish within moments, so polling starts with a
+        # short interval that backs off to the configured one.
+        sleep_interval = 0.1
+        max_interval = app.config["DB_POLL_INTERVAL_SECONDS"].get(cls.engine, 1)
+        failures = 0
+        try:
+            while True:
+                try:
+                    pending = cursor.is_query_pending()
+                    failures = 0
+                except (SoftTimeLimitExceeded, SupersetTimeoutException):
+                    raise
+                except Exception as ex:  # pylint: disable=broad-except
+                    if cls._is_oauth2_failure(query, ex):
+                        # Retrying can't renew the user's token: cancel the
+                        # statement, then prompt for re-authorization as a
+                        # failed submission does.
+                        cls._cancel_statement(cursor, query.id)
+                        cls.start_oauth2_dance(query.database)
+                        raise cls.get_dbapi_mapped_exception(ex) from ex
+                    failures += 1
+                    if failures >= cls.sea_max_poll_failures:
+                        cls._cancel_statement(cursor, query.id)
+                        raise cls.get_dbapi_mapped_exception(ex) from ex
+                    logger.warning(
+                        "Query %s: polling statement state failed, retrying",
+                        query.id,
+                    )
+                    pending = True
+                # End the read transaction before reloading, so the query
+                # isn't served from a snapshot (e.g. under REPEATABLE READ)
+                # taken before a stop was committed.
+                db.session.commit()  # pylint: disable=consider-using-transaction
+                db.session.refresh(query)
+                if cls._is_stop_requested(query):
+                    if pending:
+                        cls._cancel_statement(cursor, query.id)
+                    return True
+                if not pending:
+                    return False
+                time.sleep(min(sleep_interval, max_interval))
+                sleep_interval *= 2
+        except (SoftTimeLimitExceeded, SupersetTimeoutException):
+            # The query is marked timed out once this propagates; cancel first
+            # so the statement doesn't keep running on the warehouse.
+            cls._cancel_statement(cursor, query.id)
+            raise
+
+    @staticmethod
+    def _is_stop_requested(query: Query) -> bool:
+        return bool(
+            query.extra.get(QUERY_EARLY_CANCEL_KEY)
+            or query.status == QueryStatus.STOPPED
+        )
+
+    @staticmethod
+    def _cancel_statement(cursor: Any, query_id: int) -> None:
+        """Cancel the statement running on the live cursor."""
+        try:
+            cursor.cancel()
+        except (SoftTimeLimitExceeded, SupersetTimeoutException):
+            raise
+        except Exception:  # pylint: disable=broad-except
+            logger.warning("Query %s: cancelling the statement failed", query_id)
+
+    @staticmethod
+    def _retire_cancel_query_id(query: Query) -> None:
+        """Drop the cancel id of a statement that is no longer running."""
+        # Reload past the current snapshot so a stop's early-cancel flag,
+        # committed meanwhile, isn't overwritten with stale metadata.
+        db.session.commit()  # pylint: disable=consider-using-transaction
+        db.session.refresh(query)
+        extra = query.extra
+        if extra.pop(QUERY_CANCEL_KEY, None) is not None:
+            query.extra = extra
+            db.session.commit()  # pylint: disable=consider-using-transaction
+
+    @classmethod
+    def prepare_cancel_query(cls, query: Query) -> None:
+        """
+        Route a stop to the polling loop while no statement id is published.
+
+        That is the case before a statement is submitted and between the
+        statements of a multi-statement script. The early-cancel flag lets the
+        stop succeed: the worker doesn't start further statements, and a
+        statement that is being submitted is cancelled as soon as it's polled.
+        """
+        if query.extra.get(cls.sea_async_execution_key) and (
+            QUERY_CANCEL_KEY not in query.extra
+        ):
+            query.set_extra_json_key(QUERY_EARLY_CANCEL_KEY, True)
+
+    @classmethod
+    def get_cancel_query_id(cls, cursor: Any, query: Query) -> str | None:
+        """
+        Capture a cancel id for the statement that was submitted on ``cursor``.
+
+        Cancellation is only supported when the connection uses Databricks'
+        Statement Execution API (SEA) backend, i.e. ``use_sea=True`` was set in
+        the database's connection parameters. A SEA statement id is a plain
+        string that can be cancelled later from a brand-new cursor/connection,
+        which matches how Superset issues cancellation (a fresh connection, not
+        the one that ran the query).
+
+        The default (Thrift) backend has no equivalent public mechanism: the
+        driver can only cancel a Thrift command via the live ``CommandId`` held
+        by the executing cursor, which includes a secret that's never exposed
+        through any public/documented accessor (``cursor.query_id`` only
+        returns the operation's GUID). Rather than reconstructing that secret
+        from the driver's private internals, this returns ``None`` for
+        Thrift-backed connections so the "stop query" action fails explicitly
+        instead of silently no-oping.
+
+        :param cursor: Cursor instance in which the query was just executed
+        :param query: Query instance
+        :return: SEA statement id, or None if cancellation isn't supported
+        """
+        command_id = getattr(cursor, "active_command_id", None)
+        if command_id is None:
+            return None
+
+        session = getattr(getattr(cursor, "connection", None), "session", None)
+        if not getattr(session, "use_sea", False):
+            return None
+
+        return command_id.to_sea_statement_id()
+
+    @classmethod
+    def cancel_query(cls, cursor: Any, query: Query, cancel_query_id: str) -> bool:
+        """
+        Cancel a query in the underlying database.
+
+        Only implemented for SEA (Statement Execution API) connections; see
+        ``get_cancel_query_id``. Any error raised while attempting the cancel
+        (e.g. the fresh cursor/connection itself failing) is allowed to
+        propagate rather than being reported as a successful or failed cancel.
+
+        :param cursor: New cursor instance to the db of the query
+        :param query: Query instance
+        :param cancel_query_id: SEA statement id, as returned by
+            ``get_cancel_query_id``
+        :return: True if the cancel request was submitted successfully
+        """
+        if not cls.validate_cancel_query_id(cancel_query_id, r"^[a-zA-Z0-9-]+$"):
+            return False
+
+        from databricks.sql.backend.types import CommandId
+
+        cursor.active_command_id = CommandId.from_sea_statement_id(cancel_query_id)
+        cursor.cancel()
+        return True
+
+
+class DatabricksNativeEngineSpec(DatabricksDynamicBaseEngineSpec):
+    """Compatibility form for legacy Databricks connections."""
+
+    engine = "databricks"
+    engine_name = "Databricks (legacy)"
+    drivers = {"connector": "Native all-purpose driver"}
+    default_driver = "connector"
+
+    parameters_schema = DatabricksNativeSchema()
+    properties_schema = DatabricksNativePropertiesSchema()
+
+    sqlalchemy_uri_placeholder = (
+        "databricks+connector://token:{access_token}@{host}:{port}/{database_name}"
+    )
+
+    metadata = {
+        "description": "Field-based configuration for legacy Databricks connections.",
+        "logo": "databricks.png",
+        "homepage_url": "https://www.databricks.com/",
+        "categories": [
+            DatabaseCategory.CLOUD_DATA_WAREHOUSES,
+            DatabaseCategory.ANALYTICAL_DATABASES,
+            DatabaseCategory.PROPRIETARY,
+        ],
+        "pypi_packages": ["apache-superset[databricks]"],
+        "connection_string": (
+            "databricks+connector://token:{access_token}@{host}:{port}/{database_name}?http_path={http_path}"
+        ),
+        "default_port": 443,
+        "parameters": {
+            "access_token": "Personal access token",
+            "host": "Server hostname",
+            "port": "Port (default 443)",
+            "database_name": "Database name",
+            "http_path": "HTTP path from cluster settings",
+        },
+    }
+
+    # Note: Primary metadata is in DatabricksPythonConnectorEngineSpec which
+    # consolidates all Databricks connection methods. This spec exists for
+    # backwards compatibility with legacy databricks-dbapi connections.
+    context_key_mapping = {
+        **DatabricksDynamicBaseEngineSpec.context_key_mapping,
+        "database": "database",
+        "username": "username",
+    }
+    required_parameters = DatabricksDynamicBaseEngineSpec.required_parameters | {
+        "database",
+        "extra",
+    }
+
+    supports_dynamic_schema = True
+    supports_catalog = True
+    supports_dynamic_catalog = True
+    supports_cross_catalog_queries = True
+
+    # OAuth 2.0 support. The flow (endpoint resolution from the workspace host,
+    # `needs_oauth2` detection) is shared via `DatabricksDynamicBaseEngineSpec`.
+    supports_oauth2 = True
+    oauth2_scope = "sql"
+
+    # Authorization endpoint is derived from the workspace host at runtime; the
+    # token endpoint must be configured (no DB context at exchange time).
+    oauth2_authorization_request_uri = ""
+    oauth2_token_request_uri = ""
+
+    @classmethod
+    def build_sqlalchemy_uri(  # type: ignore
+        cls, parameters: DatabricksNativeParametersType, *_
+    ) -> str:
+        query = {}
+        if parameters.get("encryption"):
+            if not cls.encryption_parameters:
+                raise Exception(  # pylint: disable=broad-exception-raised
+                    "Unable to build a URL with encryption enabled"
+                )
+            query.update(cls.encryption_parameters)
+
+        # SQLAlchemy 2.0 made URL.__str__() hide the password by default
+        # (it rendered in full under 1.4); render_as_string(hide_password=
+        # False) is required here since this URI is stored/used to actually
+        # connect, not just displayed.
+        return URL.create(
+            f"{cls.engine}+{cls.default_driver}",
+            username="token",
+            password=parameters.get("access_token"),
+            host=parameters["host"],
+            port=parameters["port"],
+            database=parameters["database"],
+            query=query,
+        ).render_as_string(hide_password=False)
+
+    @classmethod
+    def get_parameters_from_uri(  # type: ignore
+        cls, uri: str, *_, **__
+    ) -> DatabricksNativeParametersType:
+        url = make_url_safe(uri)
+        encryption = all(
+            item in url.query.items() for item in cls.encryption_parameters.items()
+        )
+        return {
+            "access_token": url.password,
+            "host": url.host,
+            "port": url.port,
+            "database": url.database,
+            "encryption": encryption,
+        }
+
+    @classmethod
+    def parameters_json_schema(cls) -> Any:
+        """
+        Return configuration parameters as OpenAPI.
+        """
+        if not cls.properties_schema:
+            return None
+
+        spec = APISpec(
+            title="Database Parameters",
+            version="1.0.0",
+            openapi_version="3.0.2",
+            plugins=[MarshmallowPlugin()],
+        )
+        spec.components.schema(cls.__name__, schema=cls.properties_schema)
+        return spec.to_dict()["components"]["schemas"][cls.__name__]
+
+    @classmethod
+    def get_default_catalog(cls, database: Database) -> str:
+        """
+        Return the default catalog.
+
+        It's optionally specified in `connect_args.catalog`. If not:
+
+        The default behavior for Databricks is confusing. When Unity Catalog is not
+        enabled we have (the DB engine spec hasn't been tested with it enabled):
+
+            > SHOW CATALOGS;
+            spark_catalog
+            > SELECT current_catalog();
+            hive_metastore
+
+        To handle permissions correctly we use the result of `SHOW CATALOGS` when a
+        single catalog is returned.
+        """
+        connect_args = cls.get_extra_params(database)["engine_params"]["connect_args"]
+        if default_catalog := connect_args.get("catalog"):
+            return default_catalog
+
+        with database.get_sqla_engine() as engine:
+            with engine.connect() as conn:
+                catalogs = {
+                    catalog for (catalog,) in conn.execute(text("SHOW CATALOGS"))
+                }
+                if len(catalogs) == 1:
+                    return catalogs.pop()
+
+                return conn.execute(text("SELECT current_catalog()")).scalar()
+
+    @classmethod
+    def get_prequeries(
+        cls,
+        database: Database,
+        catalog: str | None = None,
+        schema: str | None = None,
+    ) -> list[str]:
+        prequeries = []
+        if catalog:
+            escaped_catalog = catalog.replace("`", "``")
+            prequeries.append(f"USE CATALOG `{escaped_catalog}`")
+        if schema:
+            escaped_schema = schema.replace("`", "``")
+            prequeries.append(f"USE SCHEMA `{escaped_schema}`")
+        return prequeries
+
+    @classmethod
+    def get_catalog_names(
+        cls,
+        database: Database,
+        inspector: Inspector,
+    ) -> set[str]:
+        with inspector.engine.connect() as conn:
+            return {catalog for (catalog,) in conn.execute(text("SHOW CATALOGS"))}
+
+
+class DatabricksODBCEngineSpec(DatabricksBaseEngineSpec):
+    """Databricks engine spec using ODBC driver for SQL Endpoints."""
+
+    engine_name = "Databricks SQL Endpoint"
+
+    engine = "databricks"
+    drivers = {"pyodbc": "ODBC driver for SQL endpoint"}
+    default_driver = "pyodbc"
+
+    metadata = {
+        "description": ("Databricks SQL Endpoint connectivity via the pyodbc driver."),
+        "logo": "databricks.png",
+        "homepage_url": "https://www.databricks.com/",
+        "categories": [
+            DatabaseCategory.CLOUD_DATA_WAREHOUSES,
+            DatabaseCategory.ANALYTICAL_DATABASES,
+            DatabaseCategory.PROPRIETARY,
+        ],
+        "pypi_packages": ["pyodbc"],
+        "connection_string": (
+            "databricks+pyodbc://token:{access_token}@{host}:{port}/{database}?http_path={http_path}"
+        ),
+        "default_port": 443,
+        "parameters": {
+            "access_token": "Personal access token",
+            "host": "Server hostname",
+            "port": "Port (default 443)",
+            "database": "Database name",
+            "http_path": "HTTP path from SQL endpoint settings",
+        },
+    }
+
+    # Note: Primary metadata is in DatabricksPythonConnectorEngineSpec which
+    # consolidates all Databricks connection methods. This spec exists for
+    # backwards compatibility with ODBC connections to SQL Endpoints.
+
+
+# NOTE: This legacy Interactive-Cluster Hive spec must stay defined *after*
+# `DatabricksPythonConnectorEngineSpec` (see the ordering note on that class): the
+# ambiguous-driver fallback in `get_engine_spec` picks the first backend-matching
+# spec by definition order, and this spec's inherited `HiveEngineSpec.execute()`
+# crashes on the `databricks.sql.client.Cursor` used by unrecognized-driver URIs.
+class DatabricksHiveEngineSpec(SparkSqlBooleanEqualityMixin, HiveEngineSpec):
+    """Databricks engine spec using Hive connector for Interactive Clusters."""
+
+    engine_name = "Databricks Interactive Cluster"
+
+    engine = "databricks"
+    drivers = {"pyhive": "Hive driver for Interactive Cluster"}
+    default_driver = "pyhive"
+
+    metadata = {
+        "description": (
+            "Databricks Interactive Cluster connectivity via the PyHive connector."
+        ),
+        "logo": "databricks.png",
+        "homepage_url": "https://www.databricks.com/",
+        "categories": [
+            DatabaseCategory.CLOUD_DATA_WAREHOUSES,
+            DatabaseCategory.ANALYTICAL_DATABASES,
+            DatabaseCategory.HOSTED_OPEN_SOURCE,
+        ],
+        "pypi_packages": ["pyhive"],
+        "connection_string": (
+            "databricks+pyhive://token:{access_token}@{host}:{port}/{database}?http_path={http_path}"
+        ),
+        "default_port": 443,
+        "parameters": {
+            "access_token": "Personal access token",
+            "host": "Server hostname",
+            "port": "Port (default 443)",
+            "database": "Database name",
+            "http_path": "HTTP path from cluster settings",
+        },
+    }
+
+    # Note: Primary metadata is in DatabricksPythonConnectorEngineSpec which
+    # consolidates all Databricks connection methods. This spec exists for
+    # backwards compatibility with Interactive Cluster connections.
+
+    _show_functions_column = "function"
+
+    _time_grain_expressions = time_grain_expressions
+
+    # Interactive Clusters run Spark SQL, same as the primary Databricks
+    # connector above; same native MEDIAN/STDDEV_SAMP/VAR_SAMP functions
+    # apply here rather than the inherited (unimplemented) HiveEngineSpec/
+    # PrestoEngineSpec default.
+    _extended_aggregations = DatabricksBaseEngineSpec._extended_aggregations
+
+
+# TODO: remove once we've upgraded to SQLAlchemy>=2.0 and databricks-sql-python>=3.x
+monkeypatch_dialect()

@@ -15,49 +15,56 @@
 # specific language governing permissions and limitations
 # under the License.
 # isort:skip_file
+from __future__ import annotations
+
 import re
 from datetime import datetime
-from typing import Any, Dict, List, NamedTuple, Optional, Pattern, Tuple, Union
-from unittest.mock import patch
+from typing import Any, cast, Literal, NamedTuple, Optional, Union
+from re import Pattern
+from unittest.mock import MagicMock, Mock, patch
 import pytest
 
 import numpy as np
 import pandas as pd
-import sqlalchemy as sa
-from flask import Flask
-from pytest_mock import MockFixture
+from flask.ctx import AppContext
+from flask_appbuilder.security.sqla.models import Role
+from pytest_mock import MockerFixture
 from sqlalchemy.sql import text
 from sqlalchemy.sql.elements import TextClause
 
 from superset import db
-from superset.connectors.sqla.models import SqlaTable, TableColumn
+from superset.connectors.sqla.models import SqlaTable, TableColumn, SqlMetric
+from superset.constants import EMPTY_STRING, NULL_STRING
+from superset.superset_typing import AdhocMetric, QueryObjectDict
 from superset.db_engine_specs.bigquery import BigQueryEngineSpec
 from superset.db_engine_specs.druid import DruidEngineSpec
-from superset.exceptions import QueryObjectValidationError
+from superset.exceptions import (
+    QueryObjectValidationError,
+)  # noqa: F401
 from superset.models.core import Database
 from superset.utils.core import (
     AdhocMetricExpressionType,
     FilterOperator,
     GenericDataType,
-    get_example_database,
-    TemporalType,
 )
+from superset.utils.database import get_example_database
 from tests.integration_tests.fixtures.birth_names_dashboard import (
-    load_birth_names_dashboard_with_slices,
+    load_birth_names_dashboard_with_slices,  # noqa: F401
+    load_birth_names_data,  # noqa: F401
 )
 
 from .base_tests import SupersetTestCase
+from .conftest import only_postgresql
 
-
-VIRTUAL_TABLE_INT_TYPES: Dict[str, Pattern[str]] = {
+VIRTUAL_TABLE_INT_TYPES: dict[str, Pattern[str]] = {
     "hive": re.compile(r"^INT_TYPE$"),
     "mysql": re.compile("^LONGLONG$"),
-    "postgresql": re.compile(r"^INT$"),
+    "postgresql": re.compile(r"^INTEGER$"),
     "presto": re.compile(r"^INTEGER$"),
     "sqlite": re.compile(r"^INT$"),
 }
 
-VIRTUAL_TABLE_STRING_TYPES: Dict[str, Pattern[str]] = {
+VIRTUAL_TABLE_STRING_TYPES: dict[str, Pattern[str]] = {
     "hive": re.compile(r"^STRING_TYPE$"),
     "mysql": re.compile(r"^VAR_STRING$"),
     "postgresql": re.compile(r"^STRING$"),
@@ -65,11 +72,100 @@ VIRTUAL_TABLE_STRING_TYPES: Dict[str, Pattern[str]] = {
     "sqlite": re.compile(r"^STRING$"),
 }
 
+ADHOC_JINJA_METRIC: dict[str, Any] = {
+    "label": "mine",
+    "expressionType": "SQL",
+    "sqlExpression": "COUNT(CASE WHEN user = '{{ current_username() }}' THEN 1 END)",
+}
+ADHOC_PLAIN_METRIC: dict[str, Any] = {
+    "label": "all",
+    "expressionType": "SQL",
+    "sqlExpression": "COUNT(*)",
+}
+ADHOC_JINJA_COLUMN: dict[str, Any] = {
+    "label": "is_mine",
+    "sqlExpression": "user = '{{ current_username() }}'",
+}
+ADHOC_PLAIN_COLUMN: dict[str, Any] = {
+    "label": "is_abc",
+    "sqlExpression": "user = 'abc'",
+}
+SIMPLE_JINJA_METRIC: dict[str, Any] = {
+    "label": "mine",
+    "expressionType": "SIMPLE",
+    "aggregate": "COUNT",
+    "column": {"column_name": "username"},
+}
+SIMPLE_PLAIN_METRIC: dict[str, Any] = {
+    "label": "all",
+    "expressionType": "SIMPLE",
+    "aggregate": "COUNT",
+    "column": {"column_name": "user"},
+}
+
+
+@pytest.mark.parametrize(
+    "expression, expected_comment",
+    [
+        ("DATE_TRUNC('QUARTER', created_at) /* inline */", "/* inline */"),
+        ("DATE_TRUNC('QUARTER', created_at) -- trailing", "/* trailing */"),
+    ],
+)
+def test_saved_postgresql_metric_preserves_normalized_source_and_comments(
+    expression: str,
+    expected_comment: str,
+) -> None:
+    database: Database = Database(
+        database_name="postgres",
+        sqlalchemy_uri="postgresql://",
+    )
+    table: SqlaTable = SqlaTable(table_name="orders", database=database)
+    metric: SqlMetric = SqlMetric(
+        metric_name="quarter",
+        expression=expression,
+        table=table,
+    )
+
+    compiled: str = str(metric.get_sqla_col())
+
+    assert "DATE_TRUNC('quarter', created_at)" in compiled
+    assert expected_comment in compiled
+
+
+@pytest.mark.parametrize(
+    "expression, expected_comment",
+    [
+        ("DATE_TRUNC('QUARTER', created_at) /* inline */", "/* inline */"),
+        ("DATE_TRUNC('QUARTER', created_at) -- trailing", "/* trailing */"),
+    ],
+)
+def test_adhoc_postgresql_metric_preserves_normalized_source_and_comments(
+    app_context: AppContext,
+    expression: str,
+    expected_comment: str,
+) -> None:
+    database: Database = Database(
+        database_name="postgres",
+        sqlalchemy_uri="postgresql://",
+    )
+    table: SqlaTable = SqlaTable(table_name="orders", database=database)
+    metric: AdhocMetric = {
+        "expressionType": "SQL",
+        "sqlExpression": expression,
+        "label": "quarter",
+    }
+
+    compiled: str = str(table.adhoc_metric_to_sqla(metric, {}))
+
+    assert "DATE_TRUNC('quarter', created_at)" in compiled
+    assert expected_comment in compiled
+
 
 class FilterTestCase(NamedTuple):
+    column: str
     operator: str
-    value: Union[float, int, List[Any], str]
-    expected: Union[str, List[str]]
+    value: Union[float, int, list[Any], str]
+    expected: Union[str, list[str]]
 
 
 class TestDatabaseModel(SupersetTestCase):
@@ -79,12 +175,12 @@ class TestDatabaseModel(SupersetTestCase):
         database = Database(database_name="druid_db", sqlalchemy_uri="druid://db")
         tbl = SqlaTable(table_name="druid_tbl", database=database)
         col = TableColumn(column_name="__time", type="INTEGER", table=tbl)
-        self.assertEqual(col.is_dttm, None)
+        assert col.is_dttm is None
         DruidEngineSpec.alter_new_orm_column(col)
-        self.assertEqual(col.is_dttm, True)
+        assert col.is_dttm is True
 
         col = TableColumn(column_name="__not_time", type="INTEGER", table=tbl)
-        self.assertEqual(col.is_temporal, False)
+        assert col.is_temporal is False
 
     def test_temporal_varchar(self):
         """Ensure a column with is_dttm set to true evaluates to is_temporal == True"""
@@ -99,7 +195,7 @@ class TestDatabaseModel(SupersetTestCase):
         assert col.is_temporal is True
 
     def test_db_column_types(self):
-        test_cases: Dict[str, GenericDataType] = {
+        test_cases: dict[str, GenericDataType] = {
             # string
             "CHAR": GenericDataType.STRING,
             "VARCHAR": GenericDataType.STRING,
@@ -121,79 +217,137 @@ class TestDatabaseModel(SupersetTestCase):
         tbl = SqlaTable(table_name="col_type_test_tbl", database=get_example_database())
         for str_type, db_col_type in test_cases.items():
             col = TableColumn(column_name="foo", type=str_type, table=tbl)
-            self.assertEqual(col.is_temporal, db_col_type == GenericDataType.TEMPORAL)
-            self.assertEqual(col.is_numeric, db_col_type == GenericDataType.NUMERIC)
-            self.assertEqual(col.is_string, db_col_type == GenericDataType.STRING)
+            assert col.is_temporal == (db_col_type == GenericDataType.TEMPORAL)
+            assert col.is_numeric == (db_col_type == GenericDataType.NUMERIC)
+            assert col.is_string == (db_col_type == GenericDataType.STRING)
 
-        for str_type, db_col_type in test_cases.items():
+        for str_type, db_col_type in test_cases.items():  # noqa: B007
             col = TableColumn(column_name="foo", type=str_type, table=tbl, is_dttm=True)
-            self.assertTrue(col.is_temporal)
+            assert col.is_temporal
 
-    @patch("superset.jinja_context.g")
-    def test_extra_cache_keys(self, flask_g):
-        flask_g.user.username = "abc"
+    @patch("superset.jinja_context.get_username", return_value="abc")
+    def test_jinja_metrics_and_calc_columns(self, mock_username: MagicMock) -> None:
+        base_query_obj: dict[str, Any] = {
+            "granularity": None,
+            "from_dttm": None,
+            "to_dttm": None,
+            "columns": [
+                "user",
+                "expr",
+                {
+                    "hasCustomLabel": True,
+                    "label": "adhoc_column",
+                    "sqlExpression": "'{{ 'foo_' + time_grain }}'",
+                },
+            ],
+            "metrics": [
+                {
+                    "hasCustomLabel": True,
+                    "label": "adhoc_metric",
+                    "expressionType": AdhocMetricExpressionType.SQL,
+                    "sqlExpression": "SUM(case when user = '{{ 'user_' + "
+                    "current_username() }}' then 1 else 0 end)",
+                },
+                "count_timegrain",
+            ],
+            "is_timeseries": False,
+            "filter": [],
+            "extras": {"time_grain_sqla": "P1D"},
+        }
+
+        table = SqlaTable(
+            table_name="test_has_jinja_metric_and_expr",
+            sql="SELECT '{{ 'user_' + current_username() }}' as user, "
+            "'{{ 'xyz_' + time_grain }}' as time_grain",
+            database=get_example_database(),
+        )
+        db.session.add(table)
+
+        column = TableColumn(
+            column_name="expr",
+            expression="case when '{{ current_username() }}' = 'abc' "
+            "then 'yes' else 'no' end",
+            type="VARCHAR(100)",
+            table=table,
+        )
+        metric = SqlMetric(
+            metric_name="count_timegrain",
+            expression="count('{{ 'bar_' + time_grain }}')",
+            table=table,
+        )
+        db.session.add(column)
+        db.session.add(metric)
+        db.session.commit()
+
+        sqla_query = table.get_sqla_query(**base_query_obj)
+        query = table.database.compile_sqla_query(sqla_query.sqla_query)
+
+        # assert virtual dataset (SQL is not reformatted when no RLS applies)
+        assert "'user_abc' as user" in query
+        assert "'xyz_P1D' as time_grain" in query
+        # assert dataset calculated column
+        assert "case when 'abc' = 'abc' then 'yes' else 'no' end" in query
+        # assert adhoc column
+        assert "'foo_P1D'" in query
+        # assert dataset saved metric
+        assert "count('bar_P1D')" in query
+        # assert adhoc metric (sanitize_clause preserves the user's SQL verbatim)
+        assert "SUM(case when user = 'user_abc' then 1 else 0 end)" in query
+        # Cleanup
+        db.session.delete(table)
+        db.session.commit()
+
+    @patch("superset.jinja_context.get_dataset_id_from_context")
+    def test_jinja_metric_macro(self, mock_dataset_id_from_context):
+        self.login(username="admin")
+        table = self.get_table(name="birth_names")
+        metric = SqlMetric(
+            metric_name="count_jinja_metric", expression="count(*)", table=table
+        )
+        db.session.add(metric)
+        db.session.commit()
+
         base_query_obj = {
             "granularity": None,
             "from_dttm": None,
             "to_dttm": None,
-            "groupby": ["user"],
-            "metrics": [],
+            "columns": [],
+            "metrics": [
+                {
+                    "hasCustomLabel": True,
+                    "label": "Metric using Jinja macro",
+                    "expressionType": AdhocMetricExpressionType.SQL,
+                    "sqlExpression": "{{ metric('count_jinja_metric') }}",
+                },
+                {
+                    "hasCustomLabel": True,
+                    "label": "Same but different",
+                    "expressionType": AdhocMetricExpressionType.SQL,
+                    "sqlExpression": "{{ metric('count_jinja_metric', "
+                    + str(table.id)
+                    + ") }}",
+                },
+            ],
             "is_timeseries": False,
             "filter": [],
+            "extras": {"time_grain_sqla": "P1D"},
         }
+        mock_dataset_id_from_context.return_value = table.id
 
-        # Table with Jinja callable.
-        table1 = SqlaTable(
-            table_name="test_has_extra_cache_keys_table",
-            sql="SELECT '{{ current_username() }}' as user",
-            database=get_example_database(),
-        )
+        sqla_query = table.get_sqla_query(**base_query_obj)
+        query = table.database.compile_sqla_query(sqla_query.sqla_query)
 
-        query_obj = dict(**base_query_obj, extras={})
-        extra_cache_keys = table1.get_extra_cache_keys(query_obj)
-        self.assertTrue(table1.has_extra_cache_key_calls(query_obj))
-        assert extra_cache_keys == ["abc"]
+        database = table.database
+        with database.get_sqla_engine() as engine:
+            quote = engine.dialect.identifier_preparer.quote_identifier
 
-        # Table with Jinja callable disabled.
-        table2 = SqlaTable(
-            table_name="test_has_extra_cache_keys_disabled_table",
-            sql="SELECT '{{ current_username(False) }}' as user",
-            database=get_example_database(),
-        )
-        query_obj = dict(**base_query_obj, extras={})
-        extra_cache_keys = table2.get_extra_cache_keys(query_obj)
-        self.assertTrue(table2.has_extra_cache_key_calls(query_obj))
-        self.assertListEqual(extra_cache_keys, [])
+        for metric_label in {"metric using jinja macro", "same but different"}:
+            assert f"count(*) as {quote(metric_label)}" in query.lower()
 
-        # Table with no Jinja callable.
-        query = "SELECT 'abc' as user"
-        table3 = SqlaTable(
-            table_name="test_has_no_extra_cache_keys_table",
-            sql=query,
-            database=get_example_database(),
-        )
-
-        query_obj = dict(**base_query_obj, extras={"where": "(user != 'abc')"})
-        extra_cache_keys = table3.get_extra_cache_keys(query_obj)
-        self.assertFalse(table3.has_extra_cache_key_calls(query_obj))
-        self.assertListEqual(extra_cache_keys, [])
-
-        # With Jinja callable in SQL expression.
-        query_obj = dict(
-            **base_query_obj, extras={"where": "(user != '{{ current_username() }}')"}
-        )
-        extra_cache_keys = table3.get_extra_cache_keys(query_obj)
-        self.assertTrue(table3.has_extra_cache_key_calls(query_obj))
-        assert extra_cache_keys == ["abc"]
-
-        # Cleanup
-        for table in [table1, table2, table3]:
-            db.session.delete(table)
+        db.session.delete(metric)
         db.session.commit()
 
-    @patch("superset.jinja_context.g")
-    def test_jinja_metrics_and_calc_columns(self, flask_g):
-        flask_g.user.username = "abc"
+    def test_adhoc_metrics_and_calc_columns(self):
         base_query_obj = {
             "granularity": None,
             "from_dttm": None,
@@ -202,9 +356,9 @@ class TestDatabaseModel(SupersetTestCase):
             "metrics": [
                 {
                     "expressionType": AdhocMetricExpressionType.SQL,
-                    "sqlExpression": "SUM(case when user = '{{ current_username() }}' "
-                    "then 1 else 0 end)",
-                    "label": "SUM(userid)",
+                    "sqlExpression": "(SELECT (SELECT * from birth_names) "
+                    "from test_validate_adhoc_sql)",
+                    "label": "adhoc_metrics",
                 }
             ],
             "is_timeseries": False,
@@ -212,47 +366,43 @@ class TestDatabaseModel(SupersetTestCase):
         }
 
         table = SqlaTable(
-            table_name="test_has_jinja_metric_and_expr",
-            sql="SELECT '{{ current_username() }}' as user",
-            database=get_example_database(),
+            table_name="test_validate_adhoc_sql", database=get_example_database()
         )
-        TableColumn(
-            column_name="expr",
-            expression="case when '{{ current_username() }}' = 'abc' "
-            "then 'yes' else 'no' end",
-            type="VARCHAR(100)",
-            table=table,
-        )
+        db.session.add(table)
         db.session.commit()
 
-        sqla_query = table.get_sqla_query(**base_query_obj)
-        query = table.database.compile_sqla_query(sqla_query.sqla_query)
-        # assert expression
-        assert "case when 'abc' = 'abc' then 'yes' else 'no' end" in query
-        # assert metric
-        assert "SUM(case when user = 'abc' then 1 else 0 end)" in query
+        with pytest.raises(QueryObjectValidationError):
+            table.get_sqla_query(**base_query_obj)
         # Cleanup
         db.session.delete(table)
         db.session.commit()
 
     @pytest.mark.usefixtures("load_birth_names_dashboard_with_slices")
     def test_where_operators(self):
-        filters: Tuple[FilterTestCase, ...] = (
-            FilterTestCase(FilterOperator.IS_NULL, "", "IS NULL"),
-            FilterTestCase(FilterOperator.IS_NOT_NULL, "", "IS NOT NULL"),
+        filters: tuple[FilterTestCase, ...] = (
+            FilterTestCase("num", FilterOperator.IS_NULL, "", "IS NULL"),
+            FilterTestCase("num", FilterOperator.IS_NOT_NULL, "", "IS NOT NULL"),
             # Some db backends translate true/false to 1/0
-            FilterTestCase(FilterOperator.IS_TRUE, "", ["IS 1", "IS true"]),
-            FilterTestCase(FilterOperator.IS_FALSE, "", ["IS 0", "IS false"]),
-            FilterTestCase(FilterOperator.GREATER_THAN, 0, "> 0"),
-            FilterTestCase(FilterOperator.GREATER_THAN_OR_EQUALS, 0, ">= 0"),
-            FilterTestCase(FilterOperator.LESS_THAN, 0, "< 0"),
-            FilterTestCase(FilterOperator.LESS_THAN_OR_EQUALS, 0, "<= 0"),
-            FilterTestCase(FilterOperator.EQUALS, 0, "= 0"),
-            FilterTestCase(FilterOperator.NOT_EQUALS, 0, "!= 0"),
-            FilterTestCase(FilterOperator.IN, ["1", "2"], "IN (1, 2)"),
-            FilterTestCase(FilterOperator.NOT_IN, ["1", "2"], "NOT IN (1, 2)"),
+            FilterTestCase("num", FilterOperator.IS_TRUE, "", ["IS 1", "IS true"]),
+            FilterTestCase("num", FilterOperator.IS_FALSE, "", ["IS 0", "IS false"]),
+            FilterTestCase("num", FilterOperator.GREATER_THAN, 0, "> 0"),
+            FilterTestCase("num", FilterOperator.GREATER_THAN_OR_EQUALS, 0, ">= 0"),
+            FilterTestCase("num", FilterOperator.LESS_THAN, 0, "< 0"),
+            FilterTestCase("num", FilterOperator.LESS_THAN_OR_EQUALS, 0, "<= 0"),
+            FilterTestCase("num", FilterOperator.EQUALS, 0, "= 0"),
+            FilterTestCase("num", FilterOperator.NOT_EQUALS, 0, "!= 0"),
+            FilterTestCase("num", FilterOperator.IN, ["1", "2"], "IN (1, 2)"),
+            FilterTestCase("num", FilterOperator.NOT_IN, ["1", "2"], "NOT IN (1, 2)"),
+            FilterTestCase(
+                "ds", FilterOperator.TEMPORAL_RANGE, "2020 : 2021", "2020-01-01"
+            ),
         )
         table = self.get_table(name="birth_names")
+        # This test targets filter operators, not the dataset Hour Offset. A
+        # non-zero offset shifts temporal filter bounds (#104810) and other tests
+        # in the suite can leave one set on the shared birth_names table, so pin
+        # it to 0 here to keep the temporal-range literal deterministic.
+        table.offset = 0
         for filter_ in filters:
             query_obj = {
                 "granularity": None,
@@ -262,18 +412,20 @@ class TestDatabaseModel(SupersetTestCase):
                 "metrics": ["count"],
                 "is_timeseries": False,
                 "filter": [
-                    {"col": "num", "op": filter_.operator, "val": filter_.value}
+                    {
+                        "col": filter_.column,
+                        "op": filter_.operator,
+                        "val": filter_.value,
+                    }
                 ],
                 "extras": {},
             }
             sqla_query = table.get_sqla_query(**query_obj)
             sql = table.database.compile_sqla_query(sqla_query.sqla_query)
             if isinstance(filter_.expected, list):
-                self.assertTrue(
-                    any([candidate in sql for candidate in filter_.expected])
-                )
+                assert any([candidate in sql for candidate in filter_.expected])  # noqa: C419
             else:
-                self.assertIn(filter_.expected, sql)
+                assert filter_.expected in sql
 
     @pytest.mark.usefixtures("load_birth_names_dashboard_with_slices")
     def test_boolean_type_where_operators(self):
@@ -310,7 +462,7 @@ class TestDatabaseModel(SupersetTestCase):
         # https://github.com/sqlalchemy/sqlalchemy/blob/master/lib/sqlalchemy/dialects/mysql/base.py
         if not dialect.supports_native_boolean and dialect.name != "mysql":
             operand = "(1, 0)"
-        self.assertIn(f"IN {operand}", sql)
+        assert f"IN {operand}" in sql
 
     def test_incorrect_jinja_syntax_raises_correct_exception(self):
         query_obj = {
@@ -347,9 +499,8 @@ class TestDatabaseModel(SupersetTestCase):
             "extras": {},
         }
 
-        # Table with Jinja callable.
         table = SqlaTable(
-            table_name="test_table",
+            table_name="another_test_table",
             sql="SELECT * from test_table;",
             database=get_example_database(),
         )
@@ -369,7 +520,7 @@ class TestDatabaseModel(SupersetTestCase):
         }
 
         table = SqlaTable(
-            table_name="test_has_extra_cache_keys_table",
+            table_name="test_multiple_sql_statements",
             sql="SELECT 'foo' as grp, 1 as num; SELECT 'bar' as grp, 2 as num",
             database=get_example_database(),
         )
@@ -390,7 +541,7 @@ class TestDatabaseModel(SupersetTestCase):
         }
 
         table = SqlaTable(
-            table_name="test_has_extra_cache_keys_table",
+            table_name="test_dml_statement",
             sql="DELETE FROM foo",
             database=get_example_database(),
         )
@@ -405,24 +556,28 @@ class TestDatabaseModel(SupersetTestCase):
             database=get_example_database(),
             sql="select 123 as intcol, 'abc' as strcol, 'abc' as mycase",
         )
-        TableColumn(column_name="intcol", type="FLOAT", table=table)
-        TableColumn(column_name="oldcol", type="INT", table=table)
-        TableColumn(
-            column_name="expr",
-            expression="case when 1 then 1 else 0 end",
-            type="INT",
-            table=table,
-        )
-        TableColumn(
-            column_name="mycase",
-            expression="case when 1 then 1 else 0 end",
-            type="INT",
-            table=table,
-        )
+        columns = [
+            TableColumn(column_name="intcol", type="FLOAT", table=table),
+            TableColumn(column_name="oldcol", type="INT", table=table),
+            TableColumn(
+                column_name="expr",
+                expression="case when 1 then 1 else 0 end",
+                type="INT",
+                table=table,
+            ),
+            TableColumn(
+                column_name="mycase",
+                expression="case when 1 then 1 else 0 end",
+                type="INT",
+                table=table,
+            ),
+        ]
+        db.session.add_all(columns)
 
         # make sure the columns have been mapped properly
         assert len(table.columns) == 4
         table.fetch_metadata()
+
         # assert that the removed column has been dropped and
         # the physical and calculated columns are present
         assert {col.column_name for col in table.columns} == {
@@ -431,9 +586,9 @@ class TestDatabaseModel(SupersetTestCase):
             "mycase",
             "expr",
         }
-        cols: Dict[str, TableColumn] = {col.column_name: col for col in table.columns}
+        cols: dict[str, TableColumn] = {col.column_name: col for col in table.columns}
         # assert that the type for intcol has been updated (asserting CI types)
-        backend = get_example_database().backend
+        backend = table.database.backend
         assert VIRTUAL_TABLE_INT_TYPES[backend].match(cols["intcol"].type)
         # assert that the expression has been replaced with the new physical column
         assert cols["mycase"].expression == ""
@@ -468,32 +623,823 @@ class TestDatabaseModel(SupersetTestCase):
         sqlaq = table.get_sqla_query(**query_obj)
         assert sqlaq.labels_expected == ["user", "COUNT_DISTINCT(user)"]
         sql = table.database.compile_sqla_query(sqlaq.sqla_query)
-        assert "COUNT_DISTINCT_user__00db1" in sql
+        # SHA-256 hash of "COUNT_DISTINCT(user)" starts with "01c94"
+        assert "COUNT_DISTINCT_user__01c94" in sql
         db.session.delete(table)
         db.session.delete(database)
         db.session.commit()
 
-    def test_values_for_column(self):
-        table = SqlaTable(
-            table_name="test_null_in_column",
-            sql="SELECT 'foo' as foo UNION SELECT 'bar' UNION SELECT NULL",
-            database=get_example_database(),
+
+@pytest.fixture
+def text_column_table(app_context: AppContext):
+    table = SqlaTable(
+        table_name="text_column_table",
+        sql=(
+            "SELECT 'foo' as foo "
+            "UNION SELECT '' "
+            "UNION SELECT NULL "
+            "UNION SELECT 'null' "
+            "UNION SELECT '\"text in double quotes\"' "
+            "UNION SELECT '''text in single quotes''' "
+            "UNION SELECT 'double quotes \" in text' "
+            "UNION SELECT 'single quotes '' in text' "
+        ),
+        database=get_example_database(),
+    )
+    column = TableColumn(column_name="foo", type="VARCHAR(255)", table=table)
+    metric = SqlMetric(metric_name="count", expression="count(*)", table=table)
+    db.session.add(column)
+    db.session.add(metric)
+    return table
+
+
+def test_values_for_column_on_text_column(text_column_table):
+    # null value, empty string and text should be retrieved
+    with_null = text_column_table.values_for_column(column_name="foo", limit=10000)
+    assert None in with_null
+    assert len(with_null) == 8
+
+
+def test_values_for_column_on_text_column_with_rls(text_column_table):
+    with patch.object(
+        text_column_table,
+        "get_sqla_row_level_filters",
+        return_value=[
+            TextClause("foo = 'foo'"),
+        ],
+    ):
+        with_rls = text_column_table.values_for_column(column_name="foo", limit=10000)
+        assert with_rls == ["foo"]
+        assert len(with_rls) == 1
+
+
+def test_values_for_column_on_text_column_with_rls_no_values(text_column_table):
+    with patch.object(
+        text_column_table,
+        "get_sqla_row_level_filters",
+        return_value=[
+            TextClause("foo = 'bar'"),
+        ],
+    ):
+        with_rls = text_column_table.values_for_column(column_name="foo", limit=10000)
+        assert with_rls == []
+        assert len(with_rls) == 0
+
+
+def test_filter_on_text_column(text_column_table):
+    table = text_column_table
+    # null value should be replaced
+    result_object = table.query(
+        {
+            "metrics": ["count"],
+            "filter": [{"col": "foo", "val": [NULL_STRING], "op": "IN"}],
+            "is_timeseries": False,
+        }
+    )
+    assert result_object.df["count"][0] == 1
+
+    # also accept None value
+    result_object = table.query(
+        {
+            "metrics": ["count"],
+            "filter": [{"col": "foo", "val": [None], "op": "IN"}],
+            "is_timeseries": False,
+        }
+    )
+    assert result_object.df["count"][0] == 1
+
+    # empty string should be replaced
+    result_object = table.query(
+        {
+            "metrics": ["count"],
+            "filter": [{"col": "foo", "val": [EMPTY_STRING], "op": "IN"}],
+            "is_timeseries": False,
+        }
+    )
+    assert result_object.df["count"][0] == 1
+
+    # also accept "" string
+    result_object = table.query(
+        {
+            "metrics": ["count"],
+            "filter": [{"col": "foo", "val": [""], "op": "IN"}],
+            "is_timeseries": False,
+        }
+    )
+    assert result_object.df["count"][0] == 1
+
+    # both replaced
+    result_object = table.query(
+        {
+            "metrics": ["count"],
+            "filter": [
+                {
+                    "col": "foo",
+                    "val": [EMPTY_STRING, NULL_STRING, "null", "foo"],
+                    "op": "IN",
+                }
+            ],
+            "is_timeseries": False,
+        }
+    )
+    assert result_object.df["count"][0] == 4
+
+    # should filter text in double quotes
+    result_object = table.query(
+        {
+            "metrics": ["count"],
+            "filter": [
+                {
+                    "col": "foo",
+                    "val": ['"text in double quotes"'],
+                    "op": "IN",
+                }
+            ],
+            "is_timeseries": False,
+        }
+    )
+    assert result_object.df["count"][0] == 1
+
+    # should filter text in single quotes
+    result_object = table.query(
+        {
+            "metrics": ["count"],
+            "filter": [
+                {
+                    "col": "foo",
+                    "val": ["'text in single quotes'"],
+                    "op": "IN",
+                }
+            ],
+            "is_timeseries": False,
+        }
+    )
+    assert result_object.df["count"][0] == 1
+
+    # should filter text with double quote
+    result_object = table.query(
+        {
+            "metrics": ["count"],
+            "filter": [
+                {
+                    "col": "foo",
+                    "val": ['double quotes " in text'],
+                    "op": "IN",
+                }
+            ],
+            "is_timeseries": False,
+        }
+    )
+    assert result_object.df["count"][0] == 1
+
+    # should filter text with single quote
+    result_object = table.query(
+        {
+            "metrics": ["count"],
+            "filter": [
+                {
+                    "col": "foo",
+                    "val": ["single quotes ' in text"],
+                    "op": "IN",
+                }
+            ],
+            "is_timeseries": False,
+        }
+    )
+    assert result_object.df["count"][0] == 1
+
+
+@only_postgresql
+def test_should_generate_closed_and_open_time_filter_range(login_as_admin):
+    table = SqlaTable(
+        table_name="temporal_column_table",
+        sql=(
+            "SELECT '2021-12-31'::timestamp as datetime_col "
+            "UNION SELECT '2022-01-01'::timestamp "
+            "UNION SELECT '2022-03-10'::timestamp "
+            "UNION SELECT '2023-01-01'::timestamp "
+            "UNION SELECT '2023-03-10'::timestamp "
+        ),
+        database=get_example_database(),
+    )
+    column = TableColumn(
+        column_name="datetime_col",
+        type="TIMESTAMP",
+        table=table,
+        is_dttm=True,
+    )
+    db.session.add(column)
+    metric = SqlMetric(metric_name="count", expression="count(*)", table=table)
+    db.session.add(metric)
+    result_object = table.query(
+        {
+            "metrics": ["count"],
+            "is_timeseries": False,
+            "filter": [],
+            "from_dttm": datetime(2022, 1, 1),
+            "to_dttm": datetime(2023, 1, 1),
+            "granularity": "datetime_col",
+        }
+    )
+    """ >>> result_object.query
+            SELECT count(*) AS count
+            FROM
+              (SELECT '2021-12-31'::timestamp as datetime_col
+               UNION SELECT '2022-01-01'::timestamp
+               UNION SELECT '2022-03-10'::timestamp
+               UNION SELECT '2023-01-01'::timestamp
+               UNION SELECT '2023-03-10'::timestamp) AS virtual_table
+            WHERE datetime_col >= TO_TIMESTAMP('2022-01-01 00:00:00.000000', 'YYYY-MM-DD HH24:MI:SS.US')
+              AND datetime_col < TO_TIMESTAMP('2023-01-01 00:00:00.000000', 'YYYY-MM-DD HH24:MI:SS.US')
+    """  # noqa: E501
+    assert result_object.df.iloc[0]["count"] == 2
+
+
+def test_none_operand_in_filter(login_as_admin, physical_dataset):
+    expected_results = [
+        {
+            "operator": FilterOperator.EQUALS,
+            "count": 10,
+            "sql_should_contain": "COL4 IS NULL",
+        },
+        {
+            "operator": FilterOperator.NOT_EQUALS,
+            "count": 0,
+            "sql_should_contain": "COL4 IS NOT NULL",
+        },
+    ]
+    for expected in expected_results:
+        result = physical_dataset.query(
+            {
+                "metrics": ["count"],
+                "filter": [{"col": "col4", "val": None, "op": expected["operator"]}],
+                "is_timeseries": False,
+            }
         )
-        TableColumn(column_name="foo", type="VARCHAR(255)", table=table)
+        assert result.df["count"][0] == expected["count"]
+        assert expected["sql_should_contain"] in result.query.upper()
 
-        with_null = table.values_for_column(
-            column_name="foo", limit=10000, contain_null=True
-        )
-        assert None in with_null
-        assert len(with_null) == 3
+    with pytest.raises(QueryObjectValidationError):  # noqa: PT012
+        for flt in [
+            FilterOperator.GREATER_THAN,
+            FilterOperator.LESS_THAN,
+            FilterOperator.GREATER_THAN_OR_EQUALS,
+            FilterOperator.LESS_THAN_OR_EQUALS,
+            FilterOperator.LIKE,
+            FilterOperator.ILIKE,
+        ]:
+            physical_dataset.query(
+                {
+                    "metrics": ["count"],
+                    "filter": [{"col": "col4", "val": None, "op": flt.value}],
+                    "is_timeseries": False,
+                }
+            )
 
-        without_null = table.values_for_column(
-            column_name="foo", limit=10000, contain_null=False
-        )
-        assert None not in without_null
-        assert len(without_null) == 2
+
+@pytest.mark.usefixtures("app_context")
+@pytest.mark.parametrize(
+    "table_name,sql,expected_cache_keys,has_extra_cache_keys",
+    [
+        (
+            "test_has_extra_cache_keys_table",
+            """
+            SELECT
+            '{{ current_user_id() }}' as id,
+            '{{ current_username() }}' as username,
+            '{{ current_user_email() }}' as email,
+            '{{ current_user_roles()|tojson }}' as roles
+            """,
+            {1, "abc", "abc@test.com", '["role1", "role2"]'},
+            True,
+        ),
+        (
+            "test_has_extra_cache_keys_table_with_set",
+            """
+            {% set user_email = current_user_email() %}
+            SELECT
+            '{{ current_user_id() }}' as id,
+            '{{ current_username() }}' as username,
+            '{{ user_email }}' as email,
+            '{{ current_user_roles()|tojson }}' as roles
+            """,
+            # The leading `{% set %}` block isn't valid SQL, so parsing this
+            # virtual dataset's SQL for RLS predicates fails and the cache key
+            # picks up the per-user parse-failure sentinel (no user is logged
+            # in for this test, hence "user-None").
+            {
+                1,
+                "abc",
+                "abc@test.com",
+                '["role1", "role2"]',
+                "rls-predicate-parse-failed-for-user-None",
+            },
+            True,
+        ),
+        (
+            "test_has_extra_cache_keys_table_with_se_multiple",
+            """
+            {% set user_conditional_id = current_user_email() and current_user_id() %}
+            SELECT
+            '{{ user_conditional_id }}' as conditional
+            """,
+            # Same parse-failure sentinel as above: the leading `{% set %}`
+            # block breaks SQL parsing for RLS predicate collection.
+            {1, "abc@test.com", "rls-predicate-parse-failed-for-user-None"},
+            True,
+        ),
+        (
+            "test_has_extra_cache_keys_disabled_table",
+            """
+            SELECT
+            '{{ current_user_id(False) }}' as id,
+            '{{ current_username(False) }}' as username,
+            '{{ current_user_email(False) }}' as email,
+            '{{ current_user_roles(False)|tojson }}' as roles
+            """,
+            [],
+            True,
+        ),
+        ("test_has_no_extra_cache_keys_table", "SELECT 'abc' as user", [], False),
+    ],
+)
+@patch("superset.jinja_context.get_user_id", return_value=1)
+@patch("superset.jinja_context.get_username", return_value="abc")
+@patch("superset.jinja_context.get_user_email", return_value="abc@test.com")
+@patch(
+    "superset.jinja_context.security_manager.get_user_roles",
+    return_value=[Role(name="role1"), Role(name="role2")],
+)
+def test_extra_cache_keys(
+    mock_get_user_roles,
+    mock_user_email,
+    mock_username,
+    mock_user_id,
+    table_name,
+    sql,
+    expected_cache_keys,
+    has_extra_cache_keys,
+):
+    table = SqlaTable(
+        table_name=table_name,
+        sql=sql,
+        database=get_example_database(),
+    )
+    base_query_obj = {
+        "granularity": None,
+        "from_dttm": None,
+        "to_dttm": None,
+        "groupby": ["id", "username", "email"],
+        "metrics": [],
+        "is_timeseries": False,
+        "filter": [],
+    }
+
+    query_obj = dict(**base_query_obj, extras={})
+
+    extra_cache_keys = table.get_extra_cache_keys(query_obj)
+    assert table.has_extra_cache_key_calls(query_obj) == has_extra_cache_keys
+    assert set(extra_cache_keys) == set(expected_cache_keys)
 
 
+@pytest.mark.usefixtures("app_context")
+@pytest.mark.parametrize(
+    "sql_expression,expected_cache_keys,has_extra_cache_keys",
+    [
+        ("(user != '{{ current_username() }}')", ["abc"], True),
+        ("(user != 'abc')", [], False),
+    ],
+)
+@patch("superset.jinja_context.get_user_id", return_value=1)
+@patch("superset.jinja_context.get_username", return_value="abc")
+@patch("superset.jinja_context.get_user_email", return_value="abc@test.com")
+@patch(
+    "superset.jinja_context.security_manager.get_user_roles",
+    return_value=[Role(name="role1"), Role(name="role2")],
+)
+def test_extra_cache_keys_in_sql_expression(
+    mock_get_user_roles,
+    mock_user_email,
+    mock_username,
+    mock_user_id,
+    sql_expression,
+    expected_cache_keys,
+    has_extra_cache_keys,
+):
+    table = SqlaTable(
+        table_name="test_has_no_extra_cache_keys_table",
+        sql="SELECT 'abc' as user",
+        database=get_example_database(),
+    )
+    base_query_obj = {
+        "granularity": None,
+        "from_dttm": None,
+        "to_dttm": None,
+        "groupby": ["id", "username", "email"],
+        "metrics": [],
+        "is_timeseries": False,
+        "filter": [],
+    }
+
+    query_obj = dict(**base_query_obj, extras={"where": sql_expression})
+
+    extra_cache_keys = table.get_extra_cache_keys(query_obj)
+    assert table.has_extra_cache_key_calls(query_obj) == has_extra_cache_keys
+    assert extra_cache_keys == expected_cache_keys
+
+
+@pytest.mark.usefixtures("app_context")
+@pytest.mark.parametrize(
+    "sql_expression,expected_cache_keys,has_extra_cache_keys,item_type",
+    [
+        ("'{{ current_username() }}'", ["abc"], True, "columns"),
+        ("(user != 'abc')", [], False, "columns"),
+        ("{{ current_user_id() }}", [1], True, "metrics"),
+        ("COUNT(*)", [], False, "metrics"),
+    ],
+)
+@patch("superset.jinja_context.get_user_id", return_value=1)
+@patch("superset.jinja_context.get_username", return_value="abc")
+def test_extra_cache_keys_in_adhoc_metrics_and_columns(
+    mock_username: Mock,
+    mock_user_id: Mock,
+    sql_expression: str,
+    expected_cache_keys: list[str | None],
+    has_extra_cache_keys: bool,
+    item_type: Literal["columns", "metrics"],
+):
+    table = SqlaTable(
+        table_name="test_has_no_extra_cache_keys_table",
+        sql="SELECT 'abc' as user",
+        database=get_example_database(),
+    )
+    base_query_obj: dict[str, Any] = {
+        "granularity": None,
+        "from_dttm": None,
+        "to_dttm": None,
+        "groupby": [],
+        "metrics": [],
+        "columns": [],
+        "is_timeseries": False,
+        "filter": [],
+    }
+
+    items: dict[str, Any] = {
+        item_type: [
+            {
+                "label": None,
+                "expressionType": "SQL",
+                "sqlExpression": sql_expression,
+            }
+        ],
+    }
+
+    query_obj = {**base_query_obj, **items}
+
+    extra_cache_keys = table.get_extra_cache_keys(cast(QueryObjectDict, query_obj))
+    assert (
+        table.has_extra_cache_key_calls(cast(QueryObjectDict, query_obj))
+        == has_extra_cache_keys
+    )
+    assert extra_cache_keys == expected_cache_keys
+
+
+def templated_dataset(
+    main_dttm_col: str = "ds", always_filter_main_dttm: bool = False
+) -> SqlaTable:
+    """
+    A dataset whose calculated columns, temporal column and metrics carry macros.
+
+    `mine` is a calculated temporal column and `ds` a plain one, so a query can
+    name either as its `granularity`. `main_dttm_col` is what `get_sqla_query`
+    falls back to when `granularity` is not one of the temporal columns, and
+    also the column it adds a second time filter on when
+    `always_filter_main_dttm` is set and it differs from the resolved
+    `granularity`.
+    """
+    return SqlaTable(
+        table_name="test_has_no_extra_cache_keys_table",
+        sql="SELECT 'abc' as user",
+        database=get_example_database(),
+        main_dttm_col=main_dttm_col,
+        always_filter_main_dttm=always_filter_main_dttm,
+        columns=[
+            TableColumn(column_name="user", type="VARCHAR(255)"),
+            TableColumn(
+                column_name="username",
+                type="VARCHAR(255)",
+                verbose_name="Who am I",
+                expression="{{ current_username() }}",
+            ),
+            TableColumn(column_name="ds", type="TIMESTAMP", is_dttm=True),
+            TableColumn(
+                column_name="mine",
+                type="TIMESTAMP",
+                is_dttm=True,
+                expression="DATE('{{ current_username() }}')",
+            ),
+        ],
+        metrics=[
+            SqlMetric(
+                metric_name="variable_profit",
+                expression="SUM(price) * {{ url_param('multiplier') }}",
+            ),
+            SqlMetric(
+                metric_name="user_count",
+                expression="COUNT('{{ current_username() }}')",
+            ),
+            SqlMetric(metric_name="plain_total", expression="SUM(price)"),
+        ],
+    )
+
+
+@pytest.mark.usefixtures("app_context")
+@pytest.mark.parametrize(
+    "query_obj_fragment,has_extra_cache_keys",
+    [
+        ({"orderby": [[ADHOC_JINJA_METRIC, False]]}, True),
+        ({"orderby": [[ADHOC_PLAIN_METRIC, False]]}, False),
+        ({"orderby": [[SIMPLE_JINJA_METRIC, False]]}, True),
+        ({"orderby": [[SIMPLE_PLAIN_METRIC, False]]}, False),
+        ({"orderby": [["variable_profit", False]]}, True),
+        ({"orderby": [["plain_total", False]]}, False),
+        ({"series_limit_metric": ADHOC_JINJA_METRIC}, True),
+        ({"series_limit_metric": ADHOC_PLAIN_METRIC}, False),
+        ({"series_limit_metric": SIMPLE_JINJA_METRIC}, True),
+        ({"timeseries_limit_metric": ADHOC_JINJA_METRIC}, True),
+        ({"metrics": [SIMPLE_JINJA_METRIC]}, True),
+        ({"metrics": [SIMPLE_PLAIN_METRIC]}, False),
+        ({"filter": [{"col": ADHOC_JINJA_COLUMN, "op": "==", "val": 1}]}, True),
+        ({"filter": [{"col": ADHOC_PLAIN_COLUMN, "op": "==", "val": 1}]}, False),
+        ({"filter": [{"col": "username", "op": "==", "val": 1}]}, True),
+        ({"filter": [{"col": "Who am I", "op": "==", "val": 1}]}, True),
+        ({"filter": [{"col": "variable_profit", "op": "==", "val": 1}]}, True),
+        ({"filter": [{"col": "plain_total", "op": "==", "val": 1}]}, False),
+        ({"filter": [{"col": "user", "op": "==", "val": 1}]}, False),
+        ({"columns": [{"label": "username", "sqlExpression": "username"}]}, True),
+        ({"columns": [{"label": "username", "sqlExpression": " username "}]}, True),
+        ({"columns": [{"label": "upper", "sqlExpression": "UPPER(user)"}]}, False),
+        ({"granularity": "mine"}, True),
+        ({"granularity": "ds"}, False),
+        ({"granularity": "user"}, False),
+        ({"groupby": ["username"]}, True),
+        ({"groupby": ["user"]}, False),
+        ({"groupby": [{"label": "username", "sqlExpression": "username"}]}, True),
+    ],
+)
+def test_extra_cache_keys_in_orderby_series_limit_and_filter(
+    query_obj_fragment: dict[str, Any],
+    has_extra_cache_keys: bool,
+):
+    """
+    `get_sqla_query` renders `orderby` metrics, `series_limit_metric` and filter
+    columns through the template processor, so a macro in any of them has to
+    trigger the extra cache key extraction. Without that, two users whose
+    rendered SQL differs share one cache entry.
+
+    Each field is resolved the way `get_sqla_query` resolves it: an adhoc
+    expression, a SIMPLE adhoc metric's column, or a name looked up against the
+    dataset's metrics and calculated columns. A filter column also resolves
+    against the columns' verbose names and the saved metrics. An adhoc column
+    whose `sqlExpression` only names a calculated column resolves to that
+    column's expression, and `granularity` follows the renderer's fallback to
+    `main_dttm_col`.
+    """
+    table = templated_dataset()
+    query_obj: dict[str, Any] = {
+        "granularity": None,
+        "from_dttm": None,
+        "to_dttm": None,
+        "groupby": [],
+        "metrics": [],
+        "columns": [],
+        "is_timeseries": False,
+        "filter": [],
+        **query_obj_fragment,
+    }
+
+    assert (
+        table.has_extra_cache_key_calls(cast(QueryObjectDict, query_obj))
+        == has_extra_cache_keys
+    )
+
+
+@pytest.mark.usefixtures("app_context")
+@pytest.mark.parametrize(
+    "query_obj_fragment,main_dttm_col,expected_cache_keys",
+    [
+        ({"orderby": [["user_count", False]], "columns": ["user"]}, "ds", ["abc"]),
+        ({"orderby": [["plain_total", False]], "columns": ["user"]}, "ds", []),
+        (
+            {
+                "groupby": ["user"],
+                "granularity": "ds",
+                "is_timeseries": True,
+                "series_limit": 5,
+                "series_limit_metric": "user_count",
+            },
+            "ds",
+            ["abc"],
+        ),
+        ({"filter": [{"col": "username", "op": "==", "val": "x"}]}, "ds", ["abc"]),
+        (
+            {"columns": [{"label": "username", "sqlExpression": "username"}]},
+            "ds",
+            ["abc"],
+        ),
+        ({"granularity": "mine", "is_timeseries": True}, "ds", ["abc"]),
+        ({"granularity": "user", "is_timeseries": True}, "mine", ["abc"]),
+        ({"groupby": ["username"]}, "ds", ["abc"]),
+    ],
+)
+@patch("superset.jinja_context.get_username", return_value="abc")
+def test_extra_cache_keys_differ_once_the_gate_fires(
+    mock_username: Mock,
+    query_obj_fragment: dict[str, Any],
+    main_dttm_col: str,
+    expected_cache_keys: list[str],
+):
+    """
+    The key extraction yields a key for each field the gate covers, not just a
+    `True` from the gate itself.
+
+    The gate firing and the key differing are two separate claims, and only the
+    second one closes the leak, so these cases assert `get_extra_cache_keys`
+    rather than `has_extra_cache_key_calls`. Each query is shaped so the field
+    really is rendered: `series_limit_metric` only reaches
+    `_get_series_orderby` while `series_limit` is set and the query has series
+    columns, so a bare fragment would yield no key at all.
+
+    The last case names a column that is not temporal, which `get_sqla_query`
+    replaces with `main_dttm_col`, so the expression that gets rendered belongs
+    to a column the query never named.
+    """
+    table = templated_dataset(main_dttm_col)
+    query_obj: dict[str, Any] = {
+        "granularity": None,
+        "from_dttm": None,
+        "to_dttm": None,
+        "groupby": [],
+        "metrics": ["plain_total"],
+        "columns": [],
+        "is_timeseries": False,
+        "filter": [],
+        **query_obj_fragment,
+    }
+
+    assert (
+        table.get_extra_cache_keys(cast(QueryObjectDict, query_obj))
+        == expected_cache_keys
+    )
+
+
+@pytest.mark.usefixtures("app_context")
+@pytest.mark.parametrize(
+    "query_obj_fragment,main_dttm_col,always_filter_main_dttm,has_extra_cache_keys",
+    [
+        # ``granularity=""`` is not a column name, so ``get_sqla_query`` takes
+        # the same fallback to ``main_dttm_col`` that an unmatched column name
+        # does. The gate checked ``granularity``'s truthiness instead of
+        # whether it was provided at all, so an empty string skipped the
+        # fallback entirely and missed the macro ``main_dttm_col`` carries.
+        ({"granularity": ""}, "mine", False, True),
+        ({"granularity": "ds"}, "mine", False, False),
+        ({}, "mine", False, False),
+        # With ``always_filter_main_dttm`` on and ``main_dttm_col`` a
+        # different, macro-carrying temporal column, ``get_sqla_query`` adds
+        # a second time filter on ``main_dttm_col`` regardless of which
+        # column ``granularity`` named.
+        ({"granularity": "ds"}, "mine", True, True),
+        # No ``granularity`` at all means ``get_sqla_query`` adds no time
+        # filter of any kind, so the flag alone does not trigger anything.
+        ({}, "mine", True, False),
+        # ``main_dttm_col`` equal to the resolved ``granularity`` is still
+        # caught, here only by the primary check since ``mine`` carries its
+        # own macro either way.
+        ({"granularity": "mine"}, "mine", True, True),
+    ],
+)
+def test_extra_cache_keys_for_granularity_fallback_and_always_filter_main_dttm(
+    query_obj_fragment: dict[str, Any],
+    main_dttm_col: str,
+    always_filter_main_dttm: bool,
+    has_extra_cache_keys: bool,
+):
+    """
+    Two gaps in the ``granularity``/``main_dttm_col`` handling, found in
+    review on #45431 and left for this follow-up rather than widening that PR.
+
+    `get_sqla_query` falls back from `granularity` to `main_dttm_col` whenever
+    `granularity` is not one of the dataset's temporal columns, which an empty
+    string satisfies the same as any other non-matching name, but the gate
+    checked `granularity`'s truthiness and skipped the fallback for `""`.
+
+    Separately, when the dataset has `always_filter_main_dttm` set and
+    `main_dttm_col` differs from the column `granularity` resolved to,
+    `get_sqla_query` adds a second, independent time filter on `main_dttm_col`,
+    rendering that column's own expression regardless of which column the
+    query named.
+    """
+    table = templated_dataset(main_dttm_col, always_filter_main_dttm)
+    query_obj: dict[str, Any] = {
+        "granularity": None,
+        "from_dttm": None,
+        "to_dttm": None,
+        "groupby": [],
+        "metrics": [],
+        "columns": [],
+        "is_timeseries": False,
+        "filter": [],
+        **query_obj_fragment,
+    }
+
+    assert (
+        table.has_extra_cache_key_calls(cast(QueryObjectDict, query_obj))
+        == has_extra_cache_keys
+    )
+
+
+@pytest.mark.usefixtures("app_context")
+@pytest.mark.parametrize(
+    "query_obj_fragment,main_dttm_col,always_filter_main_dttm",
+    [
+        ({"granularity": ""}, "mine", False),
+        ({"granularity": "ds"}, "mine", True),
+    ],
+)
+@patch("superset.jinja_context.get_username", return_value="abc")
+def test_extra_cache_keys_differ_for_granularity_fallback_and_always_filter_main_dttm(
+    mock_username: Mock,
+    query_obj_fragment: dict[str, Any],
+    main_dttm_col: str,
+    always_filter_main_dttm: bool,
+):
+    """
+    As with the other fields in this class, the gate firing and the key
+    actually differing are two separate claims; these assert
+    `get_extra_cache_keys` for the two fixed cases above.
+    """
+    table = templated_dataset(main_dttm_col, always_filter_main_dttm)
+    query_obj: dict[str, Any] = {
+        "granularity": None,
+        "from_dttm": None,
+        "to_dttm": None,
+        "groupby": [],
+        "metrics": ["plain_total"],
+        "columns": [],
+        "is_timeseries": False,
+        "filter": [],
+        **query_obj_fragment,
+    }
+
+    assert table.get_extra_cache_keys(cast(QueryObjectDict, query_obj)) == ["abc"]
+
+
+@pytest.mark.usefixtures("app_context")
+@patch("superset.jinja_context.get_user_id", return_value=1)
+@patch("superset.jinja_context.get_username", return_value="abc")
+def test_extra_cache_keys_in_dataset_metrics_and_columns(
+    mock_username: Mock,
+    mock_user_id: Mock,
+):
+    columns = [
+        TableColumn(column_name="user", type="VARCHAR(255)"),
+        TableColumn(
+            column_name="username",
+            type="VARCHAR(255)",
+            expression="{{ current_username() }}",
+        ),
+    ]
+    db.session.add_all(columns)
+    metric = SqlMetric(
+        metric_name="variable_profit",
+        expression="SUM(price) * {{ url_param('multiplier') }}",
+    )
+    db.session.add(metric)
+    table = SqlaTable(
+        table_name="test_has_no_extra_cache_keys_table",
+        sql="SELECT 'abc' as user",
+        database=get_example_database(),
+        columns=columns,
+        metrics=[metric],
+    )
+    query_obj: dict[str, Any] = {
+        "granularity": None,
+        "from_dttm": None,
+        "to_dttm": None,
+        "groupby": [],
+        "columns": ["username"],
+        "metrics": ["variable_profit"],
+        "is_timeseries": False,
+        "filter": [],
+    }
+
+    extra_cache_keys = table.get_extra_cache_keys(cast(QueryObjectDict, query_obj))
+    assert table.has_extra_cache_key_calls(cast(QueryObjectDict, query_obj)) is True
+    assert set(extra_cache_keys) == {"abc", None}
+
+
+@pytest.mark.usefixtures("app_context")
 @pytest.mark.parametrize(
     "row,dimension,result",
     [
@@ -515,14 +1461,15 @@ class TestDatabaseModel(SupersetTestCase):
     ],
 )
 def test__normalize_prequery_result_type(
-    app_context: Flask,
-    mocker: MockFixture,
+    mocker: MockerFixture,
     row: pd.Series,
     dimension: str,
     result: Any,
 ) -> None:
-    def _convert_dttm(target_type: str, dttm: datetime) -> Optional[str]:
-        if target_type.upper() == TemporalType.TIMESTAMP:
+    def _convert_dttm(
+        target_type: str, dttm: datetime, db_extra: Optional[dict[str, Any]] = None
+    ) -> Optional[str]:
+        if target_type.upper() == "TIMESTAMP":
             return f"""TIME_PARSE('{dttm.isoformat(timespec="seconds")}')"""
 
         return None
@@ -532,30 +1479,360 @@ def test__normalize_prequery_result_type(
 
     columns_by_name = {
         "foo": TableColumn(
-            column_name="foo", is_dttm=False, table=table, type="STRING",
+            column_name="foo",
+            is_dttm=False,
+            table=table,
+            type="STRING",
         ),
         "bar": TableColumn(
-            column_name="bar", is_dttm=False, table=table, type="BOOLEAN",
+            column_name="bar",
+            is_dttm=False,
+            table=table,
+            type="BOOLEAN",
         ),
         "baz": TableColumn(
-            column_name="baz", is_dttm=False, table=table, type="INTEGER",
+            column_name="baz",
+            is_dttm=False,
+            table=table,
+            type="INTEGER",
         ),
         "qux": TableColumn(
-            column_name="qux", is_dttm=False, table=table, type="FLOAT",
+            column_name="qux",
+            is_dttm=False,
+            table=table,
+            type="FLOAT",
         ),
         "quux": TableColumn(
-            column_name="quuz", is_dttm=True, table=table, type="STRING",
+            column_name="quuz",
+            is_dttm=True,
+            table=table,
+            type="STRING",
         ),
         "quuz": TableColumn(
-            column_name="quux", is_dttm=True, table=table, type="TIMESTAMP",
+            column_name="quux",
+            is_dttm=True,
+            table=table,
+            type="TIMESTAMP",
         ),
     }
+    db.session.add_all(columns_by_name.values())
 
-    normalized = table._normalize_prequery_result_type(row, dimension, columns_by_name,)
+    normalized = table._normalize_prequery_result_type(
+        row,
+        dimension,
+        columns_by_name,
+    )
 
-    assert type(normalized) == type(result)
+    assert isinstance(normalized, type(result))
 
     if isinstance(normalized, TextClause):
         assert str(normalized) == str(result)
     else:
         assert normalized == result
+
+
+@pytest.mark.usefixtures("app_context")
+def test__temporal_range_operator_in_adhoc_filter(physical_dataset):
+    result = physical_dataset.query(
+        {
+            "columns": ["col1", "col2"],
+            "filter": [
+                {
+                    "col": "col5",
+                    "val": "2000-01-05 : 2000-01-06",
+                    "op": FilterOperator.TEMPORAL_RANGE,
+                },
+                {
+                    "col": "col6",
+                    "val": "2002-05-11 : 2002-05-12",
+                    "op": FilterOperator.TEMPORAL_RANGE,
+                },
+            ],
+            "is_timeseries": False,
+        }
+    )
+    df = pd.DataFrame(index=[0], data={"col1": 4, "col2": "e"})
+    assert df.equals(result.df)
+
+
+def test_generic_metric_filtering_without_chart_flag(login_as_admin):
+    """
+    Test that filters on metrics work without chart-specific flags.
+
+    This ensures metric filtering is generic and works for any chart type.
+    """
+    from superset import db
+    from superset.connectors.sqla.models import SqlaTable, SqlMetric, TableColumn
+    from superset.utils.database import get_example_database
+
+    database = get_example_database()
+    table = SqlaTable(
+        table_name="test_metric_filter",
+        database=database,
+    )
+
+    col = TableColumn(
+        column_name="name",
+        type="VARCHAR(255)",
+        table=table,
+    )
+    db.session.add(col)
+    table.columns = [col]
+
+    metric = SqlMetric(
+        metric_name="count",
+        expression="COUNT(*)",
+        table=table,
+    )
+    db.session.add(metric)
+    table.metrics = [metric]
+
+    db.session.add(table)
+    db.session.commit()
+
+    try:
+        query_obj = {
+            "granularity": None,
+            "from_dttm": None,
+            "to_dttm": None,
+            "groupby": ["name"],
+            "metrics": ["count"],
+            "filter": [
+                {
+                    "col": "count",
+                    "op": ">",
+                    "val": 0,
+                }
+            ],
+            "is_timeseries": False,
+            "extras": {},
+        }
+
+        sqla_query = table.get_sqla_query(**query_obj)
+        sql = str(
+            sqla_query.sqla_query.compile(compile_kwargs={"literal_binds": True})
+        ).lower()
+
+        assert "having" in sql, "Metric filter should use HAVING clause. SQL: " + sql
+    finally:
+        db.session.delete(table)
+        db.session.commit()
+
+
+def test_column_ordering_without_chart_flag(login_as_admin):
+    """
+    Test that column_order works without chart-specific flags.
+
+    This ensures column ordering is generic and works for any chart type.
+    """
+    from unittest.mock import patch
+    from superset import db
+    from superset.connectors.sqla.models import SqlaTable, SqlMetric, TableColumn
+    from superset.utils.database import get_example_database
+
+    database = get_example_database()
+    table = SqlaTable(
+        table_name="test_column_order",
+        database=database,
+    )
+
+    col_a = TableColumn(column_name="col_a", type="VARCHAR(255)", table=table)
+    col_b = TableColumn(column_name="col_b", type="VARCHAR(255)", table=table)
+    db.session.add_all([col_a, col_b])
+    table.columns = [col_a, col_b]
+
+    metric_x = SqlMetric(metric_name="metric_x", expression="COUNT(*)", table=table)
+    metric_y = SqlMetric(metric_name="metric_y", expression="SUM(val)", table=table)
+    db.session.add_all([metric_x, metric_y])
+    table.metrics = [metric_x, metric_y]
+
+    db.session.add(table)
+    db.session.commit()
+
+    try:
+        mock_df = pd.DataFrame(
+            {
+                "col_a": [1, 2],
+                "col_b": [3, 4],
+                "metric_x": [10, 20],
+                "metric_y": [100, 200],
+            }
+        )
+
+        def mock_get_df(sql, catalog=None, schema=None, mutator=None):
+            """Mock get_df that calls the mutator function if provided."""
+            df = mock_df.copy()
+            if mutator:
+                df = mutator(df)
+            return df
+
+        with patch.object(database, "get_df", side_effect=mock_get_df):
+            query_obj = {
+                "granularity": None,
+                "from_dttm": None,
+                "to_dttm": None,
+                "groupby": ["col_a", "col_b"],
+                "metrics": ["metric_x", "metric_y"],
+                "filter": [],
+                "is_timeseries": False,
+                "extras": {"column_order": ["metric_y", "col_b", "metric_x", "col_a"]},
+            }
+
+            result = table.query(query_obj)
+
+            expected_order = ["metric_y", "col_b", "metric_x", "col_a"]
+            assert list(result.df.columns) == expected_order, (
+                f"Expected {expected_order}, got {list(result.df.columns)}"
+            )
+    finally:
+        db.session.delete(table)
+        db.session.commit()
+
+
+def _multivalue_table() -> SqlaTable:
+    """A dataset with an ``Array(String)`` column, for multi-value query tests.
+
+    Built over the example database but never executed — the tests only compile
+    the generated SQL, so the backing table need not physically exist.
+    """
+    columns = [
+        TableColumn(column_name="skills", type="Array(String)"),
+        TableColumn(column_name="city", type="VARCHAR(255)"),
+    ]
+    return SqlaTable(
+        table_name="test_multivalue_jobs",
+        database=get_example_database(),
+        columns=columns,
+        metrics=[SqlMetric(metric_name="count", expression="COUNT(*)")],
+    )
+
+
+def _multivalue_query(
+    *,
+    filters: list[dict[str, Any]] | None = None,
+    groupby: list[Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "granularity": None,
+        "from_dttm": None,
+        "to_dttm": None,
+        "is_timeseries": False,
+        "groupby": groupby if groupby is not None else ["city"],
+        "metrics": ["count"],
+        "filter": filters or [],
+        "extras": {},
+    }
+
+
+def _compile(table: SqlaTable, query_obj: dict[str, Any]) -> str:
+    from superset.db_engine_specs.clickhouse import ClickHouseEngineSpec
+
+    with patch.object(
+        SqlaTable, "db_engine_spec", property(lambda self: ClickHouseEngineSpec)
+    ):
+        sqla_query = table.get_sqla_query(**query_obj)
+        return table.database.compile_sqla_query(sqla_query.sqla_query).lower()
+
+
+@pytest.mark.usefixtures("app_context")
+def test_multivalue_contains_any_generates_native_sql():
+    """CONTAINS_ANY compiles to ``hasAny(col, array(...))``."""
+    table = _multivalue_table()
+    sql = _compile(
+        table,
+        _multivalue_query(
+            filters=[
+                {
+                    "col": "skills",
+                    "op": FilterOperator.CONTAINS_ANY.value,
+                    "val": ["Driver", "Cook"],
+                }
+            ]
+        ),
+    )
+    assert "hasany(skills" in sql
+
+
+@pytest.mark.usefixtures("app_context")
+def test_multivalue_contains_all_generates_native_sql():
+    """CONTAINS_ALL compiles to ``hasAll(col, array(...))``."""
+    table = _multivalue_table()
+    sql = _compile(
+        table,
+        _multivalue_query(
+            filters=[
+                {
+                    "col": "skills",
+                    "op": FilterOperator.CONTAINS_ALL.value,
+                    "val": ["Driver", "Cook"],
+                }
+            ]
+        ),
+    )
+    assert "hasall(skills" in sql
+
+
+@pytest.mark.usefixtures("app_context")
+def test_multivalue_is_empty_generates_native_sql():
+    """IS_EMPTY compiles to ``length(col) = 0``."""
+    table = _multivalue_table()
+    sql = _compile(
+        table,
+        _multivalue_query(
+            filters=[{"col": "skills", "op": FilterOperator.IS_EMPTY.value}]
+        ),
+    )
+    assert "length(skills) = 0" in sql
+
+
+@pytest.mark.usefixtures("app_context")
+def test_multivalue_length_filter_generates_native_sql():
+    """A LENGTH_GREATER_THAN filter compiles to ``length(col) > N``."""
+    table = _multivalue_table()
+    sql = _compile(
+        table,
+        _multivalue_query(
+            filters=[
+                {
+                    "col": "skills",
+                    "op": FilterOperator.LENGTH_GREATER_THAN.value,
+                    "val": 2,
+                }
+            ]
+        ),
+    )
+    assert "length(skills) > 2" in sql
+
+
+@pytest.mark.usefixtures("app_context")
+def test_multivalue_contains_unsupported_engine_raises():
+    """CONTAINS_ANY on an engine without array support is rejected."""
+    table = _multivalue_table()
+    query_obj = _multivalue_query(
+        filters=[
+            {
+                "col": "skills",
+                "op": FilterOperator.CONTAINS_ANY.value,
+                "val": ["Driver"],
+            }
+        ]
+    )
+    with pytest.raises(QueryObjectValidationError):
+        table.get_sqla_query(**query_obj)
+
+
+@pytest.mark.usefixtures("app_context")
+def test_multivalue_length_filter_unsupported_engine_raises():
+    """A Length filter on an engine without array support is rejected."""
+    table = _multivalue_table()
+    query_obj = _multivalue_query(
+        filters=[
+            {
+                "col": "skills",
+                "op": FilterOperator.LENGTH_GREATER_THAN.value,
+                "val": 2,
+            }
+        ]
+    )
+    with pytest.raises(QueryObjectValidationError):
+        table.get_sqla_query(**query_obj)

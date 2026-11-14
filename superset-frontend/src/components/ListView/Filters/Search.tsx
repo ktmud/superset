@@ -16,66 +16,99 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React, { useState } from 'react';
-import { t, styled } from '@superset-ui/core';
-import Icons from 'src/components/Icons';
-import { AntdInput as Input } from 'src/common/components';
-import { SELECT_WIDTH } from 'src/components/ListView/utils';
-import { FormLabel } from 'src/components/Form';
-import { BaseFilter } from './Base';
+import {
+  forwardRef,
+  useImperativeHandle,
+  useState,
+  useEffect,
+  RefObject,
+  ChangeEvent,
+} from 'react';
+
+import { t } from '@apache-superset/core/translation';
+import { useTheme } from '@apache-superset/core/theme';
+import {
+  Input,
+  InfoTooltip,
+  FormLabel,
+  Icons,
+  Flex,
+} from '@superset-ui/core/components';
+import type { BaseFilter, FilterHandler } from './types';
+import { FilterContainer } from './Base';
+import { SELECT_WIDTH } from '../utils';
 
 interface SearchHeaderProps extends BaseFilter {
   Header: string;
   onSubmit: (val: string) => void;
   name: string;
+  toolTipDescription: string | undefined;
+  autoComplete?: string;
 }
 
-const Container = styled.div`
-  width: ${SELECT_WIDTH}px;
-`;
-
-const SearchIcon = styled(Icons.Search)`
-  color: ${({ theme }) => theme.colors.grayscale.light1};
-`;
-
-const StyledInput = styled(Input)`
-  border-radius: ${({ theme }) => theme.gridUnit}px;
-`;
-
-export default function SearchFilter({
-  Header,
-  name,
-  initialValue,
-  onSubmit,
-}: SearchHeaderProps) {
+function SearchFilter(
+  {
+    Header,
+    name,
+    initialValue,
+    toolTipDescription,
+    onSubmit,
+    autoComplete = 'off',
+  }: SearchHeaderProps,
+  ref: RefObject<FilterHandler>,
+) {
+  const theme = useTheme();
   const [value, setValue] = useState(initialValue || '');
+  useEffect(() => {
+    setValue(initialValue || '');
+  }, [initialValue]);
   const handleSubmit = () => {
     if (value) {
-      // encode plus signs to prevent them from being converted into a space
-      onSubmit(value.trim().replace(/\+/g, '%2B'));
+      onSubmit(value.trim());
     }
   };
-  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleChange = (e: ChangeEvent<HTMLInputElement>) => {
     setValue(e.currentTarget.value);
     if (e.currentTarget.value === '') {
       onSubmit('');
     }
   };
 
+  useImperativeHandle(ref, () => ({
+    clearFilter: () => {
+      setValue('');
+      onSubmit('');
+    },
+  }));
+
   return (
-    <Container>
-      <FormLabel>{Header}</FormLabel>
-      <StyledInput
+    <FilterContainer
+      data-test="search-filter-container"
+      width={SELECT_WIDTH}
+      vertical
+      justify="center"
+      align="start"
+    >
+      <Flex>
+        <FormLabel>{Header}</FormLabel>
+        {toolTipDescription && <InfoTooltip tooltip={toolTipDescription} />}
+      </Flex>
+      <Input
         allowClear
         data-test="filters-search"
         placeholder={t('Type a value')}
+        autoComplete={autoComplete}
         name={name}
         value={value}
         onChange={handleChange}
         onPressEnter={handleSubmit}
         onBlur={handleSubmit}
-        prefix={<SearchIcon iconSize="l" />}
+        prefix={
+          <Icons.SearchOutlined iconColor={theme.colorIcon} iconSize="l" />
+        }
       />
-    </Container>
+    </FilterContainer>
   );
 }
+
+export default forwardRef(SearchFilter);

@@ -18,11 +18,13 @@
  */
 import {
   buildQueryContext,
-  GenericDataType,
+  getColumnLabel,
+  isPhysicalColumn,
   QueryObject,
   QueryObjectFilterClause,
   BuildQuery,
 } from '@superset-ui/core';
+import { GenericDataType } from '@apache-superset/core/common';
 import { DEFAULT_FORM_DATA, PluginFilterSelectQueryFormData } from './types';
 
 const buildQuery: BuildQuery<PluginFilterSelectQueryFormData> = (
@@ -35,36 +37,38 @@ const buildQuery: BuildQuery<PluginFilterSelectQueryFormData> = (
     const { columns = [], filters = [] } = baseQueryObject;
     const extraFilters: QueryObjectFilterClause[] = [];
     if (search) {
-      columns.forEach(column => {
-        if (coltypeMap[column] === GenericDataType.STRING) {
+      columns.filter(isPhysicalColumn).forEach(column => {
+        const label = getColumnLabel(column);
+        if (
+          coltypeMap[label] === GenericDataType.String ||
+          (coltypeMap[label] === GenericDataType.Numeric &&
+            !Number.isNaN(Number(search)))
+        ) {
           extraFilters.push({
             col: column,
             op: 'ILIKE',
             val: `%${search}%`,
-          });
-        } else if (
-          coltypeMap[column] === GenericDataType.NUMERIC &&
-          !Number.isNaN(Number(search))
-        ) {
-          // for numeric columns we apply a >= where clause
-          extraFilters.push({
-            col: column,
-            op: '>=',
-            val: Number(search),
           });
         }
       });
     }
 
     const sortColumns = sortMetric ? [sortMetric] : columns;
+    // Sorting by the searched column makes the engine scan and sort every
+    // match before applying the row limit, which is the dominant cost of
+    // search-as-you-type on a high-cardinality column. The dropdown re-sorts
+    // the returned page client-side, so the server sort buys nothing here. A
+    // sort metric is different: it selects *which* rows come back, so it has
+    // to stay.
+    const skipOrderBy = !!search && !sortMetric;
     const query: QueryObject[] = [
       {
         ...baseQueryObject,
-        groupby: columns,
+        columns,
         metrics: sortMetric ? [sortMetric] : [],
         filters: filters.concat(extraFilters),
         orderby:
-          sortMetric || sortAscending !== undefined
+          !skipOrderBy && (sortMetric || sortAscending !== undefined)
             ? sortColumns.map(column => [column, !!sortAscending])
             : [],
       },

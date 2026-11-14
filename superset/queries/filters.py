@@ -16,11 +16,16 @@
 # under the License.
 from typing import Any
 
-from flask import g
-from flask_sqlalchemy import BaseQuery
+try:
+    # Flask-SQLAlchemy 3.x (required by SQLAlchemy 2.0)
+    from flask_sqlalchemy.query import Query as BaseQuery
+except ImportError:  # pragma: no cover
+    # Flask-SQLAlchemy 2.x
+    from flask_sqlalchemy import BaseQuery
 
 from superset import security_manager
 from superset.models.sql_lab import Query
+from superset.utils.core import get_user_id
 from superset.views.base import BaseFilter
 
 
@@ -33,5 +38,5 @@ class QueryFilter(BaseFilter):  # pylint: disable=too-few-public-methods
         :returns: query
         """
         if not security_manager.can_access_all_queries():
-            query = query.filter(Query.user_id == g.user.get_user_id())
+            query = query.filter(Query.user_id == get_user_id())
         return query

@@ -16,39 +16,95 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React from 'react';
-import { DndProvider } from 'react-dnd';
-import { HTML5Backend } from 'react-dnd-html5-backend';
 import { render, screen } from 'spec/helpers/testing-library';
 import { DndItemType } from 'src/explore/components/DndItemType';
 import DatasourcePanelDragOption from '.';
 
-test('should render', () => {
+test('should render', async () => {
   render(
-    <DndProvider backend={HTML5Backend}>
-      <DatasourcePanelDragOption
-        value={{ metric_name: 'test' }}
-        type={DndItemType.Metric}
-      />
-    </DndProvider>,
+    <DatasourcePanelDragOption
+      value={{ metric_name: 'test', uuid: '1' }}
+      type={DndItemType.Metric}
+    />,
+    { useDndKit: true, useRedux: true, initialState: { explore: {} } },
   );
 
-  expect(screen.getByTestId('DatasourcePanelDragOption')).toBeInTheDocument();
+  expect(
+    await screen.findByTestId('DatasourcePanelDragOption'),
+  ).toBeInTheDocument();
   expect(screen.getByText('test')).toBeInTheDocument();
 });
 
-test('should have attribute draggable:true', () => {
+test('prevents dragging a metric absent from a verified compatibility result', async () => {
   render(
-    <DndProvider backend={HTML5Backend}>
-      <DatasourcePanelDragOption
-        value={{ metric_name: 'test' }}
-        type={DndItemType.Metric}
-      />
-    </DndProvider>,
+    <DatasourcePanelDragOption
+      value={{ metric_name: 'test', uuid: '1' }}
+      type={DndItemType.Metric}
+    />,
+    {
+      useDndKit: true,
+      useRedux: true,
+      initialState: {
+        explore: {
+          compatibility: {
+            status: 'verified',
+            metrics: ['other_metric'],
+            dimensions: [],
+          },
+        },
+      },
+    },
   );
 
-  expect(screen.getByTestId('DatasourcePanelDragOption')).toHaveAttribute(
-    'draggable',
-    'true',
+  expect(await screen.findByTestId('DatasourcePanelDragOption')).toHaveStyle({
+    cursor: 'not-allowed',
+  });
+});
+
+test('keeps a column draggable when it appears in the verified dimensions', async () => {
+  render(
+    <DatasourcePanelDragOption
+      value={{ column_name: 'd1' }}
+      type={DndItemType.Column}
+    />,
+    {
+      useDndKit: true,
+      useRedux: true,
+      initialState: {
+        explore: {
+          compatibility: {
+            status: 'verified',
+            metrics: [],
+            dimensions: ['d1'],
+          },
+        },
+      },
+    },
   );
+
+  expect(
+    await screen.findByTestId('DatasourcePanelDragOption'),
+  ).not.toHaveStyle({ cursor: 'not-allowed' });
+});
+
+test.each([
+  [{ status: 'idle' }],
+  [{ status: 'loading' }],
+  [{ status: 'failed' }],
+])('applies no filtering for the %o compatibility state', async state => {
+  render(
+    <DatasourcePanelDragOption
+      value={{ metric_name: 'test', uuid: '1' }}
+      type={DndItemType.Metric}
+    />,
+    {
+      useDndKit: true,
+      useRedux: true,
+      initialState: { explore: { compatibility: state } },
+    },
+  );
+
+  expect(
+    await screen.findByTestId('DatasourcePanelDragOption'),
+  ).not.toHaveStyle({ cursor: 'not-allowed' });
 });

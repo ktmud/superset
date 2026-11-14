@@ -16,38 +16,46 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
-import { makeApi } from '@superset-ui/core';
-import { Dispatch } from 'redux';
-import { FilterConfiguration } from 'src/dashboard/components/nativeFilters/types';
 import {
-  SET_DATA_MASK_FOR_FILTER_CONFIG_FAIL,
-  setDataMaskForFilterConfigComplete,
-} from 'src/dataMask/actions';
-import { HYDRATE_DASHBOARD } from './hydrate';
-import { dashboardInfoChanged } from './dashboardInfo';
-import {
+  Filter,
+  FilterConfiguration,
   Filters,
-  FilterSet,
-  FilterSetFullData,
-  FilterSets,
-} from '../reducers/types';
-import { DashboardInfo, RootState } from '../types';
+  makeApi,
+  Divider,
+  ChartCustomization,
+  ChartCustomizationDivider,
+} from '@superset-ui/core';
+import { Dispatch } from 'redux';
+import { RootState } from 'src/dashboard/types';
+import { cloneDeep, omit } from 'lodash-es';
+import { setDataMaskForFilterChangesComplete } from 'src/dataMask/actions';
+import { HYDRATE_DASHBOARD } from './hydrate';
+import {
+  dashboardInfoChanged,
+  nativeFiltersConfigChanged,
+} from './dashboardInfo';
+import { SaveFilterChangesType } from '../components/nativeFilters/FiltersConfigModal/types';
 
-export const SET_FILTER_CONFIG_BEGIN = 'SET_FILTER_CONFIG_BEGIN';
-export interface SetFilterConfigBegin {
-  type: typeof SET_FILTER_CONFIG_BEGIN;
+export const SET_NATIVE_FILTERS_CONFIG_BEGIN =
+  'SET_NATIVE_FILTERS_CONFIG_BEGIN';
+export interface SetNativeFiltersConfigBegin {
+  type: typeof SET_NATIVE_FILTERS_CONFIG_BEGIN;
   filterConfig: FilterConfiguration;
 }
 
-export const SET_FILTER_CONFIG_COMPLETE = 'SET_FILTER_CONFIG_COMPLETE';
-export interface SetFilterConfigComplete {
-  type: typeof SET_FILTER_CONFIG_COMPLETE;
-  filterConfig: FilterConfiguration;
+export const SET_NATIVE_FILTERS_CONFIG_COMPLETE =
+  'SET_NATIVE_FILTERS_CONFIG_COMPLETE';
+export interface SetNativeFiltersConfigComplete {
+  type: typeof SET_NATIVE_FILTERS_CONFIG_COMPLETE;
+  filterChanges: Array<
+    Filter | Divider | ChartCustomization | ChartCustomizationDivider
+  >;
+  deletedIds?: string[];
 }
-export const SET_FILTER_CONFIG_FAIL = 'SET_FILTER_CONFIG_FAIL';
-export interface SetFilterConfigFail {
-  type: typeof SET_FILTER_CONFIG_FAIL;
+
+export const SET_NATIVE_FILTERS_CONFIG_FAIL = 'SET_NATIVE_FILTERS_CONFIG_FAIL';
+export interface SetNativeFiltersConfigFail {
+  type: typeof SET_NATIVE_FILTERS_CONFIG_FAIL;
   filterConfig: FilterConfiguration;
 }
 export const SET_IN_SCOPE_STATUS_OF_FILTERS = 'SET_IN_SCOPE_STATUS_OF_FILTERS';
@@ -55,143 +63,102 @@ export interface SetInScopeStatusOfFilters {
   type: typeof SET_IN_SCOPE_STATUS_OF_FILTERS;
   filterConfig: FilterConfiguration;
 }
-export const SET_FILTER_SETS_BEGIN = 'SET_FILTER_SETS_BEGIN';
-export interface SetFilterSetsBegin {
-  type: typeof SET_FILTER_SETS_BEGIN;
-}
-export const SET_FILTER_SETS_COMPLETE = 'SET_FILTER_SETS_COMPLETE';
-export interface SetFilterSetsComplete {
-  type: typeof SET_FILTER_SETS_COMPLETE;
-  filterSets: FilterSet[];
-}
-export const SET_FILTER_SETS_FAIL = 'SET_FILTER_SETS_FAIL';
-export interface SetFilterSetsFail {
-  type: typeof SET_FILTER_SETS_FAIL;
-}
 
-export const CREATE_FILTER_SET_BEGIN = 'CREATE_FILTER_SET_BEGIN';
-export interface CreateFilterSetBegin {
-  type: typeof CREATE_FILTER_SET_BEGIN;
-}
-export const CREATE_FILTER_SET_COMPLETE = 'CREATE_FILTER_SET_COMPLETE';
-export interface CreateFilterSetComplete {
-  type: typeof CREATE_FILTER_SET_COMPLETE;
-  filterSet: FilterSet;
-}
-export const CREATE_FILTER_SET_FAIL = 'CREATE_FILTER_SET_FAIL';
-export interface CreateFilterSetFail {
-  type: typeof CREATE_FILTER_SET_FAIL;
-}
+const isFilterChangesEmpty = (filterChanges: SaveFilterChangesType) =>
+  Object.values(filterChanges).every(
+    array => Array.isArray(array) && !array.length,
+  );
 
-export const DELETE_FILTER_SET_BEGIN = 'DELETE_FILTER_SET_BEGIN';
-export interface DeleteFilterSetBegin {
-  type: typeof DELETE_FILTER_SET_BEGIN;
-}
-export const DELETE_FILTER_SET_COMPLETE = 'DELETE_FILTER_SET_COMPLETE';
-export interface DeleteFilterSetComplete {
-  type: typeof DELETE_FILTER_SET_COMPLETE;
-  filterSet: FilterSet;
-}
-export const DELETE_FILTER_SET_FAIL = 'DELETE_FILTER_SET_FAIL';
-export interface DeleteFilterSetFail {
-  type: typeof DELETE_FILTER_SET_FAIL;
-}
-
-export const UPDATE_FILTER_SET_BEGIN = 'UPDATE_FILTER_SET_BEGIN';
-export interface UpdateFilterSetBegin {
-  type: typeof UPDATE_FILTER_SET_BEGIN;
-}
-export const UPDATE_FILTER_SET_COMPLETE = 'UPDATE_FILTER_SET_COMPLETE';
-export interface UpdateFilterSetComplete {
-  type: typeof UPDATE_FILTER_SET_COMPLETE;
-  filterSet: FilterSet;
-}
-export const UPDATE_FILTER_SET_FAIL = 'UPDATE_FILTER_SET_FAIL';
-export interface UpdateFilterSetFail {
-  type: typeof UPDATE_FILTER_SET_FAIL;
-}
-
-export const setFilterConfiguration = (
-  filterConfig: FilterConfiguration,
-) => async (dispatch: Dispatch, getState: () => any) => {
-  dispatch({
-    type: SET_FILTER_CONFIG_BEGIN,
-    filterConfig,
-  });
-  const { id, metadata } = getState().dashboardInfo;
-  const oldFilters = getState().nativeFilters?.filters;
-
-  // TODO extract this out when makeApi supports url parameters
-  const updateDashboard = makeApi<
-    Partial<DashboardInfo>,
-    { result: DashboardInfo }
-  >({
-    method: 'PUT',
-    endpoint: `/api/v1/dashboard/${id}`,
-  });
-
-  const mergedFilterConfig = filterConfig.map(filter => {
-    const oldFilter = oldFilters[filter.id];
-    if (!oldFilter) {
-      return filter;
+export const setFilterConfiguration =
+  (filterChanges: SaveFilterChangesType) =>
+  async (dispatch: Dispatch, getState: () => RootState) => {
+    if (isFilterChangesEmpty(filterChanges)) {
+      return;
     }
-    return { ...oldFilter, ...filter };
-  });
 
-  try {
-    const response = await updateDashboard({
-      json_metadata: JSON.stringify({
-        ...metadata,
-        native_filter_configuration: mergedFilterConfig,
-      }),
+    const { id } = getState().dashboardInfo;
+    const oldFilters = getState().nativeFilters?.filters;
+
+    dispatch({
+      type: SET_NATIVE_FILTERS_CONFIG_BEGIN,
+      filterChanges,
     });
+
+    const updateFilters = makeApi<SaveFilterChangesType, { result: Filter[] }>({
+      method: 'PUT',
+      endpoint: `/api/v1/dashboard/${id}/filters`,
+    });
+    try {
+      const response = await updateFilters(filterChanges);
+      // chartsInScope/tabsInScope are derived from the live layout, and the
+      // response carries the persisted copy for every filter - including the
+      // ones this save never touched, whose copy is whatever was stored when
+      // the dashboard was last saved. Dropping them lets the reducers keep the
+      // scopes calculateScopes already computed for this session.
+      const savedFilters = response.result.map(
+        filter => omit(filter, ['chartsInScope', 'tabsInScope']) as Filter,
+      );
+      dispatch({
+        type: SET_NATIVE_FILTERS_CONFIG_COMPLETE,
+        filterChanges: savedFilters,
+        deletedIds: filterChanges.deleted,
+      });
+      dispatch(nativeFiltersConfigChanged(savedFilters));
+      dispatch(setDataMaskForFilterChangesComplete(filterChanges, oldFilters));
+    } catch (err) {
+      dispatch({
+        type: SET_NATIVE_FILTERS_CONFIG_FAIL,
+        filterConfig: filterChanges,
+      });
+    }
+  };
+
+export const setInScopeStatusOfFilters =
+  (
+    filterScopes: {
+      filterId: string;
+      chartsInScope: number[];
+      tabsInScope: string[];
+    }[],
+  ) =>
+  async (dispatch: Dispatch, getState: () => RootState) => {
+    const filters = getState().nativeFilters?.filters;
+    const filtersWithScopes = filterScopes.map(scope => ({
+      ...filters[scope.filterId],
+      chartsInScope: scope.chartsInScope,
+      tabsInScope: scope.tabsInScope,
+    }));
+    dispatch({
+      type: SET_IN_SCOPE_STATUS_OF_FILTERS,
+      filterConfig: filtersWithScopes,
+    });
+    const metadata = cloneDeep(getState().dashboardInfo.metadata);
+    const filterConfig =
+      (metadata.native_filter_configuration as FilterConfiguration) || [];
+    const mergedFilterConfig = filterConfig.map(filter => {
+      const filterWithScope = filtersWithScopes.find(
+        scope => scope.id === filter.id,
+      );
+      if (!filterWithScope) {
+        return filter;
+      }
+      return {
+        ...filter,
+        chartsInScope: filterWithScope.chartsInScope,
+        tabsInScope: filterWithScope.tabsInScope,
+      };
+    });
+    metadata.native_filter_configuration = mergedFilterConfig;
     dispatch(
       dashboardInfoChanged({
-        metadata: JSON.parse(response.result.json_metadata),
+        metadata,
       }),
     );
-    dispatch({
-      type: SET_FILTER_CONFIG_COMPLETE,
-      filterConfig: mergedFilterConfig,
-    });
-    dispatch(
-      setDataMaskForFilterConfigComplete(mergedFilterConfig, oldFilters),
-    );
-  } catch (err) {
-    dispatch({
-      type: SET_FILTER_CONFIG_FAIL,
-      filterConfig: mergedFilterConfig,
-    });
-    dispatch({
-      type: SET_DATA_MASK_FOR_FILTER_CONFIG_FAIL,
-      filterConfig: mergedFilterConfig,
-    });
-  }
-};
-
-export const setInScopeStatusOfFilters = (
-  filterScopes: {
-    filterId: string;
-    chartsInScope: number[];
-    tabsInScope: string[];
-  }[],
-) => async (dispatch: Dispatch, getState: () => any) => {
-  const filters = getState().nativeFilters?.filters;
-  const filtersWithScopes = filterScopes.map(scope => ({
-    ...filters[scope.filterId],
-    chartsInScope: scope.chartsInScope,
-    tabsInScope: scope.tabsInScope,
-  }));
-  dispatch({
-    type: SET_IN_SCOPE_STATUS_OF_FILTERS,
-    filterConfig: filtersWithScopes,
-  });
-};
+  };
 
 type BootstrapData = {
   nativeFilters: {
     filters: Filters;
-    filterSets: FilterSets;
     filtersState: object;
   };
 };
@@ -200,139 +167,6 @@ export interface SetBootstrapData {
   type: typeof HYDRATE_DASHBOARD;
   data: BootstrapData;
 }
-
-export const getFilterSets = () => async (
-  dispatch: Dispatch,
-  getState: () => RootState,
-) => {
-  const dashboardId = getState().dashboardInfo.id;
-  const fetchFilterSets = makeApi<
-    null,
-    {
-      count: number;
-      ids: number[];
-      result: FilterSetFullData[];
-    }
-  >({
-    method: 'GET',
-    endpoint: `/api/v1/dashboard/${dashboardId}/filtersets`,
-  });
-
-  dispatch({
-    type: SET_FILTER_SETS_BEGIN,
-  });
-
-  const response = await fetchFilterSets(null);
-
-  dispatch({
-    type: SET_FILTER_SETS_COMPLETE,
-    filterSets: response.ids.map((id, i) => ({
-      ...response.result[i].params,
-      id,
-      name: response.result[i].name,
-    })),
-  });
-};
-
-export const createFilterSet = (filterSet: Omit<FilterSet, 'id'>) => async (
-  dispatch: Function,
-  getState: () => RootState,
-) => {
-  const dashboardId = getState().dashboardInfo.id;
-  const postFilterSets = makeApi<
-    Partial<FilterSetFullData & { json_metadata: any }>,
-    {
-      count: number;
-      ids: number[];
-      result: FilterSetFullData[];
-    }
-  >({
-    method: 'POST',
-    endpoint: `/api/v1/dashboard/${dashboardId}/filtersets`,
-  });
-
-  dispatch({
-    type: CREATE_FILTER_SET_BEGIN,
-  });
-
-  const serverFilterSet: Omit<FilterSet, 'id' | 'name'> & { name?: string } = {
-    ...filterSet,
-  };
-
-  delete serverFilterSet.name;
-
-  await postFilterSets({
-    name: filterSet.name,
-    owner_type: 'Dashboard',
-    owner_id: dashboardId,
-    json_metadata: JSON.stringify(serverFilterSet),
-  });
-
-  dispatch({
-    type: CREATE_FILTER_SET_COMPLETE,
-  });
-  dispatch(getFilterSets());
-};
-
-export const updateFilterSet = (filterSet: FilterSet) => async (
-  dispatch: Function,
-  getState: () => RootState,
-) => {
-  const dashboardId = getState().dashboardInfo.id;
-  const postFilterSets = makeApi<
-    Partial<FilterSetFullData & { json_metadata: any }>,
-    {}
-  >({
-    method: 'PUT',
-    endpoint: `/api/v1/dashboard/${dashboardId}/filtersets/${filterSet.id}`,
-  });
-
-  dispatch({
-    type: UPDATE_FILTER_SET_BEGIN,
-  });
-
-  const serverFilterSet: Omit<FilterSet, 'id' | 'name'> & {
-    name?: string;
-    id?: number;
-  } = {
-    ...filterSet,
-  };
-
-  delete serverFilterSet.id;
-  delete serverFilterSet.name;
-
-  await postFilterSets({
-    name: filterSet.name,
-    json_metadata: JSON.stringify(serverFilterSet),
-  });
-
-  dispatch({
-    type: UPDATE_FILTER_SET_COMPLETE,
-  });
-  dispatch(getFilterSets());
-};
-
-export const deleteFilterSet = (filterSetId: number) => async (
-  dispatch: Function,
-  getState: () => RootState,
-) => {
-  const dashboardId = getState().dashboardInfo.id;
-  const deleteFilterSets = makeApi<{}, {}>({
-    method: 'DELETE',
-    endpoint: `/api/v1/dashboard/${dashboardId}/filtersets/${filterSetId}`,
-  });
-
-  dispatch({
-    type: DELETE_FILTER_SET_BEGIN,
-  });
-
-  await deleteFilterSets({});
-
-  dispatch({
-    type: DELETE_FILTER_SET_COMPLETE,
-  });
-  dispatch(getFilterSets());
-};
 
 export const SET_FOCUSED_NATIVE_FILTER = 'SET_FOCUSED_NATIVE_FILTER';
 export interface SetFocusedNativeFilter {
@@ -356,23 +190,81 @@ export function unsetFocusedNativeFilter(): UnsetFocusedNativeFilter {
   };
 }
 
+export const SET_HOVERED_NATIVE_FILTER = 'SET_HOVERED_NATIVE_FILTER';
+export interface SetHoveredNativeFilter {
+  type: typeof SET_HOVERED_NATIVE_FILTER;
+  id: string;
+}
+export const UNSET_HOVERED_NATIVE_FILTER = 'UNSET_HOVERED_NATIVE_FILTER';
+export interface UnsetHoveredNativeFilter {
+  type: typeof UNSET_HOVERED_NATIVE_FILTER;
+}
+
+export function setHoveredNativeFilter(id: string): SetHoveredNativeFilter {
+  return {
+    type: SET_HOVERED_NATIVE_FILTER,
+    id,
+  };
+}
+export function unsetHoveredNativeFilter(): UnsetHoveredNativeFilter {
+  return {
+    type: UNSET_HOVERED_NATIVE_FILTER,
+  };
+}
+
+export const SET_HOVERED_CHART_CUSTOMIZATION =
+  'SET_HOVERED_CHART_CUSTOMIZATION';
+export interface SetHoveredChartCustomization {
+  type: typeof SET_HOVERED_CHART_CUSTOMIZATION;
+  id: string;
+}
+export const UNSET_HOVERED_CHART_CUSTOMIZATION =
+  'UNSET_HOVERED_CHART_CUSTOMIZATION';
+export interface UnsetHoveredChartCustomization {
+  type: typeof UNSET_HOVERED_CHART_CUSTOMIZATION;
+}
+
+export function setHoveredChartCustomization(
+  id: string,
+): SetHoveredChartCustomization {
+  return {
+    type: SET_HOVERED_CHART_CUSTOMIZATION,
+    id,
+  };
+}
+export function unsetHoveredChartCustomization(): UnsetHoveredChartCustomization {
+  return {
+    type: UNSET_HOVERED_CHART_CUSTOMIZATION,
+  };
+}
+
+export const UPDATE_CASCADE_PARENT_IDS = 'UPDATE_CASCADE_PARENT_IDS';
+export interface UpdateCascadeParentIds {
+  type: typeof UPDATE_CASCADE_PARENT_IDS;
+  id: string;
+  parentIds: string[];
+}
+export function updateCascadeParentIds(
+  id: string,
+  parentIds: string[],
+): UpdateCascadeParentIds {
+  return {
+    type: UPDATE_CASCADE_PARENT_IDS,
+    id,
+    parentIds,
+  };
+}
+
 export type AnyFilterAction =
-  | SetFilterConfigBegin
-  | SetFilterConfigComplete
-  | SetFilterConfigFail
-  | SetFilterSetsBegin
-  | SetFilterSetsComplete
-  | SetFilterSetsFail
+  | SetNativeFiltersConfigBegin
+  | SetNativeFiltersConfigComplete
+  | SetNativeFiltersConfigFail
   | SetInScopeStatusOfFilters
   | SetBootstrapData
   | SetFocusedNativeFilter
   | UnsetFocusedNativeFilter
-  | CreateFilterSetBegin
-  | CreateFilterSetComplete
-  | CreateFilterSetFail
-  | DeleteFilterSetBegin
-  | DeleteFilterSetComplete
-  | DeleteFilterSetFail
-  | UpdateFilterSetBegin
-  | UpdateFilterSetComplete
-  | UpdateFilterSetFail;
+  | SetHoveredNativeFilter
+  | UnsetHoveredNativeFilter
+  | SetHoveredChartCustomization
+  | UnsetHoveredChartCustomization
+  | UpdateCascadeParentIds;

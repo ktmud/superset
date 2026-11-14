@@ -31,6 +31,7 @@ export const NEW_MARKDOWN_ID = 'NEW_MARKDOWN_ID';
 export const NEW_ROW_ID = 'NEW_ROW_ID';
 export const NEW_TAB_ID = 'NEW_TAB_ID';
 export const NEW_TABS_ID = 'NEW_TABS_ID';
+export const NEW_DYNAMIC_COMPONENT = 'NEW_DYNAMIC_COMPONENT';
 
 // grid constants
 export const DASHBOARD_ROOT_DEPTH = 0;
@@ -39,6 +40,7 @@ export const GRID_GUTTER_SIZE = 2 * GRID_BASE_UNIT;
 export const GRID_COLUMN_COUNT = 12;
 export const GRID_MIN_COLUMN_COUNT = 1;
 export const GRID_MIN_ROW_UNITS = 5;
+export const BOTTOM_RESIZE_DIRECTION = 'bottom';
 export const GRID_MAX_ROW_UNITS = 100;
 export const GRID_MIN_ROW_HEIGHT = GRID_GUTTER_SIZE;
 export const GRID_DEFAULT_CHART_WIDTH = 4;
@@ -57,6 +59,7 @@ export const UNDO_LIMIT = 50;
 
 // save dash options
 export const SAVE_TYPE_OVERWRITE = 'overwrite';
+export const SAVE_TYPE_OVERWRITE_CONFIRMED = 'overwriteConfirmed';
 export const SAVE_TYPE_NEWDASHBOARD = 'newDashboard';
 
 // default dashboard layout data size limit
@@ -71,8 +74,8 @@ export const IN_COMPONENT_ELEMENT_TYPES = ['LABEL'];
 export const ALL_FILTERS_ROOT = 'ALL_FILTERS_ROOT';
 
 export enum DashboardStandaloneMode {
-  NONE = 0,
-  HIDE_NAV = 1,
-  HIDE_NAV_AND_TITLE = 2,
-  REPORT = 3,
+  None = 0,
+  HideNav = 1,
+  HideNavAndTitle = 2,
+  Report = 3,
 }

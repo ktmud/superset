@@ -16,20 +16,34 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import sinon from 'sinon';
 import * as actions from 'src/SqlLab/actions/sqlLab';
 import { ColumnKeyTypeType } from 'src/SqlLab/components/ColumnElement';
+import {
+  DatasourceType,
+  denormalizeTimestamp,
+  ErrorTypeEnum,
+  QueryResponse,
+  QueryState,
+} from '@superset-ui/core';
+import { GenericDataType } from '@apache-superset/core/common';
+import { LatestQueryEditorVersion } from 'src/SqlLab/types';
+import { ISaveableDatasource } from 'src/SqlLab/components/SaveDatasetModal';
+import { SubjectType } from 'src/types/Subject';
 
-export const mockedActions = sinon.stub({ ...actions });
+export const mockedActions = Object.fromEntries(
+  Object.keys(actions).map(key => [key, jest.fn()]),
+);
 
-export const alert = { bsStyle: 'danger', msg: 'Ooops', id: 'lksvmcx32' };
+export const alert = { bsStyle: 'danger', msg: 'Oops', id: 'lksvmcx32' };
 export const table = {
   dbId: 1,
   selectStar: 'SELECT * FROM ab_user',
-  queryEditorId: 'rJ-KP47a',
-  schema: 'superset',
+  queryEditorId: 'dfsadfs',
+  catalog: null,
+  schema: 'main',
   name: 'ab_user',
   id: 'r11Vgt60',
+  view: 'SELECT * FROM ab_user',
   dataPreviewQueryId: null,
   partitions: {
     cols: ['username'],
@@ -174,21 +188,48 @@ export const table = {
 };
 
 export const defaultQueryEditor = {
+  version: LatestQueryEditorVersion,
   id: 'dfsadfs',
+  immutableId: 'immutable-id',
   autorun: false,
-  dbId: null,
+  dbId: 1,
   latestQueryId: null,
-  selectedText: null,
+  selectedText: undefined,
   sql: 'SELECT *\nFROM\nWHERE',
-  title: 'Untitled Query',
-  schemaOptions: [
-    {
-      value: 'main',
-      label: 'main',
-      title: 'main',
-    },
-  ],
+  name: 'Untitled Query 1',
+  catalog: null,
+  schema: 'main',
+  remoteId: null,
+  hideLeftBar: false,
+  templateParams: '{}',
 };
+
+export const extraQueryEditor1 = {
+  ...defaultQueryEditor,
+  id: 'diekd23',
+  immutableId: 'immutable-id',
+  sql: 'SELECT *\nFROM\nWHERE\nLIMIT',
+  name: 'Untitled Query 2',
+  selectedText: 'SELECT',
+};
+
+export const extraQueryEditor2 = {
+  ...defaultQueryEditor,
+  id: 'owkdi998',
+  immutableId: 'immutable-id',
+  sql: '',
+  name: 'Untitled Query 3',
+};
+
+export const extraQueryEditor3 = {
+  ...defaultQueryEditor,
+  id: 'kvk23',
+  immutableId: 'immutable-id',
+  sql: '',
+  name: 'Untitled Query 4',
+  tabViewId: 37,
+};
+
 export const queries = [
   {
     dbId: 1,
@@ -199,10 +240,10 @@ export const queries = [
     ctas: false,
     cached: false,
     id: 'BkA1CLrJg',
+    sqlEditorImmutableId: 'BkA1CLrJg_immutable',
     progress: 100,
     startDttm: 1476910566092.96,
-    state: 'success',
-    changedOn: 1476910566000,
+    state: QueryState.Success,
     tempTable: null,
     userId: 1,
     executedSql: null,
@@ -211,6 +252,7 @@ export const queries = [
     queryLimit: 100,
     endDttm: 1476910566798,
     limit_reached: false,
+    catalog: null,
     schema: 'test_schema',
     errorMessage: null,
     db: 'main',
@@ -221,25 +263,25 @@ export const queries = [
     results: {
       columns: [
         {
-          is_date: true,
-          name: 'ds',
+          is_dttm: true,
+          column_name: 'ds',
           type: 'STRING',
         },
         {
-          is_date: false,
-          name: 'gender',
+          is_dttm: false,
+          column_name: 'gender',
           type: 'STRING',
         },
       ],
       selected_columns: [
         {
-          is_date: true,
-          name: 'ds',
+          is_dttm: true,
+          column_name: 'ds',
           type: 'STRING',
         },
         {
-          is_date: false,
-          name: 'gender',
+          is_dttm: false,
+          column_name: 'gender',
           type: 'STRING',
         },
       ],
@@ -258,10 +300,10 @@ export const queries = [
     ctas: false,
     cached: false,
     id: 'S1zeAISkx',
+    sqlEditorImmutableId: 'S1zeAISkx_immutable',
     progress: 100,
     startDttm: 1476910570802.2,
-    state: 'success',
-    changedOn: 1476910572000,
+    state: QueryState.Success,
     tempTable: null,
     userId: 1,
     executedSql:
@@ -273,6 +315,7 @@ export const queries = [
     rows: 42,
     endDttm: 1476910579693,
     limit_reached: false,
+    catalog: null,
     schema: null,
     errorMessage: null,
     db: 'main',
@@ -292,10 +335,10 @@ export const queryWithNoQueryLimit = {
   ctas: false,
   cached: false,
   id: 'BkA1CLrJg',
+  sqlEditorImmutableId: 'BkA1CLrJg_immutable',
   progress: 100,
   startDttm: 1476910566092.96,
-  state: 'success',
-  changedOn: 1476910566000,
+  state: QueryState.Success,
   tempTable: null,
   userId: 1,
   executedSql: null,
@@ -303,6 +346,7 @@ export const queryWithNoQueryLimit = {
   rows: 42,
   endDttm: 1476910566798,
   limit_reached: false,
+  catalog: null,
   schema: 'test_schema',
   errorMessage: null,
   db: 'main',
@@ -313,25 +357,25 @@ export const queryWithNoQueryLimit = {
   results: {
     columns: [
       {
-        is_date: true,
-        name: 'ds',
+        is_dttm: true,
+        column_name: 'ds',
         type: 'STRING',
       },
       {
-        is_date: false,
-        name: 'gender',
+        is_dttm: false,
+        column_name: 'gender',
         type: 'STRING',
       },
     ],
     selected_columns: [
       {
-        is_date: true,
-        name: 'ds',
+        is_dttm: true,
+        column_name: 'ds',
         type: 'STRING',
       },
       {
-        is_date: false,
-        name: 'gender',
+        is_dttm: false,
+        column_name: 'gender',
         type: 'STRING',
       },
     ],
@@ -344,69 +388,71 @@ export const queryWithNoQueryLimit = {
     },
   },
 };
+
 export const queryWithBadColumns = {
   ...queries[0],
   results: {
     data: queries[0].results?.data,
     selected_columns: [
       {
-        is_date: true,
-        name: 'COUNT(*)',
+        is_dttm: true,
+        column_name: 'COUNT(*)',
         type: 'STRING',
       },
       {
-        is_date: false,
-        name: 'this_col_is_ok',
+        is_dttm: false,
+        column_name: 'this_col_is_ok',
         type: 'STRING',
       },
       {
-        is_date: false,
-        name: 'a',
+        is_dttm: false,
+        column_name: 'a',
         type: 'STRING',
       },
       {
-        is_date: false,
-        name: '1',
+        is_dttm: false,
+        column_name: '1',
         type: 'STRING',
       },
       {
-        is_date: false,
-        name: '123',
+        is_dttm: false,
+        column_name: '123',
         type: 'STRING',
       },
       {
-        is_date: false,
-        name: 'CASE WHEN 1=1 THEN 1 ELSE 0 END',
+        is_dttm: false,
+        column_name: 'CASE WHEN 1=1 THEN 1 ELSE 0 END',
         type: 'STRING',
       },
       {
-        is_date: true,
-        name: '_TIMESTAMP',
+        is_dttm: true,
+        column_name: '_TIMESTAMP',
         type: 'TIMESTAMP',
       },
       {
-        is_date: true,
-        name: '__TIME',
+        is_dttm: true,
+        column_name: '__TIME',
         type: 'TIMESTAMP',
       },
       {
-        is_date: false,
-        name: 'my_dupe_col__2',
+        is_dttm: false,
+        column_name: 'my_dupe_col__2',
         type: 'STRING',
       },
       {
-        is_date: true,
-        name: '__timestamp',
+        is_dttm: true,
+        column_name: '__timestamp',
         type: 'TIMESTAMP',
       },
       {
-        is_date: true,
-        name: '__TIMESTAMP',
+        is_dttm: true,
+        column_name: '__TIMESTAMP',
         type: 'TIMESTAMP',
       },
     ],
   },
 };
+
 export const databases = {
   result: [
     {
@@ -429,22 +475,26 @@ export const databases = {
     },
   ],
 };
+
 export const tables = {
   options: [
     {
       value: 'birth_names',
+      catalog: null,
       schema: 'main',
       label: 'birth_names',
       title: 'birth_names',
     },
     {
       value: 'energy_usage',
+      catalog: null,
       schema: 'main',
       label: 'energy_usage',
       title: 'energy_usage',
     },
     {
       value: 'wb_health_population',
+      catalog: null,
       schema: 'main',
       label: 'wb_health_population',
       title: 'wb_health_population',
@@ -460,11 +510,12 @@ export const stoppedQuery = {
   progress: 0,
   results: [],
   runAsync: false,
+  catalog: null,
   schema: 'main',
   sql: 'SELECT ...',
   sqlEditorId: 'rJaf5u9WZ',
   startDttm: 1497400851936,
-  state: 'stopped',
+  state: QueryState.Stopped,
   tab: 'Untitled Query 2',
   tempTable: '',
 };
@@ -478,11 +529,12 @@ export const failedQueryWithErrorMessage = {
   progress: 0,
   results: [],
   runAsync: false,
+  catalog: null,
   schema: 'main',
   sql: 'SELECT ...',
   sqlEditorId: 'rJaf5u9WZ',
   startDttm: 1497400851936,
-  state: 'failed',
+  state: QueryState.Failed,
   tab: 'Untitled Query 2',
   tempTable: '',
 };
@@ -498,29 +550,152 @@ export const failedQueryWithErrors = {
       level: 'error',
       extra: null,
     },
+    {
+      message: 'Something else wrong',
+      error_type: 'TEST_ERROR',
+      level: 'error',
+      extra: null,
+    },
   ],
   id: 'ryhMUZCGb',
   progress: 0,
   results: [],
   runAsync: false,
+  catalog: null,
   schema: 'main',
   sql: 'SELECT ...',
   sqlEditorId: 'rJaf5u9WZ',
   startDttm: 1497400851936,
-  state: 'failed',
+  state: QueryState.Failed,
   tab: 'Untitled Query 2',
   tempTable: '',
 };
 
-export const runningQuery = {
+export const failedQueryWithFrontendTimeoutErrors = {
+  ...failedQueryWithErrorMessage,
+  errors: [
+    {
+      error_type: ErrorTypeEnum.FRONTEND_TIMEOUT_ERROR,
+      message: 'Request timed out',
+      level: 'error',
+      extra: {
+        timeout: 10,
+      },
+    },
+  ],
+};
+
+const baseQuery: QueryResponse = {
+  queryId: 567,
+  dbId: 1,
+  sql: 'SELECT * FROM superset.slices',
+  sqlEditorId: 'SJ8YO72R',
+  tab: 'Demo',
+  ctas: false,
+  cached: false,
+  id: 'BkA1CLrJg',
+  sqlEditorImmutableId: 'BkA1CLrJg_immutable',
+  progress: 100,
+  startDttm: 1476910566092.96,
+  state: QueryState.Success,
+  tempSchema: null,
+  tempTable: 'temp',
+  userId: 1,
+  executedSql: 'SELECT * FROM superset.slices',
+  rows: 42,
+  started: 'started',
+  queryLimit: 100,
+  endDttm: 1476910566798,
+  catalog: null,
+  schema: 'test_schema',
+  errorMessage: null,
+  db: { key: 'main' },
+  user: { key: 'admin' },
+  isDataPreview: false,
+  resultsKey: null,
+  trackingUrl: null,
+  templateParams: null,
+  limitingFactor: 'capacity',
+  duration: '2334645675467',
+  time: { key: 'value' },
+  querylink: { key: 'value' },
+  output: { key: 'value' },
+  actions: { key: 'value' },
+  extra: {
+    progress: null,
+  },
+  columns: [],
+  type: DatasourceType.Query,
+  results: {
+    displayLimitReached: false,
+    query: { limit: 6 },
+    columns: [
+      {
+        is_dttm: true,
+        column_name: 'ds',
+        type: 'STRING',
+        type_generic: GenericDataType.String,
+      },
+      {
+        is_dttm: false,
+        column_name: 'gender',
+        type: 'STRING',
+        type_generic: GenericDataType.String,
+      },
+    ],
+    selected_columns: [
+      {
+        is_dttm: true,
+        column_name: 'ds',
+        type: 'STRING',
+        type_generic: GenericDataType.Temporal,
+      },
+      {
+        is_dttm: false,
+        column_name: 'gender',
+        type: 'STRING',
+        type_generic: GenericDataType.String,
+      },
+    ],
+    expanded_columns: [
+      {
+        is_dttm: true,
+        column_name: 'ds',
+        type: 'STRING',
+        type_generic: GenericDataType.String,
+      },
+    ],
+    data: [
+      { col1: '0', col2: '1' },
+      { col1: '2', col2: '3' },
+    ],
+  },
+};
+
+export const runningQuery: QueryResponse = {
+  ...baseQuery,
   dbId: 1,
   cached: false,
   ctas: false,
   id: 'ryhMUZCGb',
+  sqlEditorImmutableId: 'ryhMUZCGb_immutable',
   progress: 90,
-  state: 'running',
+  state: QueryState.Running,
   startDttm: Date.now() - 500,
 };
+
+export const successfulQuery: QueryResponse = {
+  ...baseQuery,
+  dbId: 1,
+  cached: false,
+  ctas: false,
+  id: 'ryhMUZCGb',
+  sqlEditorImmutableId: 'ryhMUZCGb_immutable',
+  progress: 100,
+  state: QueryState.Success,
+  startDttm: Date.now() - 500,
+};
+
 export const cachedQuery = { ...queries[0], cached: true };
 
 export const user = {
@@ -541,15 +716,17 @@ export const initialState = {
     alerts: [],
     queries: {},
     databases: {},
-    queryEditors: [defaultQueryEditor],
+    queryEditors: [defaultQueryEditor, extraQueryEditor1, extraQueryEditor2],
     tabHistory: [defaultQueryEditor.id],
     tables: [],
     workspaceQueries: [],
     queriesLastUpdate: 0,
     activeSouthPaneTab: 'Results',
-    user: { user },
+    unsavedQueryEditor: {},
+    destroyedQueryEditors: {},
   },
   messageToasts: [],
+  user,
   common: {
     conf: {
       DEFAULT_SQLLAB_LIMIT: 1000,
@@ -557,18 +734,58 @@ export const initialState = {
       DISPLAY_MAX_ROW: 100,
       SQLALCHEMY_DOCS_URL: 'test_SQLALCHEMY_DOCS_URL',
       SQLALCHEMY_DISPLAY_TEXT: 'test_SQLALCHEMY_DISPLAY_TEXT',
+      SUPERSET_WEBSERVER_TIMEOUT: '300',
     },
   },
 };
 
 export const query = {
-  id: 'clientId2353',
+  name: 'test query',
   dbId: 1,
   sql: 'SELECT * FROM something',
-  sqlEditorId: defaultQueryEditor.id,
-  tab: 'unimportant',
-  tempTable: null,
-  runAsync: false,
-  ctas: false,
-  cached: false,
+  description: 'test description',
+  catalog: null,
+  schema: 'test schema',
+  resultsKey: 'test',
 };
+
+export const queryId = 'clientId2353';
+
+export const testQuery: ISaveableDatasource = {
+  name: 'unimportant',
+  dbId: 1,
+  catalog: null,
+  schema: 'main',
+  sql: 'SELECT *',
+  columns: [
+    {
+      column_name: 'Column 1',
+      type: DatasourceType.Query,
+      is_dttm: false,
+    },
+    {
+      column_name: 'Column 3',
+      type: DatasourceType.Query,
+      is_dttm: false,
+    },
+    {
+      column_name: 'Column 2',
+      type: DatasourceType.Query,
+      is_dttm: true,
+    },
+  ],
+};
+
+export const mockdatasets = Array.from({ length: 3 }, (_, i) => ({
+  changed_by_name: 'user',
+  kind: i === 0 ? 'virtual' : 'physical', // ensure there is 1 virtual
+  changed_by: 'user',
+  changed_on: denormalizeTimestamp(new Date().toISOString()),
+  database_name: `db ${i}`,
+  explore_url: `/explore/?datasource_type=table&datasource_id=${i}`,
+  id: i,
+  catalog: null,
+  schema: `schema ${i}`,
+  table_name: `coolest table ${i}`,
+  editors: [{ id: i + 1, label: `Editor ${i + 1}`, type: SubjectType.User }],
+}));

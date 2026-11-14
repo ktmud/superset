@@ -14,19 +14,28 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
+from __future__ import annotations
+
 import re
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Pattern, Tuple, TYPE_CHECKING
+from datetime import datetime, time
+from re import Pattern
+from typing import Any, TYPE_CHECKING
 
 from flask_babel import gettext as __
+from sqlalchemy import types
 from sqlalchemy.engine.reflection import Inspector
+from sqlalchemy.sql.elements import ColumnClause
 
-from superset.db_engine_specs.base import BaseEngineSpec
+from superset.constants import TimeGrain
+from superset.db_engine_specs.base import (
+    BaseEngineSpec,
+    DatabaseCategory,
+    TimestampExpression,
+)
 from superset.errors import SupersetErrorType
-from superset.utils import core as utils
 
 if TYPE_CHECKING:
-    # prevent circular imports
     from superset.models.core import Database
 
 
@@ -36,29 +45,85 @@ COLUMN_DOES_NOT_EXIST_REGEX = re.compile("no such column: (?P<column_name>.+)")
 class SqliteEngineSpec(BaseEngineSpec):
     engine = "sqlite"
     engine_name = "SQLite"
+    # The engine's default text comparison is binary, so a mirrored
+    # ``partition_col = T(v)`` agrees with the ``col = v`` it stands in for.
+    binary_string_comparison = True
+
+    disable_ssh_tunneling = True
+    supports_multivalues_insert = True
+    supports_temporal_column_shift = True
+
+    metadata = {
+        "description": "SQLite is a self-contained, serverless SQL database engine.",
+        "logo": "sqlite.png",
+        "homepage_url": "https://www.sqlite.org/",
+        "categories": [
+            DatabaseCategory.TRADITIONAL_RDBMS,
+            DatabaseCategory.OPEN_SOURCE,
+        ],
+        "pypi_packages": [],
+        "connection_string": "sqlite:///path/to/file.db?check_same_thread=false",
+        "notes": "No additional library needed. SQLite is bundled with Python.",
+    }
 
     _time_grain_expressions = {
         None: "{col}",
-        "PT1S": "DATETIME(STRFTIME('%Y-%m-%dT%H:%M:%S', {col}))",
-        "PT1M": "DATETIME(STRFTIME('%Y-%m-%dT%H:%M:00', {col}))",
-        "PT1H": "DATETIME(STRFTIME('%Y-%m-%dT%H:00:00', {col}))",
-        "P1D": "DATE({col})",
-        "P1W": "DATE({col}, -strftime('%w', {col}) || ' days')",
-        "P1M": "DATE({col}, -strftime('%d', {col}) || ' days', '+1 day')",
-        "P3M": (
-            "DATETIME(STRFTIME('%Y-', {col}) || "  # year
-            "SUBSTR('00' || "  # pad with zeros to 2 chars
-            "((CAST(STRFTIME('%m', {col}) AS INTEGER)) - "  # month as integer
-            "(((CAST(STRFTIME('%m', {col}) AS INTEGER)) - 1) % 3)), "  # month in quarter
-            "-2) || "  # close pad
-            "'-01T00:00:00')"
+        TimeGrain.SECOND: "DATETIME(STRFTIME('%Y-%m-%dT%H:%M:%S', {col}))",
+        TimeGrain.FIVE_SECONDS: (
+            "DATETIME({col}, printf('-%d seconds', "
+            "CAST(strftime('%S', {col}) AS INT) % 5))"
         ),
-        "P1Y": "DATETIME(STRFTIME('%Y-01-01T00:00:00', {col}))",
-        "P1W/1970-01-03T00:00:00Z": "DATE({col}, 'weekday 6')",
-        "1969-12-28T00:00:00Z/P1W": "DATE({col}, 'weekday 0', '-7 days')",
+        TimeGrain.THIRTY_SECONDS: (
+            "DATETIME({col}, printf('-%d seconds', "
+            "CAST(strftime('%S', {col}) AS INT) % 30))"
+        ),
+        TimeGrain.MINUTE: "DATETIME(STRFTIME('%Y-%m-%dT%H:%M:00', {col}))",
+        TimeGrain.FIVE_MINUTES: (
+            "DATETIME(STRFTIME('%Y-%m-%dT%H:%M:00', {col}), printf('-%d minutes', "
+            "CAST(strftime('%M', {col}) AS INT) % 5))"
+        ),
+        TimeGrain.TEN_MINUTES: (
+            "DATETIME(STRFTIME('%Y-%m-%dT%H:%M:00', {col}), printf('-%d minutes', "
+            "CAST(strftime('%M', {col}) AS INT) % 10))"
+        ),
+        TimeGrain.FIFTEEN_MINUTES: (
+            "DATETIME(STRFTIME('%Y-%m-%dT%H:%M:00', {col}), printf('-%d minutes', "
+            "CAST(strftime('%M', {col}) AS INT) % 15))"
+        ),
+        TimeGrain.THIRTY_MINUTES: (
+            "DATETIME(STRFTIME('%Y-%m-%dT%H:%M:00', {col}), printf('-%d minutes', "
+            "CAST(strftime('%M', {col}) AS INT) % 30))"
+        ),
+        TimeGrain.HOUR: "DATETIME(STRFTIME('%Y-%m-%dT%H:00:00', {col}))",
+        TimeGrain.SIX_HOURS: (
+            "DATETIME(STRFTIME('%Y-%m-%dT%H:00:00', {col}), printf('-%d hours', "
+            "CAST(strftime('%H', {col}) AS INT) % 6))"
+        ),
+        TimeGrain.DAY: "DATETIME({col}, 'start of day')",
+        TimeGrain.WEEK: "DATETIME({col}, 'start of day', \
+            -strftime('%w', {col}) || ' days')",
+        TimeGrain.MONTH: "DATETIME({col}, 'start of month')",
+        TimeGrain.QUARTER: (
+            "DATETIME({col}, 'start of month', "
+            "printf('-%d month', (strftime('%m', {col}) - 1) % 3))"
+        ),
+        TimeGrain.YEAR: "DATETIME({col}, 'start of year')",
+        TimeGrain.WEEK_ENDING_SATURDAY: "DATETIME({col}, 'start of day', 'weekday 6')",
+        TimeGrain.WEEK_ENDING_SUNDAY: "DATETIME({col}, 'start of day', 'weekday 0')",
+        TimeGrain.WEEK_STARTING_SUNDAY: "DATETIME({col}, 'start of day', \
+            -strftime('%w', {col}) || ' days')",
+        TimeGrain.WEEK_STARTING_MONDAY: "DATETIME({col}, 'start of day', '-' || \
+            ((strftime('%w', {col}) + 6) % 7) || ' days')",
     }
+    # not sure why these are different
+    _time_grain_expressions.update(
+        {
+            TimeGrain.HALF_HOUR: _time_grain_expressions[TimeGrain.THIRTY_MINUTES],
+            TimeGrain.QUARTER_YEAR: _time_grain_expressions[TimeGrain.QUARTER],
+        }
+    )
 
-    custom_errors: Dict[Pattern[str], Tuple[str, SupersetErrorType, Dict[str, Any]]] = {
+    custom_errors: dict[Pattern[str], tuple[str, SupersetErrorType, dict[str, Any]]] = {
         COLUMN_DOES_NOT_EXIST_REGEX: (
             __('We can\'t seem to resolve the column "%(column_name)s"'),
             SupersetErrorType.COLUMN_DOES_NOT_EXIST_ERROR,
@@ -71,41 +136,184 @@ class SqliteEngineSpec(BaseEngineSpec):
         return "datetime({col}, 'unixepoch')"
 
     @classmethod
-    def get_all_datasource_names(
-        cls, database: "Database", datasource_type: str
-    ) -> List[utils.DatasourceName]:
-        schemas = database.get_all_schema_names(
-            cache=database.schema_cache_enabled,
-            cache_timeout=database.schema_cache_timeout,
-            force=True,
+    def year_to_dttm(cls) -> str:
+        # SQLite's date functions parse a 'YYYY-01-01' string just fine, but won't
+        # accept a bare integer/real year (it's read as a Julian day number instead).
+        # The CASE guard is needed because printf() treats a NULL argument as 0,
+        # which would otherwise turn a missing year into '0000-01-01' rather than
+        # propagating the NULL. The outer datetime() call ensures a full datetime
+        # value comes back even when this expression isn't wrapped by a time-grain
+        # function (e.g. no time grain is applied).
+        return (
+            "datetime(CASE WHEN {col} IS NULL THEN NULL "
+            "ELSE printf('%04d-01-01', CAST({col} AS INTEGER)) END)"
         )
-        schema = schemas[0]
-        if datasource_type == "table":
-            return database.get_all_table_names_in_schema(
-                schema=schema,
-                force=True,
-                cache=database.table_cache_enabled,
-                cache_timeout=database.table_cache_timeout,
-            )
-        if datasource_type == "view":
-            return database.get_all_view_names_in_schema(
-                schema=schema,
-                force=True,
-                cache=database.table_cache_enabled,
-                cache_timeout=database.table_cache_timeout,
-            )
-        raise Exception(f"Unsupported datasource_type: {datasource_type}")
 
     @classmethod
-    def convert_dttm(cls, target_type: str, dttm: datetime) -> Optional[str]:
-        tt = target_type.upper()
-        if tt in (utils.TemporalType.TEXT, utils.TemporalType.DATETIME):
-            return f"""'{dttm.isoformat(sep=" ", timespec="microseconds")}'"""
+    def get_temporal_column_shift_expr(
+        cls,
+        col: ColumnClause,
+        offset_hours: int,
+    ) -> TimestampExpression:
+        """Shift a temporal expression with SQLite's datetime modifier syntax."""
+        modifier = f"{offset_hours:+d} hours"
+        return TimestampExpression(
+            f"DATETIME({{col}}, '{modifier}')",
+            col,
+            type_=col.type,
+        )
+
+    @classmethod
+    def convert_dttm(
+        cls, target_type: str, dttm: datetime, db_extra: dict[str, Any] | None = None
+    ) -> str | None:
+        """
+        Write midnight as a bare date for DATE columns.
+
+        SQLite has no date type, so a DATE column usually holds text such as
+        ``2026-09-20``. ``'2026-09-20 00:00:00'`` sorts after that text, so a time
+        filter on a DATE column would be one day off. Any other time keeps its time
+        part, which sorts between two days, as a comparison of dates should. Values
+        that look like numbers, such as ``20260920`` or epoch seconds, are stored as
+        numbers, and SQLite sorts every number before any text.
+        """
+        sqla_type = cls.get_sqla_column_type(target_type)
+        if isinstance(sqla_type, types.Date) and dttm.time() == time.min:
+            return f"'{dttm.date().isoformat()}'"
+        if isinstance(sqla_type, (types.String, types.Date, types.DateTime)):
+            return f"""'{dttm.isoformat(sep=" ", timespec="seconds")}'"""
         return None
 
     @classmethod
     def get_table_names(
-        cls, database: "Database", inspector: Inspector, schema: Optional[str]
-    ) -> List[str]:
+        cls,
+        database: Database,
+        inspector: Inspector,
+        schema: str | None,
+    ) -> set[str]:
         """Need to disregard the schema for Sqlite"""
-        return sorted(inspector.get_table_names())
+        return set(inspector.get_table_names())
+
+    @classmethod
+    def get_function_names(
+        cls,
+        database: Database,
+    ) -> list[str]:
+        """
+        Return function names.
+        """
+        return [
+            "abs",
+            "acos",
+            "acosh",
+            "asin",
+            "asinh",
+            "atan",
+            "atan2",
+            "atanh",
+            "avg",
+            "ceil",
+            "ceiling",
+            "changes",
+            "char",
+            "coalesce",
+            "cos",
+            "cosh",
+            "count",
+            "cume_dist",
+            "date",
+            "datetime",
+            "degrees",
+            "dense_rank",
+            "exp",
+            "first_value",
+            "floor",
+            "format",
+            "glob",
+            "group_concat",
+            "hex",
+            "ifnull",
+            "iif",
+            "instr",
+            "json",
+            "json_array",
+            "json_array_length",
+            "json_each",
+            "json_error_position",
+            "json_extract",
+            "json_group_array",
+            "json_group_object",
+            "json_insert",
+            "json_object",
+            "json_patch",
+            "json_quote",
+            "json_remove",
+            "json_replace",
+            "json_set",
+            "json_tree",
+            "json_type",
+            "json_valid",
+            "julianday",
+            "lag",
+            "last_insert_rowid",
+            "last_value",
+            "lead",
+            "length",
+            "like",
+            "likelihood",
+            "likely",
+            "ln",
+            "load_extension",
+            "log",
+            "log10",
+            "log2",
+            "lower",
+            "ltrim",
+            "max",
+            "min",
+            "mod",
+            "nth_value",
+            "ntile",
+            "nullif",
+            "percent_rank",
+            "pi",
+            "pow",
+            "power",
+            "printf",
+            "quote",
+            "radians",
+            "random",
+            "randomblob",
+            "rank",
+            "replace",
+            "round",
+            "row_number",
+            "rtrim",
+            "sign",
+            "sin",
+            "sinh",
+            "soundex",
+            "sqlite_compileoption_get",
+            "sqlite_compileoption_used",
+            "sqlite_offset",
+            "sqlite_source_id",
+            "sqlite_version",
+            "sqrt",
+            "strftime",
+            "substr",
+            "substring",
+            "sum",
+            "tan",
+            "tanh",
+            "time",
+            "total_changes",
+            "trim",
+            "trunc",
+            "typeof",
+            "unhex",
+            "unicode",
+            "unixepoch",
+            "unlikely",
+            "upper",
+            "zeroblob",
+        ]

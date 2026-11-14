@@ -16,48 +16,56 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React, { createRef } from 'react';
-import shortid from 'shortid';
-import Alert from 'src/components/Alert';
-import Tabs from 'src/components/Tabs';
-import { t, styled } from '@superset-ui/core';
+import { createRef, useCallback, useMemo } from 'react';
+import { shallowEqual, useSelector } from 'react-redux';
+import { useAppDispatch } from 'src/SqlLab/hooks/useAppDispatch';
+import { nanoid } from 'nanoid';
+import Tabs from '@superset-ui/core/components/Tabs';
+import { t } from '@apache-superset/core/translation';
+import { css, styled, useTheme } from '@apache-superset/core/theme';
 
-import { isFeatureEnabled, FeatureFlag } from 'src/featureFlags';
+import { removeTables, setActiveSouthPaneTab } from 'src/SqlLab/actions/sqlLab';
 
-import Label from 'src/components/Label';
-import { UserWithPermissionsAndRoles } from 'src/types/bootstrapTypes';
+import { Flex, Label } from '@superset-ui/core/components';
+import { Icons } from '@superset-ui/core/components/Icons';
+import { SqlLabRootState } from 'src/SqlLab/types';
+import { ViewLocations } from 'src/SqlLab/contributions';
+import PanelToolbar from 'src/components/PanelToolbar';
+import { useViews } from 'src/core';
+import { resolveView } from 'src/core/views';
+import useQueryEditor from 'src/SqlLab/hooks/useQueryEditor';
+import useLogAction from 'src/logger/useLogAction';
+import { LOG_ACTIONS_SQLLAB_SWITCH_SOUTH_PANE_TAB } from 'src/logger/LogUtils';
 import QueryHistory from '../QueryHistory';
-import ResultSet from '../ResultSet';
 import {
   STATUS_OPTIONS,
   STATE_TYPE_MAP,
-  LOCALSTORAGE_MAX_QUERY_AGE_MS,
+  STATUS_OPTIONS_LOCALIZED,
 } from '../../constants';
-
-const TAB_HEIGHT = 140;
+import Results from './Results';
+import TablePreview from '../TablePreview';
 
 /*
     editorQueries are queries executed by users passed from SqlEditor component
-    dataPrebiewQueries are all queries executed for preview of table data (from SqlEditorLeft)
+    dataPreviewQueries are all queries executed for preview of table data (from SqlEditorLeft)
 */
-interface SouthPanePropTypes {
-  editorQueries: any[];
+export interface SouthPaneProps {
+  queryEditorId: string;
   latestQueryId?: string;
-  dataPreviewQueries: any[];
-  actions: Record<string, Function>;
-  activeSouthPaneTab?: string;
-  height: number;
-  databases: Record<string, any>;
-  offline?: boolean;
   displayLimit: number;
-  user: UserWithPermissionsAndRoles;
   defaultQueryLimit: number;
 }
 
+const TABS_KEYS = {
+  RESULTS: 'Results',
+  HISTORY: 'History',
+};
+
 const StyledPane = styled.div`
   width: 100%;
+  height: 100%;
 
-  .ant-tabs .ant-tabs-content-holder {
+  .ant-tabs .ant-tabs-body-holder {
     overflow: visible;
   }
   .SouthPaneTabs {
@@ -68,141 +76,187 @@ const StyledPane = styled.div`
       overflow-y: auto;
     }
   }
-  .ant-tabs-tabpane {
-    display: flex;
-    flex-direction: column;
+  .ant-tabs-extra-content {
+    margin: 0 ${({ theme }) => theme.sizeUnit * 4}px
+      ${({ theme }) => theme.sizeUnit * 2}px;
+  }
+  .ant-tabs-content {
+    padding-top: ${({ theme }) => theme.sizeUnit * 3}px;
     .scrollable {
       overflow-y: auto;
     }
   }
   .tab-content {
     .alert {
-      margin-top: ${({ theme }) => theme.gridUnit * 2}px;
+      margin-top: ${({ theme }) => theme.sizeUnit * 2}px;
     }
 
     button.fetch {
-      margin-top: ${({ theme }) => theme.gridUnit * 2}px;
+      margin-top: ${({ theme }) => theme.sizeUnit * 2}px;
     }
   }
 `;
 
-export default function SouthPane({
-  editorQueries,
+const SouthPane = ({
+  queryEditorId,
   latestQueryId,
-  dataPreviewQueries,
-  actions,
-  activeSouthPaneTab = 'Results',
-  height,
-  databases,
-  offline = false,
   displayLimit,
-  user,
   defaultQueryLimit,
-}: SouthPanePropTypes) {
-  const innerTabContentHeight = height - TAB_HEIGHT;
+}: SouthPaneProps) => {
+  const { id, tabViewId } = useQueryEditor(queryEditorId, ['tabViewId']);
+  const editorId = tabViewId ?? id;
+  const theme = useTheme();
+  const dispatch = useAppDispatch();
+  const viewItems = useViews(ViewLocations.sqllab.panels) || [];
+  const { offline, tables } = useSelector(
+    ({ sqlLab: { offline, tables } }: SqlLabRootState) => ({
+      offline,
+      tables,
+    }),
+    shallowEqual,
+  );
+  const activeSouthPaneTab =
+    useSelector<SqlLabRootState, string>(
+      state => state.sqlLab.activeSouthPaneTab as string,
+    ) ?? 'Results';
+
+  const pinnedTables = useMemo(
+    () => tables.filter(({ queryEditorId: qeId }) => String(editorId) === qeId),
+    [editorId, tables],
+  );
+  const pinnedTableKeys = useMemo(
+    () =>
+      Object.fromEntries(
+        pinnedTables.map(({ id, dbId, catalog, schema, name }) => [
+          id,
+          [dbId, catalog, schema, name].join(':'),
+        ]),
+      ),
+    [pinnedTables],
+  );
   const southPaneRef = createRef<HTMLDivElement>();
+  const logAction = useLogAction({ sqlEditorId: queryEditorId });
   const switchTab = (id: string) => {
-    actions.setActiveSouthPaneTab(id);
+    dispatch(setActiveSouthPaneTab(id));
+    logAction(LOG_ACTIONS_SQLLAB_SWITCH_SOUTH_PANE_TAB, { tab: id });
   };
-  const renderOfflineStatus = () => (
-    <Label className="m-r-3" type={STATE_TYPE_MAP[STATUS_OPTIONS.offline]}>
-      {STATUS_OPTIONS.offline}
-    </Label>
+  const removeTable = useCallback(
+    (key: string, action: string) => {
+      if (action === 'remove') {
+        const table = pinnedTables.find(
+          ({ dbId, catalog, schema, name }) =>
+            [dbId, catalog, schema, name].join(':') === key,
+        );
+        if (table) {
+          dispatch(removeTables([table]));
+        }
+      }
+    },
+    [dispatch, pinnedTables],
   );
 
-  const renderResults = () => {
-    let latestQuery;
-    if (editorQueries.length > 0) {
-      // get the latest query
-      latestQuery = editorQueries.find(({ id }) => id === latestQueryId);
-    }
-    let results;
-    if (latestQuery) {
-      if (latestQuery?.extra?.errors) {
-        latestQuery.errors = latestQuery.extra.errors;
-      }
-      if (
-        isFeatureEnabled(FeatureFlag.SQLLAB_BACKEND_PERSISTENCE) &&
-        latestQuery.state === 'success' &&
-        !latestQuery.resultsKey &&
-        !latestQuery.results
-      ) {
-        results = (
-          <Alert
-            type="warning"
-            message={t(
-              'No stored results found, you need to re-run your query',
-            )}
-          />
-        );
-        return results;
-      }
-      if (Date.now() - latestQuery.startDttm <= LOCALSTORAGE_MAX_QUERY_AGE_MS) {
-        results = (
-          <ResultSet
-            showControls
-            search
-            query={latestQuery}
-            actions={actions}
-            user={user}
-            height={innerTabContentHeight}
-            database={databases[latestQuery.dbId]}
-            displayLimit={displayLimit}
-            defaultQueryLimit={defaultQueryLimit}
-          />
-        );
-      }
-    } else {
-      results = (
-        <Alert type="info" message={t('Run a query to display results here')} />
-      );
-    }
-    return results;
-  };
+  if (offline) {
+    return (
+      <Label type={STATE_TYPE_MAP[STATUS_OPTIONS.offline]}>
+        {STATUS_OPTIONS_LOCALIZED.offline}
+      </Label>
+    );
+  }
 
-  const renderDataPreviewTabs = () =>
-    dataPreviewQueries.map(query => (
-      <Tabs.TabPane
-        tab={t('Preview: `%s`', decodeURIComponent(query.tableName))}
-        key={query.id}
-      >
-        <ResultSet
-          query={query}
-          visualize={false}
-          csv={false}
-          actions={actions}
-          cache
-          user={user}
-          height={innerTabContentHeight}
+  const tabItems = [
+    {
+      key: TABS_KEYS.RESULTS,
+      label: t('Results'),
+      children: (
+        <Results
+          latestQueryId={latestQueryId}
           displayLimit={displayLimit}
           defaultQueryLimit={defaultQueryLimit}
         />
-      </Tabs.TabPane>
-    ));
-  return offline ? (
-    renderOfflineStatus()
-  ) : (
-    <StyledPane className="SouthPane" ref={southPaneRef}>
+      ),
+      closable: false,
+    },
+    {
+      key: TABS_KEYS.HISTORY,
+      label: t('Query history'),
+      children: (
+        <QueryHistory
+          queryEditorId={queryEditorId}
+          displayLimit={displayLimit}
+          latestQueryId={latestQueryId}
+        />
+      ),
+      closable: false,
+    },
+    ...pinnedTables.map(({ id, dbId, catalog, schema, name }) => ({
+      key: pinnedTableKeys[id],
+      label: (
+        <>
+          <Icons.InsertRowAboveOutlined
+            iconSize="l"
+            css={css`
+              margin-bottom: ${theme.sizeUnit * 0.5}px;
+              margin-right: ${theme.sizeUnit}px;
+            `}
+          />
+          {`${schema}.${decodeURIComponent(name)}`}
+        </>
+      ),
+      children: (
+        <TablePreview
+          dbId={dbId}
+          catalog={catalog}
+          schema={schema}
+          tableName={name}
+        />
+      ),
+    })),
+    ...viewItems.map(view => ({
+      key: view.id,
+      label: view.name,
+      children: (
+        <div
+          css={css`
+            & > div:first-of-type {
+              padding-bottom: ${theme.sizeUnit * 2}px;
+            }
+          `}
+        >
+          <PanelToolbar viewId={view.id} />
+          {resolveView(view.id)}
+        </div>
+      ),
+      forceRender: true,
+      closable: false,
+    })),
+  ];
+
+  return (
+    <StyledPane data-test="south-pane" className="SouthPane" ref={southPaneRef}>
       <Tabs
-        activeKey={activeSouthPaneTab}
+        tabBarExtraContent={{
+          right: (
+            <Flex
+              css={css`
+                padding: 8px;
+              `}
+            >
+              <PanelToolbar viewId={ViewLocations.sqllab.panels} />
+            </Flex>
+          ),
+        }}
+        type="editable-card"
+        activeKey={pinnedTableKeys[activeSouthPaneTab] || activeSouthPaneTab}
         className="SouthPaneTabs"
         onChange={switchTab}
-        id={shortid.generate()}
-        fullWidth={false}
+        id={nanoid(11)}
         animated={false}
-      >
-        <Tabs.TabPane tab={t('Results')} key="Results">
-          {renderResults()}
-        </Tabs.TabPane>
-        <Tabs.TabPane tab={t('Query history')} key="History">
-          <QueryHistory
-            queries={editorQueries}
-            actions={actions}
-            displayLimit={displayLimit}
-          />
-        </Tabs.TabPane>
-        {renderDataPreviewTabs()}
-      </Tabs>
+        onEdit={removeTable}
+        hideAdd
+        items={tabItems}
+      />
     </StyledPane>
   );
-}
+};
+
+export default SouthPane;

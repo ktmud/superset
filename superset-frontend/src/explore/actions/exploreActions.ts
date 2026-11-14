@@ -17,35 +17,37 @@
  * under the License.
  */
 /* eslint camelcase: 0 */
-import { DatasourceMeta } from '@superset-ui/chart-controls';
-import {
-  t,
-  SupersetClient,
-  DatasourceType,
-  QueryFormData,
-} from '@superset-ui/core';
+import rison from 'rison';
+import { clearDataMask } from 'src/dataMask/actions';
+import { Dataset } from '@superset-ui/chart-controls';
+import { t } from '@apache-superset/core/translation';
+import { SupersetClient, QueryFormData } from '@superset-ui/core';
 import { Dispatch } from 'redux';
 import {
   addDangerToast,
   toastActions,
 } from 'src/components/MessageToasts/actions';
 import { Slice } from 'src/types/Chart';
+import { CompatibilityResult, SaveActionType } from 'src/explore/types';
 
-const FAVESTAR_BASE_URL = '/superset/favstar/slice';
-
-export const SET_DATASOURCE_TYPE = 'SET_DATASOURCE_TYPE';
-export function setDatasourceType(datasourceType: DatasourceType) {
-  return { type: SET_DATASOURCE_TYPE, datasourceType };
+export const RESET_SEMANTIC_SELECTIONS = 'RESET_SEMANTIC_SELECTIONS';
+export function resetSemanticSelections(sliceId?: number) {
+  return (dispatch: Dispatch) => {
+    if (sliceId !== undefined) dispatch(clearDataMask(sliceId));
+    dispatch({ type: RESET_SEMANTIC_SELECTIONS });
+  };
 }
 
-export const SET_DATASOURCE = 'SET_DATASOURCE';
-export function setDatasource(datasource: DatasourceMeta) {
-  return { type: SET_DATASOURCE, datasource };
-}
-
-export const SET_DATASOURCES = 'SET_DATASOURCES';
-export function setDatasources(datasources: DatasourceMeta[]) {
-  return { type: SET_DATASOURCES, datasources };
+export const UPDATE_FORM_DATA_BY_DATASOURCE = 'UPDATE_FORM_DATA_BY_DATASOURCE';
+export function updateFormDataByDatasource(
+  prevDatasource: Dataset,
+  newDatasource: Dataset,
+) {
+  return {
+    type: UPDATE_FORM_DATA_BY_DATASOURCE,
+    prevDatasource,
+    newDatasource,
+  };
 }
 
 export const POST_DATASOURCE_STARTED = 'POST_DATASOURCE_STARTED';
@@ -73,11 +75,9 @@ export const FETCH_FAVE_STAR = 'FETCH_FAVE_STAR';
 export function fetchFaveStar(sliceId: string) {
   return function (dispatch: Dispatch) {
     SupersetClient.get({
-      endpoint: `${FAVESTAR_BASE_URL}/${sliceId}/count/`,
+      endpoint: `/api/v1/chart/favorite_status/?q=${rison.encode([sliceId])}`,
     }).then(({ json }) => {
-      if (json.count > 0) {
-        dispatch(toggleFaveStar(true));
-      }
+      dispatch(toggleFaveStar(!!json?.result?.[0]?.value));
     });
   };
 }
@@ -85,10 +85,14 @@ export function fetchFaveStar(sliceId: string) {
 export const SAVE_FAVE_STAR = 'SAVE_FAVE_STAR';
 export function saveFaveStar(sliceId: string, isStarred: boolean) {
   return function (dispatch: Dispatch) {
-    const urlSuffix = isStarred ? 'unselect' : 'select';
-    SupersetClient.get({
-      endpoint: `${FAVESTAR_BASE_URL}/${sliceId}/${urlSuffix}/`,
-    })
+    const endpoint = `/api/v1/chart/${sliceId}/favorites/`;
+    const apiCall = isStarred
+      ? SupersetClient.delete({
+          endpoint,
+        })
+      : SupersetClient.post({ endpoint });
+
+    apiCall
       .then(() => dispatch(toggleFaveStar(!isStarred)))
       .catch(() => {
         dispatch(
@@ -103,8 +107,23 @@ export function setControlValue(
   controlName: string,
   value: any,
   validationErrors?: any[],
+  options?: {
+    /**
+     * Marks a dispatch that no user gesture produced — effects rewriting
+     * transferred controls, derived values set alongside another control,
+     * and similar. The version-history session log skips these so an
+     * untouched chart never reports unsaved changes the user didn't make.
+     */
+    programmatic?: boolean;
+  },
 ) {
-  return { type: SET_FIELD_VALUE, controlName, value, validationErrors };
+  return {
+    type: SET_FIELD_VALUE,
+    controlName,
+    value,
+    validationErrors,
+    programmatic: options?.programmatic ?? false,
+  };
 }
 
 export const SET_EXPLORE_CONTROLS = 'UPDATE_EXPLORE_CONTROLS';
@@ -112,9 +131,19 @@ export function setExploreControls(formData: QueryFormData) {
   return { type: SET_EXPLORE_CONTROLS, formData };
 }
 
+export const SET_FORM_DATA = 'UPDATE_FORM_DATA';
+export function setFormData(formData: QueryFormData) {
+  return { type: SET_FORM_DATA, formData };
+}
+
 export const UPDATE_CHART_TITLE = 'UPDATE_CHART_TITLE';
 export function updateChartTitle(sliceName: string) {
   return { type: UPDATE_CHART_TITLE, sliceName };
+}
+
+export const SET_SAVE_ACTION = 'SET_SAVE_ACTION';
+export function setSaveAction(saveAction: SaveActionType | null) {
+  return { type: SET_SAVE_ACTION, saveAction };
 }
 
 export const CREATE_NEW_SLICE = 'CREATE_NEW_SLICE';
@@ -140,11 +169,121 @@ export function sliceUpdated(slice: Slice) {
   return { type: SLICE_UPDATED, slice };
 }
 
+export const SET_FORCE_QUERY = 'SET_FORCE_QUERY';
+export function setForceQuery(force: boolean) {
+  return {
+    type: SET_FORCE_QUERY,
+    force,
+  };
+}
+
+export const UPDATE_EXPLORE_CHART_STATE = 'UPDATE_EXPLORE_CHART_STATE';
+export function updateExploreChartState(
+  chartId: number,
+  chartState: Record<string, unknown>,
+) {
+  return {
+    type: UPDATE_EXPLORE_CHART_STATE,
+    chartId,
+    chartState,
+    lastModified: Date.now(),
+  };
+}
+
+export const SET_COMPATIBILITY = 'SET_COMPATIBILITY';
+export function setCompatibility(compatibility: CompatibilityResult) {
+  return { type: SET_COMPATIBILITY, compatibility };
+}
+
+let compatibilityRequestSeq = 0;
+
+/**
+ * Fetch compatible metrics and dimensions for the current selection.
+ *
+ * Only fires for semantic views — SQL datasets always have full compatibility
+ * so we short-circuit to `null` (no filtering) for everything else.
+ *
+ * Covers both real-time selection changes (M3) and saved-chart loading (M4):
+ * call this thunk on mount as well as whenever the metric / dimension
+ * selection changes in Explore.
+ */
+export function fetchCompatibility(
+  datasourceType: string,
+  datasourceId: number,
+  selectedMetrics: string[],
+  selectedDimensions: string[],
+) {
+  return async (dispatch: Dispatch) => {
+    compatibilityRequestSeq += 1;
+    const requestSeq = compatibilityRequestSeq;
+
+    if (datasourceType !== 'semantic_view') {
+      dispatch(setCompatibility({ status: 'idle' }));
+      return;
+    }
+
+    dispatch(setCompatibility({ status: 'loading' }));
+
+    try {
+      const { json } = await SupersetClient.post({
+        endpoint: `/api/v1/datasource/${datasourceType}/${datasourceId}/compatible`,
+        jsonPayload: {
+          selected_metrics: selectedMetrics,
+          selected_dimensions: selectedDimensions,
+        },
+      });
+      if (requestSeq !== compatibilityRequestSeq) {
+        return;
+      }
+      dispatch(
+        setCompatibility({
+          status: 'verified',
+          metrics: json.result.compatible_metrics ?? [],
+          dimensions: json.result.compatible_dimensions ?? [],
+        }),
+      );
+    } catch {
+      // A failed request must stay distinguishable from loading and from a
+      // valid empty result; consumers fall back to no filtering so the user
+      // is never blocked.
+      if (requestSeq !== compatibilityRequestSeq) {
+        return;
+      }
+      dispatch(setCompatibility({ status: 'failed' }));
+    }
+  };
+}
+
+export const SET_STASH_FORM_DATA = 'SET_STASH_FORM_DATA';
+export function setStashFormData(
+  isHidden: boolean,
+  fieldNames: ReadonlyArray<string>,
+) {
+  return {
+    type: SET_STASH_FORM_DATA,
+    isHidden,
+    fieldNames,
+  };
+}
+
+export const START_METADATA_LOADING = 'START_METADATA_LOADING';
+export function startMetaDataLoading() {
+  return { type: START_METADATA_LOADING };
+}
+
+export const STOP_METADATA_LOADING = 'STOP_METADATA_LOADING';
+export function stopMetaDataLoading() {
+  return { type: STOP_METADATA_LOADING };
+}
+
+export const SYNC_DATASOURCE_METADATA = 'SYNC_DATASOURCE_METADATA';
+export function syncDatasourceMetadata(datasource: Dataset) {
+  return { type: SYNC_DATASOURCE_METADATA, datasource };
+}
+
 export const exploreActions = {
+  resetSemanticSelections,
   ...toastActions,
-  setDatasourceType,
-  setDatasource,
-  setDatasources,
   fetchDatasourcesStarted,
   fetchDatasourcesSucceeded,
   toggleFaveStar,
@@ -152,9 +291,13 @@ export const exploreActions = {
   saveFaveStar,
   setControlValue,
   setExploreControls,
+  setStashFormData,
   updateChartTitle,
   createNewSlice,
   sliceUpdated,
+  setForceQuery,
+  syncDatasourceMetadata,
+  fetchCompatibility,
 };
 
 export type ExploreActions = typeof exploreActions;

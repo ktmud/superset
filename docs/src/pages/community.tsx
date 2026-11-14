@@ -16,128 +16,247 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React from 'react';
-import { css } from '@emotion/core';
-import { Card, List } from 'antd';
-import { GithubOutlined } from '@ant-design/icons';
-import SEO from '../components/seo';
-import Layout from '../components/layout';
-import { pmc } from '../resources/data';
+import { useState } from 'react';
+import styled from '@emotion/styled';
+import Layout from '@theme/Layout';
+import { mq } from '../utils';
+import SectionHeader from '../components/SectionHeader';
+import BlurredSection from '../components/BlurredSection';
 
-const links = [
-  [
-    'https://join.slack.com/t/apache-superset/shared_invite/zt-uxbh5g36-AISUtHbzOXcu0BIj7kgUaw',
-    'Slack',
-    'interact with other Superset users and community members',
-  ],
-  [
-    'https://github.com/apache/superset',
-    'GitHub',
-    'create tickets to report issues, report bugs, and suggest new features',
-  ],
-  [
-    'https://lists.apache.org/list.html?dev@superset.apache.org',
-    'dev@ Mailing List',
-    'participate in conversations with committers and contributors',
-  ],
-  [
-    'https://stackoverflow.com/questions/tagged/superset+apache-superset',
-    'Stack Overflow',
-    'our growing knowledge base',
-  ],
-  [
-    'https://www.meetup.com/Global-Apache-Superset-Community-Meetup/',
-    'Superset Meetup Group',
-    'join our monthly virtual meetups and register for any upcoming events',
-  ],
-  [
-    'https://github.com/apache/superset/blob/master/RESOURCES/INTHEWILD.md',
-    'Organizations',
-    'a list of some of the organizations using Superset in production',
-  ],
-  [
-    'https://github.com/apache-superset/awesome-apache-superset',
-    'Contributors Guide',
-    'Interested in contributing? Learn how to contribute and best practices',
-  ],
+const communityLinks = [
+  {
+    url: 'http://bit.ly/join-superset-slack',
+    title: 'Slack',
+    description: 'Interact with other Superset users and community members.',
+    image: 'slack-symbol.jpg',
+    ariaLabel:
+      'Interact with other Superset users and community members on Slack',
+  },
+  {
+    url: 'https://github.com/apache/superset',
+    title: 'GitHub',
+    description:
+      'Create tickets to report issues, report bugs, and suggest new features.',
+    image: 'github-symbol.jpg',
+    ariaLabel:
+      'Create tickets to report issues, report bugs, and suggest new features on Superset GitHub repo',
+  },
+  {
+    url: 'https://lists.apache.org/list.html?dev@superset.apache.org',
+    title: 'dev@ Mailing List',
+    description:
+      'Participate in conversations with committers and contributors.',
+    image: 'email-symbol.png',
+    ariaLabel:
+      'Participate in conversations with committers and contributors on Superset mailing list',
+  },
+  {
+    url: 'https://stackoverflow.com/questions/tagged/apache-superset',
+    title: 'Stack Overflow',
+    description: 'Our growing knowledge base.',
+    image: 'stackoverflow-symbol.jpg',
+    ariaLabel: 'See Superset issues on Stack Overflow',
+  },
+  {
+    url: 'https://www.meetup.com/Global-Apache-Superset-Community-Meetup/',
+    title: 'Superset Meetup Group',
+    description:
+      'Join our monthly virtual meetups and register for any upcoming events.',
+    image: 'coffee-symbol.png',
+    ariaLabel:
+      'Join our monthly virtual meetups and register for any upcoming events on Meetup',
+  },
+  {
+    url: 'https://superset.apache.org/inTheWild/',
+    title: 'Organizations',
+    description:
+      'A list of some of the organizations using Superset in production.',
+    image: 'note-symbol.png',
+    ariaLabel: 'See a list of the organizations using Superset in production',
+  },
+  {
+    url: 'https://github.com/apache-superset/awesome-apache-superset',
+    title: 'Contributors Guide',
+    description:
+      'Interested in contributing? Learn how to contribute and best practices.',
+    image: 'writing-symbol.png',
+    ariaLabel: 'Learn how to contribute and best practices on Superset GitHub',
+  },
 ];
 
-const communityContainer = css`
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: space-around;
-  margin: 0 auto;
-  overflow: auto;
-  .communityCard {
-    font-size: 12px;
-    overflow: hidden;
-    margin: 10px 10px;
-    .ant-card-meta-title {
-      text-overflow: clip;
-      white-space: normal;
+const StyledJoinCommunity = styled('section')`
+  background-color: var(--ifm-background-color);
+  border-bottom: 1px solid var(--ifm-border-color);
+  .list {
+    max-width: 540px;
+    margin: 0 auto;
+    padding: 40px 20px 20px 35px;
+    list-style: none;
+  }
+  .item {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 0;
+    border: 0;
+  }
+  .icon {
+    width: 40px;
+    margin-top: 5px;
+    ${mq[1]} {
+      width: 40px;
+      margin-top: 0;
     }
-    .ant-card-body {
-      padding: 8px;
-      display:inline-block;
-      white-space: nowrap;
+  }
+  .title {
+    font-size: 20px;
+    line-height: 36px;
+    font-weight: 700;
+    color: var(--ifm-font-base-color);
+    ${mq[1]} {
+      font-size: 23px;
+      line-height: 26px;
+    }
+  }
+  .description {
+    font-size: 14px;
+    line-height: 20px;
+    color: var(--ifm-font-base-color);
+    margin-top: -8px;
+    margin-bottom: 23px;
+    ${mq[1]} {
+      font-size: 17px;
+      line-height: 22px;
+      color: var(--ifm-primary-text);
+      margin-bottom: 35px;
+      margin-top: 0;
     }
   }
 `;
 
-const getInvolvedContainer = css`
-  margin-bottom: 25px;
+const StyledCalendarIframe = styled('iframe')`
+  display: block;
+  margin: 20px auto 30px;
+  max-width: 800px;
+  width: 100%;
+  height: 600px;
+  border: 0;
+  ${mq[1]} {
+    width: calc(100% - 40px);
+  }
+`;
+
+const StyledLink = styled('a')`
+  display: inline-flex;
+  align-items: center;
+  font-size: 20px;
+  font-weight: bold;
+  line-height: 1.4;
+  margin-top: 12px;
+  ${mq[1]} {
+    font-size: 18px;
+  }
+  img {
+    width: 24px;
+    height: 24px;
+    margin-right: 12px;
+    ${mq[1]} {
+      display: none;
+    }
+  }
+`;
+
+const FinePrint = styled('div')`
+  font-size: 14px;
+  color: var(--ifm-secondary-text);
 `;
 
 const Community = () => {
-  const pmcList = pmc.map((e) => {
-    const name = e.name.indexOf(' ');
-    return (
-      <a href={e.github} target="_blank" rel="noreferrer" key={name}>
-        <Card
-          className="communityCard"
-          hoverable
-          style={{ width: '150px' }}
-          size="small"
-          cover={<img alt="example" src={e.image} />}
-        >
-          <GithubOutlined style={{ paddingRight: 3, paddingTop: 3 }} />
-          {e.name}
-        </Card>
-      </a>
-    );
-  });
+  const [showCalendar, setShowCalendar] = useState(false); // State to control calendar visibility
+
+  const toggleCalendar = () => {
+    setShowCalendar(!showCalendar); // Toggle calendar visibility
+  };
+
   return (
-    <Layout>
-      <div className="contentPage">
-        <SEO title="Community" />
-        <section>
-          <h1 className="title">Community</h1>
-          Get involved in our welcoming, fast growing community!
-        </section>
-        <section className="joinCommunity">
-          <div css={getInvolvedContainer}>
-            <h2>Get involved!</h2>
-            <List
-              size="small"
-              bordered
-              dataSource={links}
-              renderItem={([href, link, post]) => (
-                <List.Item>
-                  <a href={href}>{link}</a>
-                  {' '}
-                  -
-                  {' '}
-                  {post}
-                </List.Item>
-              )}
+    <Layout
+      title="Community"
+      description="Community website for Apache Superset™, a data visualization and data exploration platform"
+    >
+      <main>
+        <BlurredSection>
+          <SectionHeader
+            level="h1"
+            title="Community"
+            subtitle="Get involved in our welcoming, fast growing community!"
+          />
+        </BlurredSection>
+        <StyledJoinCommunity>
+          <ul className="list">
+            {communityLinks.map(
+              ({ url, title, description, image, ariaLabel }) => (
+                <li className="item" key={title}>
+                  <a
+                    className="avatar"
+                    href={url}
+                    target="_blank"
+                    rel="noreferrer"
+                    aria-label={ariaLabel}
+                  >
+                    <img className="icon" src={`/img/community/${image}`} />
+                  </a>
+                  <div>
+                    <a href={url} target="_blank" rel="noreferrer">
+                      <p className="title" style={{ marginBottom: 0 }}>
+                        {title}
+                      </p>
+                    </a>
+                    <p className="description">{description}</p>
+                  </div>
+                </li>
+              ),
+            )}
+          </ul>
+        </StyledJoinCommunity>
+        <BlurredSection id="superset-community-calendar">
+          <SectionHeader
+            level="h2"
+            title="Superset Community Calendar"
+            subtitle={
+              <>
+                Join us for live demos, meetups, discussions, and more!
+                <br />
+                <StyledLink
+                  href="https://calendar.google.com/calendar/u/0/r?cid=superset.committers@gmail.com"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  <img src="/img/calendar-icon.svg" alt="calendar-icon" />
+                  Subscribe to the Superset Community Calendar
+                </StyledLink>
+                <br />
+                <StyledLink onClick={toggleCalendar}>
+                  <img src="/img/calendar-icon.svg" alt="calendar-icon" />
+                  {showCalendar ? 'Hide Calendar' : 'Display Calendar*'}
+                </StyledLink>
+                {!showCalendar && (
+                  <FinePrint>
+                    <sup>*</sup>Clicking on this link will load and send data
+                    from and to Google.
+                  </FinePrint>
+                )}
+              </>
+            }
+          />
+          {showCalendar && (
+            <StyledCalendarIframe
+              src="https://calendar.google.com/calendar/embed?src=superset.committers%40gmail.com&ctz=America%2FLos_Angeles"
+              frameBorder="0"
+              scrolling="no"
             />
-          </div>
-        </section>
-        <section className="ppmc">
-          <h2>Apache Committers</h2>
-          <div css={communityContainer}>{pmcList}</div>
-        </section>
-      </div>
+          )}
+        </BlurredSection>
+      </main>
     </Layout>
   );
 };

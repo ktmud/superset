@@ -16,18 +16,48 @@
  * under the License.
  */
 
-/* eslint-disable global-require */
-const loadModule = () => {
-  let module;
+export interface SupersetTextConfig {
+  DB_IMAGES?: Record<string, string>;
+  DB_CONNECTION_ALERTS?: {
+    DEFAULT?: {
+      message?: string;
+      description?: string;
+    };
+    ADD_DATABASE?: {
+      message?: string;
+      description?: string;
+      contact_link?: string;
+      contact_description_link?: string;
+    };
+    REGIONAL_IPS?: Record<string, string>;
+    [key: string]: unknown;
+  };
+  DB_CONNECTION_DOC_LINKS?: Record<string, string> & {
+    default?: string;
+    support?: string;
+  };
+  DB_MODAL_SQLALCHEMY_FORM?: {
+    SQLALCHEMY_DOCS_URL?: string;
+    SQLALCHEMY_DISPLAY_TEXT?: string;
+  };
+  THEME_MODAL?: {
+    THEME_EDITOR_URL?: string;
+    DOCUMENTATION_URL?: string;
+  };
+  ERRORS?: Record<string, string>;
+  [key: string]: unknown;
+}
+
+const loadModule = (): SupersetTextConfig => {
   try {
-    // @ts-ignore
-    module = require('../../../superset_text'); // eslint-disable-line import/no-unresolved
+    // eslint-disable-next-line @typescript-eslint/no-var-requires, import/no-dynamic-require
+    const config = require('../../../superset_text.yml') as SupersetTextConfig;
+    return config || {};
   } catch (e) {
-    module = {};
+    return {};
   }
-  return module;
 };
 
-const supersetText = loadModule();
+const supersetText: SupersetTextConfig = loadModule();
 
 export default supersetText;

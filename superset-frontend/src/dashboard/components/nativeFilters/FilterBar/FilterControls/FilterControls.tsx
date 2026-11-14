@@ -16,147 +16,737 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React, { FC, useCallback, useMemo, useState } from 'react';
-import { css } from '@emotion/react';
-import { DataMask, styled, t } from '@superset-ui/core';
+import {
+  memo,
+  Fragment,
+  FC,
+  useEffect,
+  useCallback,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import { t } from '@apache-superset/core/translation';
+import {
+  DataMask,
+  DataMaskStateWithId,
+  Filter,
+  Divider,
+  isNativeFilterWithDataMask,
+  NativeFilterTarget,
+  ChartCustomization,
+  isChartCustomizationDivider,
+  ChartCustomizationDivider,
+} from '@superset-ui/core';
+import {
+  css,
+  SupersetTheme,
+  useTheme,
+  styled,
+} from '@apache-superset/core/theme';
 import {
   createHtmlPortalNode,
   InPortal,
   OutPortal,
 } from 'react-reverse-portal';
-import { Collapse } from 'src/common/components';
-import { DataMaskStateWithId } from 'src/dataMask/types';
+import { useSelector, useDispatch } from 'react-redux';
 import {
   useDashboardHasTabs,
   useSelectFiltersInScope,
+  useSelectCustomizationsInScope,
 } from 'src/dashboard/components/nativeFilters/state';
-import { Filter } from 'src/dashboard/components/nativeFilters/types';
-import CascadePopover from '../CascadeFilters/CascadePopover';
-import { useFilters } from '../state';
-import { buildCascadeFiltersTree } from './utils';
+import { FilterBarOrientation, RootState } from 'src/dashboard/types';
+import {
+  DropdownContainer,
+  type DropdownItem,
+  type DropdownRef as DropdownContainerRef,
+  Typography,
+} from '@superset-ui/core/components';
+import { Icons } from '@superset-ui/core/components/Icons';
+import { useChartIds } from 'src/dashboard/util/charts/useChartIds';
+import { useChartLayoutItems } from 'src/dashboard/util/useChartLayoutItems';
+import { setPendingChartCustomization } from 'src/dashboard/actions/chartCustomizationActions';
+import { getInitialDataMask } from 'src/dataMask/reducer';
+import { FiltersOutOfScopeCollapsible } from '../FiltersOutOfScopeCollapsible';
+import { CustomizationsOutOfScopeCollapsible } from '../CustomizationsOutOfScopeCollapsible';
+import { useFilterControlFactory } from '../useFilterControlFactory';
+import { FiltersDropdownContent } from '../FiltersDropdownContent';
+import crossFiltersSelector from '../CrossFilters/selectors';
+import { CrossFilterIndicator } from '../../selectors';
+import CrossFilter from '../CrossFilters/CrossFilter';
+import { useFilterOutlined } from '../useFilterOutlined';
+import { useChartsVerboseMaps } from '../utils';
+import FilterControl from './FilterControl';
+import FilterDivider from './FilterDivider';
 
-const Wrapper = styled.div`
-  padding: ${({ theme }) => theme.gridUnit * 4}px;
+function addDataMaskToCustomization(
+  customization: ChartCustomization,
+  dataMaskSelected: DataMaskStateWithId,
+): ChartCustomization & { dataMask: DataMask } {
+  const dataMask =
+    dataMaskSelected[customization.id] ?? getInitialDataMask(customization.id);
+  return { ...customization, dataMask };
+}
+
+type FilterControlsProps = {
+  dataMaskSelected: DataMaskStateWithId;
+  onFilterSelectionChange: (filter: Filter, dataMask: DataMask) => void;
+  onPendingCustomizationDataMaskChange: (
+    customizationId: string,
+    dataMask: DataMask,
+  ) => void;
+  chartCustomizationValues: (ChartCustomization | ChartCustomizationDivider)[];
+  clearAllTriggers?: Record<string, boolean>;
+  onClearAllComplete?: (filterId: string) => void;
+  hideHeader?: boolean;
+};
+
+const SectionHeader = styled.button`
+  appearance: none;
+  border: none;
+  background: none;
+  font: inherit;
+  text-align: left;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: ${({ theme }) => theme.sizeUnit * 2}px 0;
+  cursor: pointer;
+  user-select: none;
+
   &:hover {
-    cursor: pointer;
+    background: ${({ theme }) => theme.colorBgTextHover};
+    margin: 0 -${({ theme }) => theme.sizeUnit * 2}px;
+    padding: ${({ theme }) => theme.sizeUnit * 2}px;
+    border-radius: ${({ theme }) => theme.borderRadius}px;
   }
 `;
 
-type FilterControlsProps = {
-  directPathToChild?: string[];
-  dataMaskSelected: DataMaskStateWithId;
-  onFilterSelectionChange: (filter: Filter, dataMask: DataMask) => void;
-};
+const { Title } = Typography;
+
+const SectionContent = styled.div`
+  padding: ${({ theme }) => theme.sizeUnit * 2}px 0;
+`;
+
+const StyledDivider = styled.div`
+  height: 1px;
+  background: ${({ theme }) => theme.colorSplit};
+  margin: ${({ theme }) => theme.sizeUnit * 2}px 0;
+`;
+
+const StyledIcon = styled(Icons.UpOutlined)<{ isOpen: boolean }>`
+  transform: ${({ isOpen }) => (isOpen ? 'rotate(0deg)' : 'rotate(180deg)')};
+  transition: transform 0.2s ease;
+  color: ${({ theme }) => theme.colorTextSecondary};
+`;
+
+const ChartCustomizationContent = styled.div`
+  display: flex;
+  flex-direction: column;
+  gap: ${({ theme }) => theme.sizeUnit * 2}px;
+`;
 
 const FilterControls: FC<FilterControlsProps> = ({
-  directPathToChild,
   dataMaskSelected,
   onFilterSelectionChange,
+  onPendingCustomizationDataMaskChange,
+  chartCustomizationValues,
+  clearAllTriggers,
+  onClearAllComplete,
+  hideHeader = false,
 }) => {
-  const [visiblePopoverId, setVisiblePopoverId] = useState<string | null>(null);
-  const filters = useFilters();
-  const filterValues = useMemo(() => Object.values<Filter>(filters), [filters]);
-  const portalNodes = useMemo(() => {
-    const nodes = new Array(filterValues.length);
-    for (let i = 0; i < filterValues.length; i += 1) {
-      nodes[i] = createHtmlPortalNode();
-    }
-    return nodes;
-  }, [filterValues.length]);
-
-  const cascadeFilters = useMemo(() => {
-    const filtersWithValue = filterValues.map(filter => ({
-      ...filter,
-      dataMask: dataMaskSelected[filter.id],
-    }));
-    return buildCascadeFiltersTree(filtersWithValue);
-  }, [filterValues, dataMaskSelected]);
-  const cascadeFilterIds = new Set(cascadeFilters.map(item => item.id));
-
-  const [filtersInScope, filtersOutOfScope] = useSelectFiltersInScope(
-    cascadeFilters,
+  const theme = useTheme();
+  const dispatch = useDispatch();
+  const filterBarOrientation = useSelector<RootState, FilterBarOrientation>(
+    ({ dashboardInfo }) => dashboardInfo.filterBarOrientation,
   );
-  const dashboardHasTabs = useDashboardHasTabs();
-  const showCollapsePanel = dashboardHasTabs && cascadeFilters.length > 0;
 
-  const cascadePopoverFactory = useCallback(
-    index => (
-      <CascadePopover
-        data-test="cascade-filters-control"
-        key={cascadeFilters[index].id}
-        dataMaskSelected={dataMaskSelected}
-        visible={visiblePopoverId === cascadeFilters[index].id}
-        onVisibleChange={visible =>
-          setVisiblePopoverId(visible ? cascadeFilters[index].id : null)
-        }
-        filter={cascadeFilters[index]}
-        onFilterSelectionChange={onFilterSelectionChange}
-        directPathToChild={directPathToChild}
-        inView={false}
-      />
+  const { outlinedFilterId, lastUpdated } = useFilterOutlined();
+
+  const [overflowedIds, setOverflowedIds] = useState<string[]>([]);
+  const popoverRef = useRef<DropdownContainerRef>(null);
+
+  const dataMask = useSelector<RootState, DataMaskStateWithId>(
+    state => state.dataMask,
+  );
+  const chartIds = useChartIds();
+  const chartLayoutItems = useChartLayoutItems();
+  const verboseMaps = useChartsVerboseMaps();
+
+  const selectedCrossFilters = useMemo(
+    () =>
+      crossFiltersSelector({
+        dataMask,
+        chartIds,
+        chartLayoutItems,
+        verboseMaps,
+      }),
+    [chartIds, chartLayoutItems, dataMask, verboseMaps],
+  );
+  const { filterControlFactory, filtersWithValues } = useFilterControlFactory(
+    dataMaskSelected,
+    onFilterSelectionChange,
+    clearAllTriggers,
+    onClearAllComplete,
+  );
+  const portalNodes = useMemo(
+    () =>
+      Array.from({ length: filtersWithValues.length }, () =>
+        createHtmlPortalNode(),
+      ),
+    [filtersWithValues.length],
+  );
+
+  const filterIds = new Set(filtersWithValues.map(item => item.id));
+
+  const [filtersInScope, filtersOutOfScope] =
+    useSelectFiltersInScope(filtersWithValues);
+
+  const filteredChartCustomizationValues = useMemo(
+    () => chartCustomizationValues.filter(item => !item.removed),
+    [chartCustomizationValues],
+  );
+
+  const [customizationsInScope, customizationsOutOfScope] =
+    useSelectCustomizationsInScope(filteredChartCustomizationValues);
+
+  const hasRequiredFirst = useMemo(
+    () => filtersWithValues.some(filter => filter.requiredFirst),
+    [filtersWithValues],
+  );
+
+  const dashboardHasTabs = useDashboardHasTabs();
+  const showCollapsePanel = dashboardHasTabs && filtersWithValues.length > 0;
+  const showCustomizationCollapsePanel =
+    dashboardHasTabs && filteredChartCustomizationValues.length > 0;
+
+  const [sectionsOpen, setSectionsOpen] = useState({
+    filters: true,
+    chartCustomization: true,
+  });
+
+  const showFiltersOutOfScope =
+    showCollapsePanel &&
+    (hideHeader || sectionsOpen.filters) &&
+    filtersOutOfScope.length > 0;
+
+  const toggleSection = useCallback((section: keyof typeof sectionsOpen) => {
+    setSectionsOpen(prev => ({
+      ...prev,
+      [section]: !prev[section],
+    }));
+  }, []);
+
+  const handleChartCustomizationChange = useCallback(
+    (customizationItem: ChartCustomization, dataMask: DataMask) => {
+      const columnValue = dataMask.ownState?.column;
+      const existingTarget = customizationItem.targets?.[0] || {};
+
+      dispatch(
+        setPendingChartCustomization({
+          ...customizationItem,
+          targets: [
+            {
+              ...existingTarget,
+              ...(columnValue && {
+                column: {
+                  ...existingTarget.column,
+                  name: columnValue,
+                },
+              }),
+            },
+          ] as [Partial<NativeFilterTarget>],
+        }),
+      );
+
+      onPendingCustomizationDataMaskChange(customizationItem.id, dataMask);
+    },
+    [dispatch, onPendingCustomizationDataMaskChange],
+  );
+
+  const renderer = useCallback(
+    ({ id }: Filter | Divider, index: number | undefined) => {
+      const filterIndex = filtersWithValues.findIndex(f => f.id === id);
+      const key = index ?? id;
+      return (
+        // Empty text node is to ensure there's always an element preceding
+        // the OutPortal, otherwise react-reverse-portal crashes
+        <Fragment key={key}>
+          {'' /* eslint-disable-line react/jsx-curly-brace-presence */}
+          <OutPortal node={portalNodes[filterIndex]} inView />
+        </Fragment>
+      );
+    },
+    [filtersWithValues, portalNodes],
+  );
+
+  const customizationRenderer = useCallback(
+    (item: ChartCustomization | ChartCustomizationDivider, _index: number) => {
+      if (isChartCustomizationDivider(item)) {
+        return (
+          <FilterDivider
+            key={item.id}
+            title={item.title}
+            description={item.description}
+            orientation={FilterBarOrientation.Vertical}
+          />
+        );
+      }
+      const filterWithDataMask = addDataMaskToCustomization(
+        item,
+        dataMaskSelected,
+      );
+      return (
+        <FilterControl
+          key={item.id}
+          filter={filterWithDataMask}
+          dataMaskSelected={dataMaskSelected}
+          onFilterSelectionChange={(_, dataMask) =>
+            handleChartCustomizationChange(item, dataMask)
+          }
+          orientation={FilterBarOrientation.Vertical}
+          overflow={false}
+        />
+      );
+    },
+    [dataMaskSelected, handleChartCustomizationChange],
+  );
+
+  const renderVerticalContent = useCallback(
+    () => (
+      <>
+        {filtersInScope.length > 0 && (
+          <div>
+            {!hideHeader && (
+              <SectionHeader
+                type="button"
+                aria-expanded={sectionsOpen.filters}
+                onClick={() => toggleSection('filters')}
+              >
+                <Title
+                  level={5}
+                  style={{
+                    margin: 0,
+                    fontSize: theme.fontSize,
+                    fontWeight: theme.fontWeightNormal,
+                    color: theme.colorText,
+                    lineHeight: 1.3,
+                  }}
+                >
+                  {t('Filters')}
+                </Title>
+                <StyledIcon iconSize="m" isOpen={sectionsOpen.filters} />
+              </SectionHeader>
+            )}
+            {(hideHeader || sectionsOpen.filters) && (
+              <SectionContent>{filtersInScope.map(renderer)}</SectionContent>
+            )}
+            {(hideHeader || sectionsOpen.filters) && <StyledDivider />}
+          </div>
+        )}
+
+        {showFiltersOutOfScope && (
+          <FiltersOutOfScopeCollapsible
+            filtersOutOfScope={filtersOutOfScope}
+            renderer={renderer}
+            forceRender={hasRequiredFirst}
+          />
+        )}
+
+        {customizationsInScope.length > 0 && (
+          <div>
+            {!hideHeader && (
+              <SectionHeader
+                type="button"
+                aria-expanded={sectionsOpen.chartCustomization}
+                onClick={() => toggleSection('chartCustomization')}
+              >
+                <Title
+                  level={5}
+                  style={{
+                    margin: 0,
+                    fontSize: theme.fontSize,
+                    fontWeight: theme.fontWeightNormal,
+                    color: theme.colorText,
+                    lineHeight: 1.3,
+                  }}
+                >
+                  {t('Display controls')}
+                </Title>
+                <StyledIcon
+                  iconSize="m"
+                  isOpen={sectionsOpen.chartCustomization}
+                />
+              </SectionHeader>
+            )}
+            {(hideHeader || sectionsOpen.chartCustomization) && (
+              <SectionContent>
+                <ChartCustomizationContent>
+                  {customizationsInScope.map((item, index) =>
+                    customizationRenderer(item, index),
+                  )}
+                </ChartCustomizationContent>
+              </SectionContent>
+            )}
+            {(hideHeader || sectionsOpen.chartCustomization) && (
+              <StyledDivider />
+            )}
+          </div>
+        )}
+
+        {showCustomizationCollapsePanel &&
+          (hideHeader || sectionsOpen.chartCustomization) && (
+            <CustomizationsOutOfScopeCollapsible
+              customizationsOutOfScope={customizationsOutOfScope}
+              renderer={customizationRenderer}
+              forceRender={false}
+            />
+          )}
+      </>
     ),
     [
-      cascadeFilters,
-      JSON.stringify(dataMaskSelected),
-      directPathToChild,
-      onFilterSelectionChange,
-      visiblePopoverId,
+      filtersInScope,
+      renderer,
+      showCollapsePanel,
+      filtersOutOfScope,
+      hasRequiredFirst,
+      customizationsInScope,
+      customizationsOutOfScope,
+      showCustomizationCollapsePanel,
+      customizationRenderer,
+      sectionsOpen,
+      toggleSection,
+      theme,
+      hideHeader,
     ],
   );
-  return (
-    <Wrapper>
-      {portalNodes
-        .filter((node, index) => cascadeFilterIds.has(filterValues[index].id))
-        .map((node, index) => (
-          <InPortal node={node}>{cascadePopoverFactory(index)}</InPortal>
-        ))}
-      {filtersInScope.map(filter => {
-        const index = filterValues.findIndex(f => f.id === filter.id);
-        return <OutPortal node={portalNodes[index]} inView />;
-      })}
-      {showCollapsePanel && (
-        <Collapse
-          ghost
-          bordered
-          expandIconPosition="right"
-          collapsible={filtersOutOfScope.length === 0 ? 'disabled' : undefined}
-          css={theme => css`
-            &.ant-collapse {
-              margin-top: ${filtersInScope.length > 0
-                ? theme.gridUnit * 6
-                : 0}px;
-              & > .ant-collapse-item {
-                & > .ant-collapse-header {
-                  padding-left: 0;
-                  padding-bottom: ${theme.gridUnit * 2}px;
 
-                  & > .ant-collapse-arrow {
-                    right: ${theme.gridUnit}px;
-                  }
-                }
+  const overflowedFiltersInScope = useMemo(
+    () => filtersInScope.filter(({ id }) => overflowedIds?.includes(id)),
+    [filtersInScope, overflowedIds],
+  );
 
-                & .ant-collapse-content-box {
-                  padding: ${theme.gridUnit * 4}px 0 0;
-                }
-              }
-            }
+  const overflowedCrossFilters = useMemo(
+    () =>
+      selectedCrossFilters.filter(({ emitterId, name }) =>
+        overflowedIds?.includes(`${name}${emitterId}`),
+      ),
+    [overflowedIds, selectedCrossFilters],
+  );
+
+  const activeOverflowedFiltersInScope = useMemo(() => {
+    const activeOverflowedFilters = overflowedFiltersInScope.filter(filter =>
+      isNativeFilterWithDataMask(filter),
+    );
+    return [...activeOverflowedFilters, ...overflowedCrossFilters];
+  }, [overflowedCrossFilters, overflowedFiltersInScope]);
+
+  const overflowedCustomizationsInScope = useMemo(
+    () =>
+      customizationsInScope.filter(({ id }) =>
+        overflowedIds?.includes(`chart-customization-${id}`),
+      ),
+    [customizationsInScope, overflowedIds],
+  );
+
+  const rendererCrossFilter = useCallback(
+    (
+      crossFilter: CrossFilterIndicator,
+      orientation: FilterBarOrientation,
+      last: CrossFilterIndicator | undefined,
+    ) => (
+      <CrossFilter
+        filter={crossFilter}
+        orientation={orientation}
+        last={
+          filtersInScope.length > 0 &&
+          !!last &&
+          `${last.name}${last.emitterId}` ===
+            `${crossFilter.name}${crossFilter.emitterId}`
+        }
+      />
+    ),
+    [filtersInScope.length],
+  );
+
+  const items = useMemo(() => {
+    const crossFilters = selectedCrossFilters.map(c => ({
+      // a combination of filter name and chart id to account
+      // for multiple cross filters from the same chart in the future
+      id: `${c.name}${c.emitterId}`,
+      element: rendererCrossFilter(
+        c,
+        FilterBarOrientation.Horizontal,
+        selectedCrossFilters.at(-1),
+      ),
+    }));
+    const nativeFiltersInScope = filtersInScope.map((filter, index) => ({
+      id: filter.id,
+      element: (
+        <div
+          className="filter-item-wrapper"
+          css={css`
+            flex-shrink: 0;
           `}
         >
-          <Collapse.Panel
-            header={`${t('Filters out of scope')} (${
-              filtersOutOfScope.length
-            })`}
-            key="1"
+          {renderer(filter, index)}
+        </div>
+      ),
+    }));
+    const dividerItems = [];
+    if (
+      (crossFilters.length > 0 || nativeFiltersInScope.length > 0) &&
+      chartCustomizationValues.length > 0
+    ) {
+      dividerItems.push({
+        id: 'chart-customization-divider',
+        element: (
+          <div
+            css={css`
+              width: 1px;
+              height: 22px;
+              background: ${theme.colorBorder};
+              margin-left: ${theme.sizeUnit * 4}px;
+              margin-right: ${theme.sizeUnit}px;
+              flex-shrink: 0;
+            `}
+          />
+        ),
+      });
+    }
+
+    const chartCustomizations = customizationsInScope.map(item => {
+      if (isChartCustomizationDivider(item)) {
+        return {
+          id: `chart-customization-${item.id}`,
+          element: (
+            <div
+              className="chart-customization-item-wrapper"
+              css={css`
+                flex-shrink: 0;
+              `}
+            >
+              <FilterDivider
+                title={item.title}
+                description={item.description}
+                orientation={FilterBarOrientation.Horizontal}
+              />
+            </div>
+          ),
+        };
+      }
+      return {
+        id: `chart-customization-${item.id}`,
+        element: (
+          <div
+            className="chart-customization-item-wrapper"
+            css={css`
+              flex-shrink: 0;
+            `}
           >
-            {filtersOutOfScope.map(filter => {
-              const index = cascadeFilters.findIndex(f => f.id === filter.id);
-              return <OutPortal node={portalNodes[index]} inView />;
-            })}
-          </Collapse.Panel>
-        </Collapse>
-      )}
-    </Wrapper>
+            <FilterControl
+              filter={addDataMaskToCustomization(item, dataMaskSelected)}
+              dataMaskSelected={dataMaskSelected}
+              onFilterSelectionChange={(_, dataMask) =>
+                handleChartCustomizationChange(item, dataMask)
+              }
+              orientation={FilterBarOrientation.Horizontal}
+              overflow={false}
+            />
+          </div>
+        ),
+      };
+    });
+
+    return [
+      ...chartCustomizations,
+      ...dividerItems,
+      ...crossFilters,
+      ...nativeFiltersInScope,
+    ];
+  }, [
+    filtersInScope,
+    renderer,
+    rendererCrossFilter,
+    selectedCrossFilters,
+    customizationsInScope,
+    theme,
+    handleChartCustomizationChange,
+    dataMaskSelected,
+    chartCustomizationValues.length,
+  ]);
+
+  const renderHorizontalContent = useCallback(
+    () => (
+      <div
+        css={(theme: SupersetTheme) => css`
+          padding: 0 ${theme.sizeUnit * 4}px;
+          min-width: 0;
+          flex: 1;
+        `}
+      >
+        <DropdownContainer
+          items={items}
+          dropdownTriggerIcon={
+            <Icons.FilterOutlined
+              css={css`
+                && {
+                  margin-right: -4px;
+                  display: flex;
+                }
+              `}
+            />
+          }
+          dropdownTriggerText={t('More filters')}
+          dropdownTriggerCount={activeOverflowedFiltersInScope.length}
+          dropdownTriggerTooltip={
+            activeOverflowedFiltersInScope.length === 0
+              ? t('No applied filters')
+              : t(
+                  'Applied filters: %s',
+                  activeOverflowedFiltersInScope
+                    .map(filter => filter.name)
+                    .join(', '),
+                )
+          }
+          dropdownContent={
+            overflowedFiltersInScope.length ||
+            overflowedCrossFilters.length ||
+            overflowedCustomizationsInScope.length ||
+            (filtersOutOfScope.length && showCollapsePanel) ||
+            (customizationsOutOfScope.length && showCustomizationCollapsePanel)
+              ? (overflowedItems: DropdownItem[]) => {
+                  // Which ids are overflowed comes from DropdownContainer's own
+                  // fresh, synchronous partition of `items` (the argument it
+                  // passes here), not from `overflowedIds` state — that state
+                  // only updates one render later via onOverflowingStateChange,
+                  // so using it here could show a filter here that
+                  // DropdownContainer's *own* main row, computed this same
+                  // render, has already stopped excluding (duplicate chip).
+                  const overflowedItemIds = new Set(
+                    overflowedItems.map(item => item.id),
+                  );
+                  const freshOverflowedFiltersInScope = filtersInScope.filter(
+                    ({ id }) => overflowedItemIds.has(id),
+                  );
+                  const freshOverflowedCrossFilters =
+                    selectedCrossFilters.filter(({ emitterId, name }) =>
+                      overflowedItemIds.has(`${name}${emitterId}`),
+                    );
+                  const freshOverflowedCustomizationsInScope =
+                    customizationsInScope.filter(({ id }) =>
+                      overflowedItemIds.has(`chart-customization-${id}`),
+                    );
+                  return (
+                    <>
+                      <FiltersDropdownContent
+                        overflowedCrossFilters={freshOverflowedCrossFilters}
+                        filtersInScope={freshOverflowedFiltersInScope}
+                        filtersOutOfScope={filtersOutOfScope}
+                        overflowedCustomizationsInScope={
+                          freshOverflowedCustomizationsInScope
+                        }
+                        renderer={renderer}
+                        rendererCrossFilter={rendererCrossFilter}
+                        customizationRenderer={customizationRenderer}
+                        showCollapsePanel={showCollapsePanel}
+                        // Out-of-scope collapsible panels inside opened dropdown content
+                        forceRenderOutOfScope={hasRequiredFirst}
+                      />
+                      {showCustomizationCollapsePanel && (
+                        <CustomizationsOutOfScopeCollapsible
+                          customizationsOutOfScope={customizationsOutOfScope}
+                          renderer={customizationRenderer}
+                          forceRender={false}
+                        />
+                      )}
+                    </>
+                  );
+                }
+              : undefined
+          }
+          ref={popoverRef}
+          onOverflowingStateChange={({ overflowed: nextOverflowedIds }) => {
+            if (
+              nextOverflowedIds.length !== overflowedIds.length ||
+              overflowedIds.reduce(
+                (a, b, i) => a || b !== nextOverflowedIds[i],
+                false,
+              )
+            ) {
+              setOverflowedIds(nextOverflowedIds);
+            }
+          }}
+        />
+      </div>
+    ),
+    [
+      items,
+      activeOverflowedFiltersInScope,
+      overflowedFiltersInScope,
+      overflowedCrossFilters,
+      overflowedCustomizationsInScope,
+      filtersInScope,
+      selectedCrossFilters,
+      customizationsInScope,
+      filtersOutOfScope,
+      showCollapsePanel,
+      customizationsOutOfScope,
+      showCustomizationCollapsePanel,
+      customizationRenderer,
+      renderer,
+      rendererCrossFilter,
+      hasRequiredFirst,
+      overflowedIds,
+    ],
+  );
+
+  const overflowedByIndex = useMemo(() => {
+    const filtersOutOfScopeIds = new Set(filtersOutOfScope.map(({ id }) => id));
+    const overflowedFiltersInScopeIds = new Set(
+      overflowedFiltersInScope.map(({ id }) => id),
+    );
+
+    return filtersWithValues.map(filter => {
+      // Out-of-scope filters in vertical mode are in a Collapse panel, not overflowed
+      if (filtersOutOfScopeIds.has(filter.id)) {
+        return filterBarOrientation === FilterBarOrientation.Horizontal;
+      }
+      return overflowedFiltersInScopeIds.has(filter.id);
+    });
+  }, [
+    filtersOutOfScope,
+    filtersWithValues,
+    overflowedFiltersInScope,
+    filterBarOrientation,
+  ]);
+
+  useEffect(() => {
+    if (outlinedFilterId && overflowedIds.includes(outlinedFilterId)) {
+      popoverRef?.current?.open();
+    }
+  }, [outlinedFilterId, lastUpdated, popoverRef, overflowedIds]);
+
+  return (
+    <>
+      {portalNodes
+        .filter((node, index) => filterIds.has(filtersWithValues[index].id))
+        .map((node, index) => (
+          <InPortal node={node} key={filtersWithValues[index].id}>
+            {filterControlFactory(
+              index,
+              filterBarOrientation,
+              overflowedByIndex[index],
+            )}
+          </InPortal>
+        ))}
+      {filterBarOrientation === FilterBarOrientation.Vertical &&
+        renderVerticalContent()}
+      {filterBarOrientation === FilterBarOrientation.Horizontal &&
+        renderHorizontalContent()}
+    </>
   );
 };
 
-export default React.memo(FilterControls);
+export default memo(FilterControls);

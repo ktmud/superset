@@ -15,18 +15,25 @@
 # specific language governing permissions and limitations
 # under the License.
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 from flask import Response
-from flask_appbuilder.api import expose, permission_name, protect, rison, safe
+from flask_appbuilder.api import (
+    expose,
+    permission_name,
+    protect,
+    rison as parse_rison,
+    safe,
+)
 from flask_appbuilder.api.schemas import get_item_schema, get_list_schema
 from flask_appbuilder.hooks import before_request
 from flask_appbuilder.models.sqla.interface import SQLAInterface
 
 from superset import is_feature_enabled
 from superset.constants import MODEL_API_RW_METHOD_PERMISSION_MAP, RouteMethod
-from superset.models.reports import ReportExecutionLog
+from superset.reports.filters import ReportExecutionLogFilter
 from superset.reports.logs.schemas import openapi_spec_methods_override
+from superset.reports.models import ReportExecutionLog
 from superset.views.base_api import BaseSupersetModelRestApi
 
 logger = logging.getLogger(__name__)
@@ -47,6 +54,13 @@ class ReportExecutionLogRestApi(BaseSupersetModelRestApi):
     class_permission_name = "ReportSchedule"
     resource_name = "report"
     allow_browser_login = True
+    # Ownership scoping. Without a base filter the only scoping on these
+    # routes is the caller-controlled ``pk`` path parameter (folded into the
+    # rison filters below), so any role with ReportSchedule read could
+    # iterate every schedule's logs deployment-wide. Mirrors the
+    # ReportScheduleFilter applied by the schedule API
+    # (superset/reports/api.py).
+    base_filters = [["id", ReportExecutionLogFilter, lambda: []]]
 
     show_columns = [
         "id",
@@ -83,7 +97,7 @@ class ReportExecutionLogRestApi(BaseSupersetModelRestApi):
 
     @staticmethod
     def _apply_layered_relation_to_rison(  # pylint: disable=invalid-name
-        layer_id: int, rison_parameters: Dict[str, Any]
+        layer_id: int, rison_parameters: dict[str, Any]
     ) -> None:
         if "filters" not in rison_parameters:
             rison_parameters["filters"] = []
@@ -91,19 +105,18 @@ class ReportExecutionLogRestApi(BaseSupersetModelRestApi):
             {"col": "report_schedule", "opr": "rel_o_m", "value": layer_id}
         )
 
-    @expose("/<int:pk>/log/", methods=["GET"])
+    @expose("/<int:pk>/log/", methods=("GET",))
     @protect()
     @safe
     @permission_name("get")
-    @rison(get_list_schema)
+    @parse_rison(get_list_schema)
     def get_list(  # pylint: disable=arguments-differ
         self, pk: int, **kwargs: Any
     ) -> Response:
-        """Get a list of report schedule logs
+        """Get a list of report schedule logs.
         ---
         get:
-          description: >-
-            Get a list of report schedule logs
+          summary: Get a list of report schedule logs
           parameters:
           - in: path
             schema:
@@ -148,23 +161,22 @@ class ReportExecutionLogRestApi(BaseSupersetModelRestApi):
               $ref: '#/components/responses/422'
             500:
               $ref: '#/components/responses/500'
-        """
+        """  # noqa: E501
         self._apply_layered_relation_to_rison(pk, kwargs["rison"])
         return self.get_list_headless(**kwargs)
 
-    @expose("/<int:pk>/log/<int:log_id>", methods=["GET"])
+    @expose("/<int:pk>/log/<int:log_id>", methods=("GET",))
     @protect()
     @safe
     @permission_name("get")
-    @rison(get_item_schema)
+    @parse_rison(get_item_schema)
     def get(  # pylint: disable=arguments-differ
         self, pk: int, log_id: int, **kwargs: Any
     ) -> Response:
-        """Get a report schedule log
+        """Get a report schedule log.
         ---
         get:
-          description: >-
-            Get a report schedule log
+          summary: Get a report schedule log
           parameters:
           - in: path
             schema:

@@ -18,52 +18,75 @@
  */
 
 import { ReactNode } from 'react';
-import { PopoverProps } from 'antd/lib/popover';
-import { ControlComponentProps } from '@superset-ui/chart-controls';
-
-export enum COMPARATOR {
-  NONE = 'None',
-  GREATER_THAN = '>',
-  LESS_THAN = '<',
-  GREATER_OR_EQUAL = '≥',
-  LESS_OR_EQUAL = '≤',
-  EQUAL = '=',
-  NOT_EQUAL = '≠',
-  BETWEEN = '< x <',
-  BETWEEN_OR_EQUAL = '≤ x ≤',
-  BETWEEN_OR_LEFT_EQUAL = '≤ x <',
-  BETWEEN_OR_RIGHT_EQUAL = '< x ≤',
-}
-
-export const MULTIPLE_VALUE_COMPARATORS = [
-  COMPARATOR.BETWEEN,
-  COMPARATOR.BETWEEN_OR_EQUAL,
-  COMPARATOR.BETWEEN_OR_LEFT_EQUAL,
-  COMPARATOR.BETWEEN_OR_RIGHT_EQUAL,
-];
+import { PopoverProps } from '@superset-ui/core/components/Popover';
+import {
+  Comparator,
+  ControlComponentProps,
+  ObjectFormattingEnum,
+  BoundUnit,
+  PercentDenominator,
+} from '@superset-ui/chart-controls';
+import { GenericDataType } from '@apache-superset/core/common';
+import { type RGBColor } from '@superset-ui/core/components';
 
 export type ConditionalFormattingConfig = {
-  operator?: COMPARATOR;
+  operator?: Comparator;
   targetValue?: number;
   targetValueLeft?: number;
   targetValueRight?: number;
   column?: string;
-  colorScheme?: string;
+  colorScheme?: RGBColor | string;
+  toAllRow?: boolean;
+  toTextColor?: boolean;
+  useGradient?: boolean;
+  columnFormatting?: string;
+  objectFormatting?: ObjectFormattingEnum;
+  minBound?: number;
+  maxBound?: number;
+  centerValue?: number;
+  lowColor?: RGBColor | string;
+  midColor?: RGBColor | string;
+  highColor?: RGBColor | string;
+  boundUnit?: BoundUnit;
+  percentDenominator?: PercentDenominator;
 };
 
 export type ConditionalFormattingControlProps = ControlComponentProps<
   ConditionalFormattingConfig[]
 > & {
-  columnOptions: { label: string; value: string }[];
+  columnOptions: ColumnOption[];
+  removeIrrelevantConditions: boolean;
   verboseMap: Record<string, string>;
   label: string;
   description: string;
+  extraColorChoices?: { label: string; colors: string[] }[];
+  allColumns?: ColumnOption[];
+  /**
+   * Hide formatting-target fields (columnFormatting / objectFormatting)
+   * so the control applies only to the selected metric.
+   */
+  metricOnly?: boolean;
+  serverPagination?: boolean;
 };
 
 export type FormattingPopoverProps = PopoverProps & {
-  columns: { label: string; value: string }[];
+  columns: ColumnOption[];
   onChange: (value: ConditionalFormattingConfig) => void;
   config?: ConditionalFormattingConfig;
   title: string;
   children: ReactNode;
+  extraColorChoices?: { label: string; colors: string[] }[];
+  allColumns?: ColumnOption[];
+  /**
+   * Hide formatting-target fields (columnFormatting / objectFormatting)
+   * so the control applies only to the selected metric.
+   */
+  metricOnly?: boolean;
+  serverPagination?: boolean;
 };
+
+export interface ColumnOption {
+  label: string;
+  value: string;
+  dataType: GenericDataType;
+}

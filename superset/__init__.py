@@ -14,32 +14,39 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Package's main module!"""
-from flask import current_app, Flask
+import flask_appbuilder
 from werkzeug.local import LocalProxy
 
-from superset.app import create_app
-from superset.connectors.connector_registry import ConnectorRegistry
-from superset.extensions import (
-    appbuilder,
+# SQLAlchemy 2.0 enables "Annotated Declarative" mapping, which inspects class
+# attribute type annotations and requires mapped attributes to use ``Mapped[...]``.
+# Superset's models (and Flask-AppBuilder mixins) still carry legacy 1.x style
+# annotations that are not wrapped in ``Mapped[...]``. Setting ``__allow_unmapped__``
+# on the shared declarative base preserves the legacy behavior so those annotations
+# are ignored by the ORM. This must run before any model class is defined (i.e.
+# before importing ``superset.app``), since the annotation check happens at class
+# creation time. Models can be migrated incrementally to the typed ``Mapped[...]``
+# form.
+flask_appbuilder.Model.__allow_unmapped__ = True
+
+from superset.app import create_app  # noqa: E402, F401
+from superset.extensions import (  # noqa: E402
+    appbuilder,  # noqa: F401
     cache_manager,
-    db,
-    event_logger,
+    db,  # noqa: F401
+    event_logger,  # noqa: F401
     feature_flag_manager,
     manifest_processor,
     results_backend_manager,
-    security_manager,
-    talisman,
+    security_manager,  # noqa: F401
+    talisman,  # noqa: F401
 )
-from superset.security import SupersetSecurityManager
+from superset.security import SupersetSecurityManager  # noqa: E402, F401
 
-#  All of the fields located here should be considered legacy. The correct way
-#  to declare "global" dependencies is to define it in extensions.py,
-#  then initialize it in app.create_app(). These fields will be removed
-#  in subsequent PRs as things are migrated towards the factory pattern
-app: Flask = current_app
+# All of the fields located here should be considered legacy. The correct way to
+# declare "global" dependencies is to define it in extensions.py,
+# then initialize it in app.create_app(). These fields will be removed
+# in subsequent PRs as things are migrated towards the factory pattern
 cache = cache_manager.cache
-conf = LocalProxy(lambda: current_app.config)
 get_feature_flags = feature_flag_manager.get_feature_flags
 get_manifest_files = manifest_processor.get_manifest_files
 is_feature_enabled = feature_flag_manager.is_feature_enabled

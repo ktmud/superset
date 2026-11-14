@@ -16,21 +16,17 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React from 'react';
-import { render, screen } from 'spec/helpers/testing-library';
-import userEvent from '@testing-library/user-event';
-import AdhocFilter, {
-  EXPRESSION_TYPES,
-  CLAUSES,
-} from 'src/explore/components/controls/FilterControl/AdhocFilter';
+import { render, screen, userEvent } from 'spec/helpers/testing-library';
+import AdhocFilter from 'src/explore/components/controls/FilterControl/AdhocFilter';
 import AdhocFilterPopoverTrigger from '.';
+import { Clauses, ExpressionTypes } from '../types';
 
 const simpleAdhocFilter = new AdhocFilter({
-  expressionType: EXPRESSION_TYPES.SIMPLE,
+  expressionType: ExpressionTypes.Simple,
   subject: 'value',
   operator: '>',
   comparator: '10',
-  clause: CLAUSES.WHERE,
+  clause: Clauses.Where,
 });
 
 const mockedProps = {
@@ -49,14 +45,14 @@ test('should render', () => {
   expect(container).toBeInTheDocument();
 });
 
-test('should render the Popover on click when uncontrolled', () => {
+test('should render the Popover on click when uncontrolled', async () => {
   render(
     <AdhocFilterPopoverTrigger {...mockedProps}>
       Click
     </AdhocFilterPopoverTrigger>,
   );
   expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
-  userEvent.click(screen.getByText('Click'));
+  await userEvent.click(screen.getByText('Click'));
   expect(screen.getByRole('tooltip')).toBeInTheDocument();
 });
 
@@ -73,7 +69,8 @@ test('should be visible when controlled', async () => {
       Click
     </AdhocFilterPopoverTrigger>,
   );
-  expect(screen.getByRole('tooltip')).toBeInTheDocument();
+
+  expect(await screen.findByRole('tooltip')).toBeInTheDocument();
 });
 
 test('should NOT be visible when controlled', () => {

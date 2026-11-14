@@ -16,35 +16,67 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { t } from '@superset-ui/core';
+import { t } from '@apache-superset/core/translation';
 
 export const AGGREGATES = {
   AVG: 'AVG',
   COUNT: 'COUNT',
   COUNT_DISTINCT: 'COUNT_DISTINCT',
   MAX: 'MAX',
+  MEDIAN: 'MEDIAN',
   MIN: 'MIN',
+  STDDEV_SAMP: 'STDDEV_SAMP',
   SUM: 'SUM',
+  VAR_SAMP: 'VAR_SAMP',
 };
 export const AGGREGATES_OPTIONS = Object.values(AGGREGATES);
 
+// Kept in sync with LEGACY_AGGREGATION_TAG in the backend migration
+// (superset/migrations/versions/2026-09-25_00-00_141b8ada7731_tag_pivot_
+// tables_with_restored_.py), which applies this tag to a pivot_table_v2
+// chart whose orphaned `aggregateFunction` value started computing totals
+// again once result aggregation shipped. Read by LegacyAggregationAlert and
+// removed on save in saveModalActions -- kept here, rather than on either
+// of those, so neither has to import the other's heavier module tree just
+// for this string.
+export const LEGACY_AGGREGATION_TAG = 'legacy-pivot-aggregation-restored';
+
+// Human-readable labels for aggregates whose raw enum value isn't
+// self-explanatory in the UI. Aggregates absent here (AVG, COUNT, MAX,
+// MEDIAN, MIN, SUM, ...) are already clear as their raw value.
+export const AGGREGATES_LABELS: Record<string, string> = {
+  STDDEV_SAMP: t('Sample Standard Deviation'),
+  VAR_SAMP: t('Sample Variance'),
+};
+
 export enum Operators {
-  EQUALS = 'EQUALS',
-  NOT_EQUALS = 'NOT_EQUALS',
-  LESS_THAN = 'LESS_THAN',
-  GREATER_THAN = 'GREATER_THAN',
-  LESS_THAN_OR_EQUAL = 'LESS_THAN_OR_EQUAL',
-  GREATER_THAN_OR_EQUAL = 'GREATER_THAN_OR_EQUAL',
-  IN = 'IN',
-  NOT_IN = 'NOT_IN',
-  ILIKE = 'ILIKE',
-  LIKE = 'LIKE',
-  REGEX = 'REGEX',
-  IS_NOT_NULL = 'IS_NOT_NULL',
-  IS_NULL = 'IS_NULL',
-  LATEST_PARTITION = 'LATEST_PARTITION',
-  IS_TRUE = 'IS_TRUE',
-  IS_FALSE = 'IS_FALSE',
+  Equals = 'EQUALS',
+  NotEquals = 'NOT_EQUALS',
+  LessThan = 'LESS_THAN',
+  LessThanOrEqual = 'LESS_THAN_OR_EQUAL',
+  GreaterThan = 'GREATER_THAN',
+  GreaterThanOrEqual = 'GREATER_THAN_OR_EQUAL',
+  In = 'IN',
+  NotIn = 'NOT_IN',
+  Like = 'LIKE',
+  CaseInsensitiveLike = 'ILIKE',
+  IsNotNull = 'IS_NOT_NULL',
+  IsNull = 'IS_NULL',
+  LatestPartition = 'LATEST_PARTITION',
+  IsTrue = 'IS_TRUE',
+  IsFalse = 'IS_FALSE',
+  TemporalRange = 'TEMPORAL_RANGE',
+  // Element-level operators for multi-value (array) columns
+  ContainsAny = 'CONTAINS_ANY',
+  ContainsAll = 'CONTAINS_ALL',
+  IsEmpty = 'IS_EMPTY',
+  IsNotEmpty = 'IS_NOT_EMPTY',
+  // Length (element-count) comparison operators for array columns
+  LengthEquals = 'LENGTH_EQUALS',
+  LengthGreaterThan = 'LENGTH_GREATER_THAN',
+  LengthLessThan = 'LENGTH_LESS_THAN',
+  LengthGreaterThanOrEqual = 'LENGTH_GREATER_THAN_OR_EQUALS',
+  LengthLessThanOrEqual = 'LENGTH_LESS_THAN_OR_EQUALS',
 }
 
 export interface OperatorType {
@@ -55,70 +87,132 @@ export interface OperatorType {
 export const OPERATOR_ENUM_TO_OPERATOR_TYPE: {
   [key in Operators]: OperatorType;
 } = {
-  [Operators.EQUALS]: { display: 'equals', operation: '==' },
-  [Operators.NOT_EQUALS]: { display: 'not equals', operation: '!=' },
-  [Operators.GREATER_THAN]: { display: '>', operation: '>' },
-  [Operators.LESS_THAN]: { display: '<', operation: '<' },
-  [Operators.GREATER_THAN_OR_EQUAL]: { display: '>=', operation: '>=' },
-  [Operators.LESS_THAN_OR_EQUAL]: { display: '<=', operation: '<=' },
-  [Operators.IN]: { display: 'IN', operation: 'IN' },
-  [Operators.NOT_IN]: { display: 'NOT IN', operation: 'NOT IN' },
-  [Operators.LIKE]: { display: 'LIKE', operation: 'LIKE' },
-  [Operators.ILIKE]: { display: 'LIKE (case insensitive)', operation: 'ILIKE' },
-  [Operators.REGEX]: { display: 'REGEX', operation: 'REGEX' },
-  [Operators.IS_NOT_NULL]: { display: 'IS NOT NULL', operation: 'IS NOT NULL' },
-  [Operators.IS_NULL]: { display: 'IS NULL', operation: 'IS NULL' },
-  [Operators.LATEST_PARTITION]: {
-    display: 'use latest_partition template',
+  [Operators.Equals]: { display: t('Equal to (=)'), operation: '==' },
+  [Operators.NotEquals]: { display: t('Not equal to (≠)'), operation: '!=' },
+  [Operators.LessThan]: { display: t('Less than (<)'), operation: '<' },
+  [Operators.LessThanOrEqual]: {
+    display: t('Less or equal (<=)'),
+    operation: '<=',
+  },
+  [Operators.GreaterThan]: { display: t('Greater than (>)'), operation: '>' },
+  [Operators.GreaterThanOrEqual]: {
+    display: t('Greater or equal (>=)'),
+    operation: '>=',
+  },
+  [Operators.In]: { display: t('In'), operation: 'IN' },
+  [Operators.NotIn]: { display: t('Not in'), operation: 'NOT IN' },
+  [Operators.Like]: { display: t('Like'), operation: 'LIKE' },
+  [Operators.CaseInsensitiveLike]: {
+    display: t('Like (case insensitive)'),
+    operation: 'ILIKE',
+  },
+  [Operators.IsNotNull]: {
+    display: t('Is not null'),
+    operation: 'IS NOT NULL',
+  },
+  [Operators.IsNull]: { display: t('Is null'), operation: 'IS NULL' },
+  [Operators.LatestPartition]: {
+    display: t('use latest_partition template'),
     operation: 'LATEST PARTITION',
   },
-  [Operators.IS_TRUE]: { display: 'IS TRUE', operation: '==' },
-  [Operators.IS_FALSE]: { display: 'IS FALSE', operation: '==' },
+  [Operators.IsTrue]: { display: t('Is true'), operation: 'IS TRUE' },
+  [Operators.IsFalse]: { display: t('Is false'), operation: 'IS FALSE' },
+  [Operators.TemporalRange]: {
+    display: t('TEMPORAL_RANGE'),
+    operation: 'TEMPORAL_RANGE',
+  },
+  [Operators.ContainsAny]: {
+    display: t('Contains any'),
+    operation: 'CONTAINS_ANY',
+  },
+  [Operators.ContainsAll]: {
+    display: t('Contains all'),
+    operation: 'CONTAINS_ALL',
+  },
+  [Operators.IsEmpty]: { display: t('Is empty'), operation: 'IS_EMPTY' },
+  [Operators.IsNotEmpty]: {
+    display: t('Is not empty'),
+    operation: 'IS_NOT_EMPTY',
+  },
+  [Operators.LengthEquals]: {
+    display: t('Length equals (=)'),
+    operation: 'LENGTH_EQUALS',
+  },
+  [Operators.LengthGreaterThan]: {
+    display: t('Length greater than (>)'),
+    operation: 'LENGTH_GREATER_THAN',
+  },
+  [Operators.LengthLessThan]: {
+    display: t('Length less than (<)'),
+    operation: 'LENGTH_LESS_THAN',
+  },
+  [Operators.LengthGreaterThanOrEqual]: {
+    display: t('Length greater or equal (>=)'),
+    operation: 'LENGTH_GREATER_THAN_OR_EQUALS',
+  },
+  [Operators.LengthLessThanOrEqual]: {
+    display: t('Length less or equal (<=)'),
+    operation: 'LENGTH_LESS_THAN_OR_EQUALS',
+  },
 };
 
 export const OPERATORS_OPTIONS = Object.values(Operators) as Operators[];
 
-export const TABLE_ONLY_OPERATORS = [Operators.LIKE, Operators.ILIKE];
-export const DRUID_ONLY_OPERATORS = [Operators.REGEX];
-export const HAVING_OPERATORS = [
-  Operators.EQUALS,
-  Operators.NOT_EQUALS,
-  Operators.GREATER_THAN,
-  Operators.LESS_THAN,
-  Operators.GREATER_THAN_OR_EQUAL,
-  Operators.LESS_THAN_OR_EQUAL,
+export const TABLE_ONLY_OPERATORS = [
+  Operators.Like,
+  Operators.CaseInsensitiveLike,
 ];
-export const MULTI_OPERATORS = new Set([Operators.IN, Operators.NOT_IN]);
+export const HAVING_OPERATORS = [
+  Operators.Equals,
+  Operators.NotEquals,
+  Operators.LessThan,
+  Operators.LessThanOrEqual,
+  Operators.GreaterThan,
+  Operators.GreaterThanOrEqual,
+];
+export const MULTI_OPERATORS = new Set([
+  Operators.In,
+  Operators.NotIn,
+  Operators.ContainsAny,
+  Operators.ContainsAll,
+]);
 // CUSTOM_OPERATORS will show operator in simple mode,
 // but will generate customized sqlExpression
-export const CUSTOM_OPERATORS = new Set([Operators.LATEST_PARTITION]);
+export const CUSTOM_OPERATORS = new Set([
+  Operators.LatestPartition,
+  Operators.TemporalRange,
+]);
 // DISABLE_INPUT_OPERATORS will disable filter value input
 // in adhocFilter control
 export const DISABLE_INPUT_OPERATORS = [
-  Operators.IS_NOT_NULL,
-  Operators.IS_NULL,
-  Operators.LATEST_PARTITION,
-  Operators.IS_TRUE,
-  Operators.IS_FALSE,
+  Operators.IsNotNull,
+  Operators.IsNull,
+  Operators.LatestPartition,
+  Operators.IsTrue,
+  Operators.IsFalse,
+  Operators.IsEmpty,
+  Operators.IsNotEmpty,
 ];
 
-export const sqlaAutoGeneratedMetricNameRegex = /^(sum|min|max|avg|count|count_distinct)__.*$/i;
-export const sqlaAutoGeneratedMetricRegex = /^(LONG|DOUBLE|FLOAT)?(SUM|AVG|MAX|MIN|COUNT)\([A-Z0-9_."]*\)$/i;
-export const druidAutoGeneratedMetricRegex = /^(LONG|DOUBLE|FLOAT)?(SUM|MAX|MIN|COUNT)\([A-Z0-9_."]*\)$/i;
+export const sqlaAutoGeneratedMetricNameRegex =
+  /^(sum|min|max|avg|count|count_distinct)__.*$/i;
+export const sqlaAutoGeneratedMetricRegex =
+  /^(LONG|DOUBLE|FLOAT)?(SUM|AVG|MAX|MIN|COUNT|MEDIAN|STDDEV_SAMP|VAR_SAMP)\([A-Z0-9_."]*\)$/i;
 
 export const TIME_FILTER_LABELS = {
   time_range: t('Time range'),
   granularity_sqla: t('Time column'),
   time_grain_sqla: t('Time grain'),
-  druid_time_origin: t('Origin'),
   granularity: t('Time granularity'),
 };
 
 export const FILTER_CONFIG_ATTRIBUTES = {
+  CLEARABLE: 'clearable',
   DEFAULT_VALUE: 'defaultValue',
   MULTIPLE: 'multiple',
   SEARCH_ALL_OPTIONS: 'searchAllOptions',
-  CLEARABLE: 'clearable',
+  SORT_ASCENDING: 'asc',
+  SORT_METRIC: 'metric',
 };
 
 export const FILTER_OPTIONS_LIMIT = 1000;
@@ -130,10 +224,25 @@ export const TIME_FILTER_MAP = {
   time_range: '__time_range',
   granularity_sqla: '__time_col',
   time_grain_sqla: '__time_grain',
-  druid_time_origin: '__time_origin',
   granularity: '__granularity',
 };
 
-// TODO: make this configurable per Superset installation
-export const DEFAULT_TIME_RANGE = 'No filter';
-export const NO_TIME_RANGE = 'No filter';
+export const POPOVER_INITIAL_HEIGHT = 240;
+export const POPOVER_INITIAL_WIDTH = 320;
+/** The control panel's tab container, which control popovers open alongside. */
+export const CONTROL_SECTIONS_ID = 'controlSections';
+export const UNSAVED_CHART_ID = 0;
+
+export enum ExploreStandaloneMode {
+  None = 0,
+  HideNav = 1,
+  HideNavShowControls = 2,
+}
+
+export const QUERY_MODE_REQUISITES = new Set([
+  'all_columns',
+  'groupby',
+  'metrics',
+  'percent_metrics',
+  'order_by_cols',
+]);

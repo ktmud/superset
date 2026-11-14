@@ -16,31 +16,34 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { flatMapDeep } from 'lodash';
-import { FormInstance } from 'antd/lib/form';
-import React from 'react';
-import { CustomControlItem, DatasourceMeta } from '@superset-ui/chart-controls';
-import { Column, ensureIsArray, GenericDataType } from '@superset-ui/core';
+import { flatMapDeep } from 'lodash-es';
+import type { FormInstance } from '@superset-ui/core/components';
+import { useState, useCallback } from 'react';
+import { CustomControlItem, Dataset } from '@superset-ui/chart-controls';
+import { Column, DatasourceType, ensureIsArray } from '@superset-ui/core';
+import { GenericDataType } from '@apache-superset/core/common';
 import { DatasourcesState, ChartsState } from 'src/dashboard/types';
+import { FILTER_SUPPORTED_TYPES } from './constants';
 
 const FILTERS_FIELD_NAME = 'filters';
 
-export const FILTER_SUPPORTED_TYPES = {
-  filter_time: [GenericDataType.TEMPORAL],
-  filter_timegrain: [GenericDataType.TEMPORAL],
-  filter_timecolumn: [GenericDataType.TEMPORAL],
-  filter_select: [
-    GenericDataType.BOOLEAN,
-    GenericDataType.STRING,
-    GenericDataType.NUMERIC,
-    GenericDataType.TEMPORAL,
-  ],
-  filter_range: [GenericDataType.NUMERIC],
-};
+type TimeGrainTuple = [string, string];
 
-export const useForceUpdate = () => {
-  const [, updateState] = React.useState({});
-  return React.useCallback(() => updateState({}), []);
+export const getTimeGrainOptions = (
+  timeGrains: TimeGrainTuple[] = [],
+): { value: string; label: string }[] =>
+  timeGrains.map(timeGrain => {
+    const [value, label] = timeGrain;
+    return { value, label: label || value };
+  });
+
+export const useForceUpdate = (isActive = true) => {
+  const [, updateState] = useState({});
+  return useCallback(() => {
+    if (isActive) {
+      updateState({});
+    }
+  }, [isActive]);
 };
 
 export const setNativeFilterFieldValues = (
@@ -74,44 +77,94 @@ export const getControlItems = (
     [],
   ) as CustomControlItem[]) ?? [];
 
-type DatasetSelectValue = {
-  value: number;
-  label: string;
-};
-
-export const datasetToSelectOption = (
-  item: DatasourceMeta & { table_name: string },
-): DatasetSelectValue => ({
-  value: item.id,
-  label: item.table_name,
-});
-
-// TODO: add column_types field to DatasourceMeta
+// TODO: add column_types field to Dataset
 // We return true if column_types is undefined or empty as a precaution against backend failing to return column_types
 export const hasTemporalColumns = (
-  dataset: DatasourceMeta & { column_types: GenericDataType[] },
+  dataset: Dataset & { column_types: GenericDataType[] },
 ) => {
   const columnTypes = ensureIsArray(dataset?.column_types);
   return (
-    columnTypes.length === 0 || columnTypes.includes(GenericDataType.TEMPORAL)
+    columnTypes.length === 0 || columnTypes.includes(GenericDataType.Temporal)
   );
 };
 
-export const doesColumnMatchFilterType = (filterType: string, column: Column) =>
-  !column.type_generic ||
-  !(filterType in FILTER_SUPPORTED_TYPES) ||
-  FILTER_SUPPORTED_TYPES[filterType]?.includes(column.type_generic);
+// Determines whether to show the time range picker in pre-filter settings.
+// Returns true if dataset is undefined (precautionary default) or has temporal columns.
+export const shouldShowTimeRangePicker = (
+  currentDataset: (Dataset & { column_types: GenericDataType[] }) | undefined,
+): boolean => (currentDataset ? hasTemporalColumns(currentDataset) : true);
 
+export const doesColumnMatchFilterType = (
+  filterType: string,
+  column: Column,
+  datasourceType?: DatasourceType,
+): boolean => {
+  // Semantic range filters skip the runtime non-numeric bounds check, so an
+  // unrecognised dimension type must not be offered for >= / <= comparisons.
+  if (
+    filterType === 'filter_range' &&
+    datasourceType === DatasourceType.SemanticView
+  ) {
+    return column.type_generic === GenericDataType.Numeric;
+  }
+  return (
+    !column.type_generic ||
+    !(filterType in FILTER_SUPPORTED_TYPES) ||
+    !!FILTER_SUPPORTED_TYPES[
+      filterType as keyof typeof FILTER_SUPPORTED_TYPES
+    ]?.includes(column.type_generic)
+  );
+};
+
+// Shared semantic-view structure helpers live in a layer-neutral module so
+// non-dashboard consumers (e.g. the dataset drill-info hook) need not import
+// from this filter-form utility. Re-exported here for existing call sites.
+export {
+  mapSemanticTypeToGenericDataType,
+  fetchSemanticViewStructure,
+  semanticViewDimensionsToColumns,
+} from 'src/utils/semanticViewStructure';
+export type { SemanticViewStructure } from 'src/utils/semanticViewStructure';
+
+// Validates that a filter default value is present when the default value option is enabled.
+// For range filters, at least one of the two values must be non-null.
+// For other filters (e.g., filter_select), the value must be non-empty.
+// Arrays must have at least one element (empty array means no selection).
+export const isValidFilterValue = (
+  value: unknown,
+  isRangeFilter: boolean,
+): boolean => {
+  if (isRangeFilter) {
+    return Array.isArray(value) && (value[0] !== null || value[1] !== null);
+  }
+  // For multi-select filters, an empty array means no selection was made
+  if (Array.isArray(value)) {
+    return value.length > 0;
+  }
+  // For other values, check if truthy (note: 0 is falsy but unlikely for non-range filters)
+  return !!value;
+};
+
+/**
+ * A datasource identified by both id and type. Datasets and semantic views have
+ * independent id sequences, so an id alone cannot name a datasource.
+ */
+export type DatasourceBinding = { id: number; type: DatasourceType };
+
+/**
+ * The datasource used by the most charts on the dashboard, typed from its
+ * dashboard datasource entry; undefined when that entry is not loaded.
+ */
 export const mostUsedDataset = (
   datasets: DatasourcesState,
   charts: ChartsState,
-) => {
+): DatasourceBinding | undefined => {
   const map = new Map<string, number>();
   let mostUsedDataset = '';
   let maxCount = 0;
 
   Object.values(charts).forEach(chart => {
-    const { formData } = chart;
+    const { form_data: formData } = chart;
     if (formData) {
       const { datasource } = formData;
       const count = (map.get(datasource) || 0) + 1;
@@ -124,5 +177,57 @@ export const mostUsedDataset = (
     }
   });
 
-  return datasets[mostUsedDataset]?.id;
+  const datasource = datasets[mostUsedDataset];
+  if (!datasource) {
+    return undefined;
+  }
+  return {
+    id: datasource.id,
+    type: datasource.datasource_type || datasource.type || DatasourceType.Table,
+  };
+};
+
+const normalizeDatasourceType = (datasourceType?: string): string =>
+  datasourceType || DatasourceType.Table;
+
+const parseDatasourceUid = (
+  datasourceUid?: string,
+): { id?: number; type?: string } => {
+  if (!datasourceUid) {
+    return {};
+  }
+
+  const [rawId, type] = String(datasourceUid).split('__');
+  const id = Number(rawId);
+  if (Number.isNaN(id)) {
+    return {};
+  }
+
+  return { id, type };
+};
+
+export const doesChartMatchFilterDatasource = (
+  chartDatasourceUid: string | undefined,
+  loadedDatasets: DatasourcesState,
+  filterDatasetId: number,
+  filterDatasourceType?: DatasourceType,
+): boolean => {
+  const expectedType = normalizeDatasourceType(filterDatasourceType);
+  const loadedDataset = chartDatasourceUid
+    ? loadedDatasets[chartDatasourceUid]
+    : undefined;
+
+  if (loadedDataset) {
+    const loadedType = normalizeDatasourceType(
+      loadedDataset.datasource_type || loadedDataset.type,
+    );
+
+    return loadedDataset.id === filterDatasetId && loadedType === expectedType;
+  }
+
+  const parsed = parseDatasourceUid(chartDatasourceUid);
+  return (
+    parsed.id === filterDatasetId &&
+    normalizeDatasourceType(parsed.type) === expectedType
+  );
 };

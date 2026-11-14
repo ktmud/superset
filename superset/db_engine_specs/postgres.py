@@ -14,47 +14,51 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-import json
+
+from __future__ import annotations
+
 import logging
 import re
+from collections.abc import Collection
 from datetime import datetime
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    List,
-    Match,
-    Optional,
-    Pattern,
-    Tuple,
-    TYPE_CHECKING,
-    Union,
-)
+from re import Pattern
+from typing import Any, Callable, Optional, TYPE_CHECKING
 
+import sqlalchemy as sa
 from flask_babel import gettext as __
-from pytz import _FixedOffset  # type: ignore
-from sqlalchemy.dialects.postgresql import ARRAY, DOUBLE_PRECISION, ENUM, JSON
+from marshmallow import fields, pre_load
+from marshmallow.validate import Range
+from sqlalchemy import text, types
+from sqlalchemy.dialects.postgresql import DOUBLE_PRECISION, ENUM, INTERVAL, JSON
 from sqlalchemy.dialects.postgresql.base import PGInspector
-from sqlalchemy.types import String, TypeEngine
+from sqlalchemy.engine.reflection import Inspector
+from sqlalchemy.engine.url import URL
+from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.sql.expression import ColumnClause
+from sqlalchemy.types import Date, DateTime, String
 
-from superset.db_engine_specs.base import BaseEngineSpec, BasicParametersMixin
-from superset.errors import SupersetErrorType
-from superset.exceptions import SupersetException
+from superset.constants import EPOCH_FORMATS, TimeGrain
+from superset.db_engine_specs.base import (
+    AURORA_DATA_API_KNOWN_INCOMPATIBILITIES,
+    BaseEngineSpec,
+    BasicParametersMixin,
+    BasicParametersSchema,
+    BasicParametersType,
+    DatabaseCategory,
+    TimestampExpression,
+)
+from superset.errors import ErrorLevel, SupersetError, SupersetErrorType
+from superset.exceptions import SupersetException, SupersetSecurityException
 from superset.models.sql_lab import Query
-from superset.utils import core as utils
-from superset.utils.core import ColumnSpec, GenericDataType
+from superset.sql.dialects.postgres import normalize_date_trunc_units
+from superset.sql.parse import process_jinja_sql
+from superset.utils import core as utils, json
+from superset.utils.core import GenericDataType, QuerySource
 
 if TYPE_CHECKING:
     from superset.models.core import Database  # pragma: no cover
 
 logger = logging.getLogger()
-
-
-# Replace psycopg2.tz.FixedOffsetTimezone with pytz, which is serializable by PyArrow
-# https://github.com/stub42/pytz/blob/b70911542755aeeea7b5a9e066df5e1c87e8f2c8/src/pytz/reference.py#L25
-class FixedOffsetTimezone(_FixedOffset):
-    pass
-
 
 # Regular expressions to catch custom errors
 CONNECTION_INVALID_USERNAME_REGEX = re.compile(
@@ -89,25 +93,206 @@ COLUMN_DOES_NOT_EXIST_REGEX = re.compile(
 SYNTAX_ERROR_REGEX = re.compile('syntax error at or near "(?P<syntax_error>.*?)"')
 
 
+def _check_not_redshift(dbapi_connection: Any, connection_record: Any) -> None:
+    """
+    Event that checks if database is Amazon Redshift.
+
+    SQLAlchemy pool `connect` event that checks whether the database is actually
+    Amazon Redshift by running `SELECT version()`. Redshift returns a version string
+    containing `Redshift`, e.g.::
+
+        PostgreSQL 8.0.2 on ... Redshift 1.0.77467
+
+    If detected, a `ValueError` is raised so that the user is prompted to
+    switch to the `redshift+psycopg2://` driver, which ensures the correct
+    sqlglot dialect is used for SQL transpilation.
+    """
+    try:
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("SELECT version()")
+            version = cursor.fetchone()[0]
+        finally:
+            cursor.close()
+
+        if "redshift" in str(version).lower():
+            raise ValueError(
+                "It looks like you're connecting to Amazon Redshift using the "
+                "PostgreSQL driver. Please use the Redshift driver instead "
+                "(redshift+psycopg2://) to ensure proper SQL dialect support."
+            )
+    except ValueError:
+        raise
+    except Exception:
+        logger.debug(
+            "Failed to check database version for Redshift detection",
+            exc_info=True,
+        )
+
+
+def parse_options(connect_args: dict[str, Any]) -> dict[str, str]:
+    """
+    Parse ``options`` from  ``connect_args`` into a dictionary.
+    """
+    if not isinstance(connect_args.get("options"), str):
+        return {}
+
+    tokens = (
+        tuple(token.strip() for token in option.strip().split("=", 1))
+        for option in re.split(r"-c\s?", connect_args["options"])
+        if "=" in option
+    )
+
+    return {token[0]: token[1] for token in tokens}
+
+
+def _normalize_interval(v: Any) -> Optional[float]:
+    """Convert PostgreSQL INTERVAL values to milliseconds.
+
+    psycopg2 and psycopg3 always return INTERVAL values as datetime.timedelta
+    objects. We convert to milliseconds so users can apply the built-in
+    "DURATION" number format for human-readable display (e.g.,
+    "1d 2h 30m 45s") and so the values participate cleanly in numeric
+    aggregations in bar/pie charts.
+
+    Returns None for the NULL case (preserves NULL semantics) and for any
+    unexpected non-timedelta type (avoids producing a mixed-type column
+    when an unfamiliar driver surfaces something other than timedelta).
+    """
+    if v is None:
+        return None
+    if hasattr(v, "total_seconds"):
+        return v.total_seconds() * 1000
+    # Defensive: psycopg2/3 should always hand us a timedelta. If a future
+    # driver doesn't, surface the surprise in the logs rather than silently
+    # dropping the value so operators can diagnose it.
+    logger.warning(
+        "Cannot normalize PostgreSQL INTERVAL value of type %s to numeric; "
+        "returning None.",
+        type(v).__name__,
+    )
+    return None
+
+
+def _quote_identifier(name: str) -> str:
+    """
+    Quote a Postgres identifier, so it's read exactly as written.
+    """
+    return '"' + name.replace('"', '""') + '"'
+
+
+_ASCII_UPPER_TO_LOWER = {code: code + 32 for code in range(ord("A"), ord("Z") + 1)}
+# an identifier ``to_regclass`` reads as one name, folded the way a query's is
+_PLAIN_IDENTIFIER = re.compile(r"[^\W\d][\w$]*")
+
+
+def _table_spellings(name: str) -> list[str]:
+    """
+    The spellings of a table name to look up, each as ``to_regclass`` reads it.
+
+    A parsed reference no longer says whether its name was quoted, which decides
+    whether Postgres folds it. Folding an unquoted name lower-cases ASCII letters
+    only in a UTF-8 database, so ``str.lower`` would name a table (``venté``) the
+    query never reads (``ventÉ``). A name with other letters is also passed
+    unquoted, for Postgres to fold the way its encoding does.
+    """
+    spellings = [
+        _quote_identifier(name),
+        _quote_identifier(name.translate(_ASCII_UPPER_TO_LOWER)),
+    ]
+    if not name.isascii() and _PLAIN_IDENTIFIER.fullmatch(name):
+        spellings.append(name)
+    return utils.remove_duplicates(spellings)
+
+
+def _named_schemas(search_path: str, user: str) -> list[str]:
+    """
+    The schemas a ``search_path`` setting names, in order, as Postgres reads them.
+
+    Unlike ``current_schemas``, this includes the ones that don't exist, which a
+    script can create before reading a table from one. ``$user`` names the
+    current user's schema, an unquoted name is folded the way Postgres folds it
+    (see ``_table_spellings``), and ``pg_temp``, the session's own temporary
+    schema, is left out.
+    """
+    schemas = []
+    for name, quoted in re.findall(
+        r'\s*(?:"((?:[^"]|"")*)"|([^,]*?))\s*(?:,|$)', search_path
+    ):
+        schema = (
+            name.replace('""', '"')
+            if name
+            else quoted.strip().translate(_ASCII_UPPER_TO_LOWER)
+        )
+        if schema == "$user":
+            schema = user
+        if schema and schema != "pg_temp":
+            schemas.append(schema)
+    return utils.remove_duplicates(schemas)
+
+
 class PostgresBaseEngineSpec(BaseEngineSpec):
     """Abstract class for Postgres 'like' databases"""
 
     engine = ""
     engine_name = "PostgreSQL"
+    # The engine's default text comparison is binary, so a mirrored
+    # ``partition_col = T(v)`` agrees with the ``col = v`` it stands in for.
+    binary_string_comparison = True
+    supports_multivalues_insert = True
+
+    # The time grain templates below spell ``DATE_TRUNC`` units in lowercase.
+    # PostgreSQL-like engines compare a metric's ``DATE_TRUNC`` call against
+    # the ``GROUP BY`` expression structurally, so a custom metric using a
+    # different unit spelling fails with a grouping error. Every spec that
+    # inherits these templates therefore also inherits the normalization that
+    # keeps custom metric units aligned with them; specs that replace the
+    # templates (e.g. Snowflake) replace the normalization as well.
+    preserves_custom_sql_metric_source = True
+
+    @classmethod
+    def normalize_custom_sql_metric(cls, expression: str) -> str:
+        """Canonicalize DATE_TRUNC units to match generated time grains."""
+        return normalize_date_trunc_units(expression)
 
     _time_grain_expressions = {
         None: "{col}",
-        "PT1S": "DATE_TRUNC('second', {col})",
-        "PT1M": "DATE_TRUNC('minute', {col})",
-        "PT1H": "DATE_TRUNC('hour', {col})",
-        "P1D": "DATE_TRUNC('day', {col})",
-        "P1W": "DATE_TRUNC('week', {col})",
-        "P1M": "DATE_TRUNC('month', {col})",
-        "P3M": "DATE_TRUNC('quarter', {col})",
-        "P1Y": "DATE_TRUNC('year', {col})",
+        TimeGrain.SECOND: "DATE_TRUNC('second', {col})",
+        TimeGrain.FIVE_SECONDS: "DATE_TRUNC('minute', {col}) + INTERVAL '5 seconds' * FLOOR(EXTRACT(SECOND FROM {col}) / 5)",  # noqa: E501
+        TimeGrain.THIRTY_SECONDS: "DATE_TRUNC('minute', {col}) + INTERVAL '30 seconds' * FLOOR(EXTRACT(SECOND FROM {col}) / 30)",  # noqa: E501
+        TimeGrain.MINUTE: "DATE_TRUNC('minute', {col})",
+        TimeGrain.FIVE_MINUTES: "DATE_TRUNC('hour', {col}) + INTERVAL '5 minutes' * FLOOR(EXTRACT(MINUTE FROM {col}) / 5)",  # noqa: E501
+        TimeGrain.TEN_MINUTES: "DATE_TRUNC('hour', {col}) + INTERVAL '10 minutes' * FLOOR(EXTRACT(MINUTE FROM {col}) / 10)",  # noqa: E501
+        TimeGrain.FIFTEEN_MINUTES: "DATE_TRUNC('hour', {col}) + INTERVAL '15 minutes' * FLOOR(EXTRACT(MINUTE FROM {col}) / 15)",  # noqa: E501
+        TimeGrain.THIRTY_MINUTES: "DATE_TRUNC('hour', {col}) + INTERVAL '30 minutes' * FLOOR(EXTRACT(MINUTE FROM {col}) / 30)",  # noqa: E501
+        TimeGrain.HOUR: "DATE_TRUNC('hour', {col})",
+        TimeGrain.DAY: "DATE_TRUNC('day', {col})",
+        TimeGrain.WEEK: "DATE_TRUNC('week', {col})",
+        TimeGrain.MONTH: "DATE_TRUNC('month', {col})",
+        TimeGrain.QUARTER: "DATE_TRUNC('quarter', {col})",
+        TimeGrain.YEAR: "DATE_TRUNC('year', {col})",
     }
 
-    custom_errors: Dict[Pattern[str], Tuple[str, SupersetErrorType, Dict[str, Any]]] = {
+    # Verified against a live postgres:16 instance, including under GROUPING
+    # SETS (the pivot table's non-additive-total rollup pattern): the grand
+    # total correctly reflects every row, not an aggregate-of-aggregates.
+    # STDDEV_SAMP/VAR_SAMP (not MEDIAN -- see its override) are inherited by
+    # Redshift (a Postgres fork); its SQL function reference documents the
+    # same support, but that has not been separately verified against a live
+    # Redshift instance.
+    # Also inherited by TimescaleDB (a Postgres extension, not a forked query
+    # engine -- it runs unmodified Postgres aggregate execution) and by
+    # Aurora PostgreSQL / its Data API variant (AWS's wire- and
+    # SQL-compatible managed Postgres). Engines that share the SQL dialect
+    # but run a materially different query engine (CockroachDB, Greenplum,
+    # SAP HANA) reset this to `{}` instead -- see those engine specs.
+    _extended_aggregations: dict[str, Callable[[ColumnElement], ColumnElement]] = {
+        "MEDIAN": lambda col: sa.func.percentile_cont(0.5).within_group(col),
+        "STDDEV_SAMP": sa.func.stddev_samp,
+        "VAR_SAMP": sa.func.var_samp,
+    }
+
+    custom_errors: dict[Pattern[str], tuple[str, SupersetErrorType, dict[str, Any]]] = {
         CONNECTION_INVALID_USERNAME_REGEX: (
             __('The username "%(username)s" does not exist.'),
             SupersetErrorType.CONNECTION_INVALID_USERNAME_ERROR,
@@ -165,32 +350,415 @@ class PostgresBaseEngineSpec(BaseEngineSpec):
     }
 
     @classmethod
-    def fetch_data(
-        cls, cursor: Any, limit: Optional[int] = None
-    ) -> List[Tuple[Any, ...]]:
-        cursor.tzinfo_factory = FixedOffsetTimezone
-        if not cursor.description:
-            return []
-        return super().fetch_data(cursor, limit)
-
-    @classmethod
     def epoch_to_dttm(cls) -> str:
         return "(timestamp 'epoch' + {col} * interval '1 second')"
 
+    @classmethod
+    def get_timestamp_expr(
+        cls,
+        col: ColumnClause,
+        pdf: str | None,
+        time_grain: str | None,
+    ) -> TimestampExpression:
+        """
+        Construct a timestamp expression for Postgres temporal columns.
 
-class PostgresEngineSpec(PostgresBaseEngineSpec, BasicParametersMixin):
+        Applying ``DATE_TRUNC`` to a ``DATE`` column implicitly casts the value to
+        ``TIMESTAMP``, which can trigger unwanted timezone conversion on the client
+        and shift the displayed date by a day. To avoid this, the truncated value is
+        cast back to ``DATE`` when the source column is a pure ``DATE`` type.
+
+        String columns explicitly marked as temporal are cast to ``TIMESTAMP`` before
+        applying a time grain because Postgres does not implicitly cast strings for
+        ``DATE_TRUNC`` or ``EXTRACT``.
+
+        See https://github.com/apache/superset/issues/42254.
+        See https://github.com/apache/superset/issues/42386.
+        """
+        expr = super().get_timestamp_expr(col, pdf, time_grain)
+        col_type = getattr(col, "type", None)
+        if time_grain and isinstance(col_type, String) and pdf not in EPOCH_FORMATS:
+            expr = TimestampExpression(
+                expr.name.replace("{col}", "CAST({col} AS TIMESTAMP)"),
+                col,
+                type_=DateTime(),
+            )
+        # ``DateTime``/``TIMESTAMP`` are distinct SQLAlchemy types (not subclasses
+        # of ``Date``), so this only matches pure ``DATE`` columns.
+        if time_grain and isinstance(col_type, Date):
+            return TimestampExpression(f"CAST({expr.name} AS DATE)", col, type_=Date())
+        return expr
+
+    @classmethod
+    def convert_dttm(
+        cls, target_type: str, dttm: datetime, db_extra: dict[str, Any] | None = None
+    ) -> str | None:
+        sqla_type = cls.get_sqla_column_type(target_type)
+
+        if isinstance(sqla_type, Date):
+            return f"TO_DATE('{dttm.date().isoformat()}', 'YYYY-MM-DD')"
+        if isinstance(sqla_type, DateTime):
+            dttm_formatted = dttm.isoformat(sep=" ", timespec="microseconds")
+            return f"""TO_TIMESTAMP('{dttm_formatted}', 'YYYY-MM-DD HH24:MI:SS.US')"""
+        return None
+
+
+class PostgresParametersSchema(BasicParametersSchema):
+    """
+    Same as ``BasicParametersSchema``, except ``port`` is optional: a blank
+    port falls back to Postgres's own default (5432) in
+    ``PostgresEngineSpec.build_sqlalchemy_uri``.
+    """
+
+    port = fields.Integer(
+        required=False,
+        allow_none=True,
+        metadata={"description": __("Database port")},
+        validate=Range(min=0, max=2**16, max_inclusive=False),
+    )
+
+    @pre_load
+    def blank_port_to_none(self, data: Any, **kwargs: Any) -> Any:
+        """
+        A cleared number input in the Connect Database form submits ``""``
+        for ``port`` (HTML input values are always strings) rather than
+        omitting the key or sending ``null``. Normalize it to ``None`` so it
+        deserializes cleanly instead of failing with "Not a valid integer.",
+        and is treated as blank -- same as an omitted port -- downstream.
+        """
+        if isinstance(data, dict) and data.get("port") == "":
+            data = {**data, "port": None}
+        return data
+
+
+#: The text forms PostgreSQL's date/time input reads, which `RedshiftEngineSpec`
+#: shares. Both the ISO spellings and the unseparated ones --
+#: ``'20260115'::date`` is 2026-01-15 -- so a ``YYYYMMDD`` bucketing key
+#: mirrors on either.
+#:
+#: Declared on the concrete specs rather than on `PostgresBaseEngineSpec`,
+#: which Snowflake, Vertica, HANA, Netezza and Hologres also inherit.
+#: Snowflake's AUTO date input does not take ``YYYYMMDD`` and reads an
+#: all-digit string as epoch seconds, so inheriting this misread the mirror.
+POSTGRES_TEMPORAL_LITERAL_FORMATS = (
+    "%Y-%m-%d",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M:%S.%f",
+    "%Y-%m-%dT%H:%M:%S.%f",
+    "%Y%m%d",
+    "%Y%m%d%H%M%S",
+)
+
+
+class PostgresEngineSpec(BasicParametersMixin, PostgresBaseEngineSpec):
     engine = "postgresql"
+    engine_name = "PostgreSQL"
     engine_aliases = {"postgres"}
 
+    temporal_literal_formats = POSTGRES_TEMPORAL_LITERAL_FORMATS
+
+    supports_dynamic_schema = True
+    supports_catalog = True
+    supports_dynamic_catalog = True
+    supports_grouping_sets = True
+    supports_temporal_column_shift = True
+
     default_driver = "psycopg2"
+    parameters_schema = PostgresParametersSchema()
+    # ``port`` is intentionally not required: a blank port falls back to
+    # Postgres's own default (``metadata["default_port"]``) in
+    # ``BasicParametersMixin.build_sqlalchemy_uri`` (overridden below).
+    required_parameters = {"host", "username", "database"}
     sqlalchemy_uri_placeholder = (
         "postgresql://user:password@host:port/dbname[?key=value&key=value...]"
     )
+
+    metadata = {
+        "description": "PostgreSQL is an advanced open-source relational database.",
+        "logo": "postgresql.svg",
+        "homepage_url": "https://www.postgresql.org/",
+        "categories": [
+            DatabaseCategory.TRADITIONAL_RDBMS,
+            DatabaseCategory.OPEN_SOURCE,
+        ],
+        "pypi_packages": ["psycopg2"],
+        "connection_string": (
+            "postgresql://{username}:{password}@{host}:{port}/{database}"
+        ),
+        "default_port": 5432,
+        "parameters": {
+            "username": "Database username",
+            "password": "Database password",
+            "host": "For localhost: localhost or 127.0.0.1. For AWS: endpoint URL",
+            "port": "Default 5432",
+            "database": "Database name",
+        },
+        "notes": "The psycopg2 library comes bundled with Superset Docker images.",
+        "connection_examples": [
+            {
+                "description": "Basic connection",
+                "connection_string": (
+                    "postgresql://{username}:{password}@{host}:{port}/{database}"
+                ),
+            },
+            {
+                "description": "With SSL required",
+                "connection_string": (
+                    "postgresql://{username}:{password}@{host}:{port}/{database}"
+                    "?sslmode=require"
+                ),
+            },
+        ],
+        "docs_url": "https://www.postgresql.org/docs/",
+        "sqlalchemy_docs_url": (
+            "https://docs.sqlalchemy.org/en/13/dialects/postgresql.html"
+        ),
+        "compatible_databases": [
+            {
+                "name": "Hologres",
+                "description": (
+                    "Alibaba Cloud real-time interactive analytics service, "
+                    "fully compatible with PostgreSQL 11."
+                ),
+                "logo": "hologres.png",
+                "homepage_url": "https://www.alibabacloud.com/product/hologres",
+                "pypi_packages": ["psycopg2"],
+                "connection_string": (
+                    "postgresql+psycopg2://{username}:{password}"
+                    "@{host}:{port}/{database}"
+                ),
+                "parameters": {
+                    "username": "AccessKey ID of your Alibaba Cloud account",
+                    "password": "AccessKey secret of your Alibaba Cloud account",
+                    "host": "Public endpoint of the Hologres instance",
+                    "port": "Port number of the Hologres instance",
+                    "database": "Name of the Hologres database",
+                },
+                "categories": [DatabaseCategory.PROPRIETARY],
+            },
+            {
+                "name": "TimescaleDB",
+                "description": (
+                    "Open-source relational database for time-series and analytics, "
+                    "built on PostgreSQL."
+                ),
+                "logo": "timescale.png",
+                "homepage_url": "https://www.timescale.com/",
+                "pypi_packages": ["psycopg2"],
+                "connection_string": (
+                    "postgresql://{username}:{password}@{host}:{port}/{database}"
+                ),
+                "connection_examples": [
+                    {
+                        "description": "Timescale Cloud (SSL required)",
+                        "connection_string": (
+                            "postgresql://{username}:{password}"
+                            "@{host}:{port}/{database}?sslmode=require"
+                        ),
+                    },
+                ],
+                "notes": "psycopg2 comes bundled with Superset Docker images.",
+                "docs_url": "https://docs.timescale.com/",
+                "categories": [DatabaseCategory.OPEN_SOURCE],
+            },
+            {
+                "name": "YugabyteDB",
+                "description": ("Distributed SQL database built on top of PostgreSQL."),
+                "logo": "yugabyte.png",
+                "homepage_url": "https://www.yugabyte.com/",
+                "pypi_packages": ["psycopg2"],
+                "connection_string": (
+                    "postgresql://{username}:{password}@{host}:{port}/{database}"
+                ),
+                "notes": "psycopg2 comes bundled with Superset Docker images.",
+                "docs_url": "https://www.yugabyte.com/",
+                "categories": [DatabaseCategory.OPEN_SOURCE],
+            },
+            {
+                "name": "Supabase",
+                "description": (
+                    "Open-source Firebase alternative built on top of PostgreSQL, "
+                    "providing a full backend-as-a-service with a hosted Postgres "
+                    "database."
+                ),
+                "logo": "supabase.svg",
+                "homepage_url": "https://supabase.com/",
+                "pypi_packages": ["psycopg2"],
+                "connection_string": (
+                    "postgresql://{username}:{password}@{host}:{port}/{database}"
+                ),
+                "connection_examples": [
+                    {
+                        "description": "Supabase project (connection pooler)",
+                        "connection_string": (
+                            "postgresql://{username}.{project_ref}:{password}"
+                            "@aws-0-{region}.pooler.supabase.com:6543/{database}"
+                        ),
+                    },
+                ],
+                "parameters": {
+                    "username": "Database user (default: postgres)",
+                    "password": "Database password",
+                    "host": "Supabase project host (from project settings)",
+                    "port": "Default 5432 (direct) or 6543 (pooler)",
+                    "database": "Database name (default: postgres)",
+                    "project_ref": "Supabase project reference (from project settings)",
+                    "region": "Supabase project region (e.g., us-east-1)",
+                },
+                "notes": (
+                    "Find connection details in your Supabase project dashboard under "
+                    "Settings > Database. Use the connection pooler (port 6543) for "
+                    "better connection management."
+                ),
+                "docs_url": "https://supabase.com/docs/guides/database/connecting-to-postgres",
+                "categories": [
+                    DatabaseCategory.HOSTED_OPEN_SOURCE,
+                ],
+            },
+            {
+                "name": "Google AlloyDB",
+                "description": (
+                    "Google Cloud's PostgreSQL-compatible database service "
+                    "for demanding transactional and analytical workloads."
+                ),
+                "logo": "alloydb.png",
+                "homepage_url": "https://cloud.google.com/alloydb",
+                "pypi_packages": ["psycopg2"],
+                "connection_string": (
+                    "postgresql://{username}:{password}@{host}:{port}/{database}"
+                ),
+                "parameters": {
+                    "username": "Database user (default: postgres)",
+                    "password": "Database password",
+                    "host": "AlloyDB instance IP or Auth Proxy address",
+                    "port": "Default 5432",
+                    "database": "Database name",
+                },
+                "notes": (
+                    "For public IP connections, use the AlloyDB Auth Proxy for "
+                    "secure access. Private IP connections can connect directly."
+                ),
+                "docs_url": "https://cloud.google.com/alloydb/docs",
+                "categories": [
+                    DatabaseCategory.CLOUD_GCP,
+                    DatabaseCategory.HOSTED_OPEN_SOURCE,
+                ],
+            },
+            {
+                "name": "Neon",
+                "description": (
+                    "Serverless PostgreSQL with branching, scale-to-zero, "
+                    "and bottomless storage."
+                ),
+                "logo": "neon.png",
+                "homepage_url": "https://neon.tech/",
+                "pypi_packages": ["psycopg2"],
+                "connection_string": (
+                    "postgresql://{username}:{password}"
+                    "@{host}/{database}?sslmode=require"
+                ),
+                "parameters": {
+                    "username": "Neon role name",
+                    "password": "Neon role password",
+                    "host": (
+                        "Neon hostname (e.g., "
+                        "ep-cool-name-123456.us-east-2.aws.neon.tech)"
+                    ),
+                    "database": "Database name (default: neondb)",
+                },
+                "notes": (
+                    "SSL is required for all connections. Find connection "
+                    "details in the Neon console under Connection Details."
+                ),
+                "docs_url": "https://neon.tech/docs/connect/connect-from-any-app",
+                "categories": [
+                    DatabaseCategory.HOSTED_OPEN_SOURCE,
+                ],
+            },
+            {
+                "name": "Amazon Aurora PostgreSQL",
+                "description": (
+                    "Amazon Aurora PostgreSQL is a fully managed, "
+                    "PostgreSQL-compatible relational database with up to 5x "
+                    "the throughput of standard PostgreSQL."
+                ),
+                "logo": "aws-aurora.jpg",
+                "homepage_url": "https://aws.amazon.com/rds/aurora/",
+                "pypi_packages": ["sqlalchemy-aurora-data-api"],
+                "connection_string": (
+                    "postgresql+auroradataapi://{aws_access_id}:{aws_secret_access_key}@/"
+                    "{database_name}?aurora_cluster_arn={aurora_cluster_arn}&"
+                    "secret_arn={secret_arn}&region_name={region_name}"
+                ),
+                "parameters": {
+                    "aws_access_id": "AWS Access Key ID",
+                    "aws_secret_access_key": "AWS Secret Access Key",
+                    "database_name": "Database name",
+                    "aurora_cluster_arn": "Aurora cluster ARN",
+                    "secret_arn": "Secrets Manager ARN for credentials",
+                    "region_name": "AWS region (e.g., us-east-1)",
+                },
+                "notes": (
+                    "Uses the Data API for serverless access. "
+                    "Standard PostgreSQL connections also work with psycopg2."
+                ),
+                "categories": [
+                    DatabaseCategory.CLOUD_AWS,
+                    DatabaseCategory.HOSTED_OPEN_SOURCE,
+                ],
+                "known_incompatibilities": AURORA_DATA_API_KNOWN_INCOMPATIBILITIES,
+            },
+            {
+                "name": "ClickHouse Managed Postgres",
+                "description": "Managed PostgreSQL from ClickHouse.",
+                "logo": "clickhouse-mark.svg",
+                "logo_dark": "clickhouse-mark-dark.svg",
+                "homepage_url": "https://clickhouse.com/cloud/postgres",
+                "pypi_packages": ["psycopg2"],
+                "connection_string": (
+                    "postgresql+psycopg2://{username}:{password}"
+                    "@{host}:{port}/{database}?sslmode=verify-full"
+                    "&sslrootcert={ca_certificate_path}"
+                ),
+                "parameters": {
+                    "username": "Database user",
+                    "password": "URL-encoded database password",
+                    "host": "Direct PostgreSQL hostname from the Connect dialog",
+                    "port": "Port from the Connect dialog (default: 5432)",
+                    "database": "Database name",
+                    "ca_certificate_path": (
+                        "URL-encoded absolute path to the instance CA certificate "
+                        "on the Superset server"
+                    ),
+                },
+                "notes": (
+                    "In ClickHouse Cloud, open the Connect menu and use the "
+                    "Directly option. Download the instance-specific CA certificate "
+                    "from Settings and make it available to each Superset process "
+                    "that connects to the database. Use verify-full to verify "
+                    "the certificate and hostname."
+                ),
+                "docs_url": (
+                    "https://clickhouse.com/docs/products/managed-postgres/connection"
+                ),
+                "categories": [DatabaseCategory.HOSTED_OPEN_SOURCE],
+            },
+        ],
+    }
     # https://www.postgresql.org/docs/9.1/libpq-ssl.html#LIBQ-SSL-CERTIFICATES
     encryption_parameters = {"sslmode": "require"}
 
     max_column_name_length = 63
-    try_remove_schema_from_table_name = False
+    try_remove_schema_from_table_name = False  # pylint: disable=invalid-name
+
+    # Sensitive fields that should be masked in encrypted_extra.
+    # This follows the pattern used by other engine specs (bigquery, snowflake, etc.)
+    # that specify exact paths rather than using the base class's catch-all "$.*".
+    encrypted_extra_sensitive_fields = {
+        "$.aws_iam.external_id": "AWS IAM External ID",
+        "$.aws_iam.role_arn": "AWS IAM Role ARN",
+    }
 
     column_type_mappings = (
         (
@@ -200,19 +768,303 @@ class PostgresEngineSpec(PostgresBaseEngineSpec, BasicParametersMixin):
         ),
         (
             re.compile(r"^array.*", re.IGNORECASE),
-            lambda match: ARRAY(int(match[2])) if match[2] else String(),
-            utils.GenericDataType.STRING,
+            String(),
+            GenericDataType.STRING,
         ),
-        (re.compile(r"^json.*", re.IGNORECASE), JSON(), utils.GenericDataType.STRING,),
-        (re.compile(r"^enum.*", re.IGNORECASE), ENUM(), utils.GenericDataType.STRING,),
+        (
+            re.compile(r"^json.*", re.IGNORECASE),
+            JSON(),
+            GenericDataType.STRING,
+        ),
+        (
+            re.compile(r"^enum.*", re.IGNORECASE),
+            ENUM(),
+            GenericDataType.STRING,
+        ),
+        (
+            re.compile(r"^interval", re.IGNORECASE),
+            INTERVAL(),
+            GenericDataType.NUMERIC,
+        ),
     )
 
+    column_type_mutators: dict[types.TypeEngine, Callable[[Any], Any]] = {
+        INTERVAL: _normalize_interval,
+    }
+
     @classmethod
-    def get_allow_cost_estimate(cls, extra: Dict[str, Any]) -> bool:
+    def get_schema_from_engine_params(
+        cls,
+        sqlalchemy_uri: URL,
+        connect_args: dict[str, Any],
+    ) -> str | None:
+        """
+        Return the configured schema.
+
+        While Postgres doesn't support connecting directly to a given schema, it allows
+        users to specify a "search path" that is used to resolve non-qualified table
+        names; this can be specified in the database ``connect_args``.
+
+        One important detail is that the search path can be a comma separated list of
+        schemas. While this is supported by the SQLAlchemy dialect, it shouldn't be used
+        in Superset because it breaks schema-level permissions, since it's impossible
+        to determine the schema for a non-qualified table in a query. In cases like
+        that we raise an exception.
+
+        Note that because the DB engine supports dynamic schema this method is never
+        called. It's left here as an implementation reference.
+        """
+        options = parse_options(connect_args)
+        if search_path := options.get("search_path"):
+            schemas = search_path.split(",")
+            if len(schemas) > 1:
+                raise Exception(  # pylint: disable=broad-exception-raised
+                    "Multiple schemas are configured in the search path, which means "
+                    "Superset is unable to determine the schema of unqualified table "
+                    "names and enforce permissions."
+                )
+            return schemas[0]
+
+        return None
+
+    @classmethod
+    def get_search_path(
+        cls,
+        database: Database,
+        catalog: str | None,
+        tables: Collection[str] = (),
+    ) -> tuple[list[str], dict[str, list[str]]]:
+        """
+        Resolve tables referenced without a schema the way the connection does.
+
+        The default schema Postgres reports is the first schema of the
+        ``search_path`` that exists (``current_schema()``), which needn't hold the
+        table: under the default ``"$user", public`` an unqualified ``sales`` in
+        ``public`` is still read when a schema named after the user exists, and a
+        ``sales`` in that schema shadows it. ``current_schemas(true)`` lists the
+        schemas Postgres searches, in order, including the ``pg_catalog`` it
+        searches first when the path doesn't name it, and ``to_regclass`` resolves
+        a table name the way a query does. A parsed reference no longer says
+        whether its name was quoted, which decides whether Postgres folds it, so
+        both spellings are looked up (see ``_table_spellings``) and every schema
+        holding either is returned. ``current_schemas`` leaves out a schema the path
+        names that doesn't exist, which a script can create before reading a table
+        from it, so those are listed after the ones searched.
+        """
+        spellings = {table: _table_spellings(table) for table in tables}
+        with database.get_raw_connection(catalog=catalog) as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                "SELECT pg_catalog.current_schemas(true)::text[], "
+                "pg_catalog.current_setting('search_path'), current_user::text"
+            )
+            row = cursor.fetchone()
+            if not row or not isinstance(row[0], list):
+                # reported as an empty path, it would match no table's rules
+                raise ValueError(f"Unexpected search path: {row!r}")
+            schemas: list[str] = utils.remove_duplicates(
+                row[0] + _named_schemas(row[1], row[2])
+            )
+            found: dict[str, str] = {}
+            if spellings:
+                cursor.execute(
+                    "SELECT spelling, n.nspname::text "
+                    "FROM unnest(%s::text[]) AS s(spelling) "
+                    "JOIN pg_catalog.pg_class AS c "
+                    "ON c.oid = pg_catalog.to_regclass(spelling) "
+                    "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace",
+                    ([name for names in spellings.values() for name in names],),
+                )
+                found = dict(cursor.fetchall())
+
+        order = {schema: position for position, schema in enumerate(schemas)}
+        resolved = {
+            table: sorted(
+                {found[name] for name in names if name in found},
+                key=lambda schema: order.get(schema, len(order)),
+            )
+            for table, names in spellings.items()
+        }
+        return schemas, {table: found for table, found in resolved.items() if found}
+
+    @classmethod
+    def get_default_schema_for_query(
+        cls,
+        database: Database,
+        query: Query,
+        template_params: Optional[dict[str, Any]] = None,
+    ) -> str | None:
+        """
+        Return the default schema for a given query.
+
+        This method simply uses the parent method after checking that the query
+        cannot rebind the schema used to resolve unqualified table names.
+        """
+        script = process_jinja_sql(query.sql, database, template_params).script
+        if script.changes_default_schema():
+            raise SupersetSecurityException(
+                SupersetError(
+                    error_type=SupersetErrorType.QUERY_SECURITY_ACCESS_ERROR,
+                    message=__(
+                        "Users are not allowed to set a search path for security reasons."  # noqa: E501
+                    ),
+                    level=ErrorLevel.ERROR,
+                )
+            )
+
+        return super().get_default_schema_for_query(database, query, template_params)
+
+    @classmethod
+    def adjust_engine_params(
+        cls,
+        uri: URL,
+        connect_args: dict[str, Any],
+        catalog: str | None = None,
+        schema: str | None = None,
+    ) -> tuple[URL, dict[str, Any]]:
+        """
+        Set the catalog (database).
+        """
+        if catalog:
+            uri = uri.set(database=catalog)
+
+        return uri, connect_args
+
+    @classmethod
+    def build_sqlalchemy_uri(
+        cls,
+        parameters: BasicParametersType,
+        encrypted_extra: dict[str, str] | None = None,
+    ) -> str:
+        """
+        Default a missing/blank port to Postgres's own default (5432) so the
+        dynamic form can connect without requiring the port to be filled in.
+
+        Only an absent key, ``None``, or ``""`` (what a cleared number input
+        submits, since this may be called directly with raw, non-schema-
+        loaded parameters -- see ``ValidateDatabaseParametersCommand``) are
+        treated as blank; an explicitly supplied port -- including ``0`` --
+        is preserved as-is rather than overwritten by a truthiness check.
+        """
+        port = parameters.get("port")
+        resolved_port: int = (
+            cls.metadata["default_port"] if port is None or port == "" else port
+        )
+        parameters_with_default_port: BasicParametersType = {
+            **parameters,
+            "port": resolved_port,
+        }
+        return super().build_sqlalchemy_uri(
+            parameters_with_default_port, encrypted_extra
+        )
+
+    @staticmethod
+    def mutate_db_for_connection_test(database: Database) -> None:
+        """
+        Flag the database so that the Redshift `SELECT version()` check
+        runs during `test_connection`.  The actual check is injected as a
+        pool `connect` event inside `update_params_from_encrypted_extra`.
+        """
+        database._check_redshift_version = True
+
+    @staticmethod
+    def update_params_from_encrypted_extra(
+        database: Database,
+        params: dict[str, Any],
+    ) -> None:
+        """
+        Extract sensitive parameters from encrypted_extra.
+
+        Handles AWS IAM authentication if configured, then merges any
+        remaining encrypted_extra keys into params (standard behavior).
+        """
+        # During test_connection, inject a pool event to detect Redshift by
+        # checking SELECT version().  This catches cases where the hostname
+        # doesn't reveal Redshift (custom domains, private endpoints, etc.).
+        if getattr(database, "_check_redshift_version", False) is True:
+            pool_events = params.setdefault("pool_events", [])
+            pool_events.append((_check_not_redshift, "connect"))
+
+        if not database.encrypted_extra:
+            return
+
+        try:
+            encrypted_extra = json.loads(database.encrypted_extra)
+        except json.JSONDecodeError as ex:
+            logger.error(ex, exc_info=True)
+            raise
+
+        # Handle AWS IAM auth: pop the key so it doesn't reach create_engine()
+        iam_config = encrypted_extra.pop("aws_iam", None)
+        if iam_config and iam_config.get("enabled"):
+            from superset.db_engine_specs.aws_iam import AWSIAMAuthMixin
+
+            # Preserve a stricter existing sslmode (e.g. verify-full) if present
+            connect_args = params.get("connect_args") or {}
+            previous_sslmode = connect_args.get("sslmode")
+
+            AWSIAMAuthMixin._apply_iam_authentication(
+                database,
+                params,
+                iam_config,
+                ssl_args={"sslmode": "require"},
+                default_port=5432,
+            )
+
+            # Restore stricter sslmode if it was previously configured
+            if previous_sslmode in ("verify-ca", "verify-full"):
+                params.setdefault("connect_args", {})["sslmode"] = previous_sslmode
+
+        # Standard behavior: merge remaining keys into params
+        if encrypted_extra:
+            params.update(encrypted_extra)
+
+    @classmethod
+    def get_default_catalog(cls, database: Database) -> str:
+        """
+        Return the default catalog for a given database.
+        """
+        return database.url_object.database
+
+    @classmethod
+    def get_prequeries(
+        cls,
+        database: Database,
+        catalog: str | None = None,
+        schema: str | None = None,
+    ) -> list[str]:
+        """
+        Set the search path to the specified schema.
+
+        This is important for two reasons: in SQL Lab it will allow queries to run in
+        the schema selected in the dropdown, resolving unqualified table names to the
+        expected schema.
+
+        But more importantly, in SQL Lab this is used to check if the user has access to
+        any tables with unqualified names. If the schema is not set by SQL Lab it could
+        be anything, and we would have to block users from running any queries
+        referencing tables without an explicit schema.
+        """
+        if not schema:
+            return []
+        escaped = schema.replace('"', '""')
+        return [f'set search_path = "{escaped}"']
+
+    @classmethod
+    def get_allow_cost_estimate(cls, extra: dict[str, Any]) -> bool:
         return True
 
     @classmethod
-    def estimate_statement_cost(cls, statement: str, cursor: Any) -> Dict[str, Any]:
+    def estimate_statement_cost(
+        cls, database: Database, statement: str, cursor: Any
+    ) -> dict[str, Any]:
+        """
+        Run a SQL query that estimates the cost of a given statement.
+        :param database: A Database object
+        :param statement: A single SQL statement
+        :param cursor: Cursor instance
+        :return: JSON response from Trino
+        """
         sql = f"EXPLAIN {statement}"
         cursor.execute(sql)
 
@@ -228,31 +1080,71 @@ class PostgresEngineSpec(PostgresBaseEngineSpec, BasicParametersMixin):
 
     @classmethod
     def query_cost_formatter(
-        cls, raw_cost: List[Dict[str, Any]]
-    ) -> List[Dict[str, str]]:
+        cls, raw_cost: list[dict[str, Any]]
+    ) -> list[dict[str, str]]:
         return [{k: str(v) for k, v in row.items()} for row in raw_cost]
 
     @classmethod
-    def get_table_names(
-        cls, database: "Database", inspector: PGInspector, schema: Optional[str]
-    ) -> List[str]:
-        """Need to consider foreign tables for PostgreSQL"""
-        tables = inspector.get_table_names(schema)
-        tables.extend(inspector.get_foreign_table_names(schema))
-        return sorted(tables)
+    def get_catalog_names(
+        cls,
+        database: Database,
+        inspector: Inspector,
+    ) -> set[str]:
+        """
+        Return all catalogs.
+
+        In Postgres, a catalog is called a "database".
+        """
+        with inspector.engine.connect() as conn:
+            return {
+                catalog
+                for (catalog,) in conn.execute(
+                    text("""
+SELECT datname FROM pg_database
+WHERE datistemplate = false;
+                    """)
+                )
+            }
 
     @classmethod
-    def convert_dttm(cls, target_type: str, dttm: datetime) -> Optional[str]:
-        tt = target_type.upper()
-        if tt == utils.TemporalType.DATE:
-            return f"TO_DATE('{dttm.date().isoformat()}', 'YYYY-MM-DD')"
-        if "TIMESTAMP" in tt or "DATETIME" in tt:
-            dttm_formatted = dttm.isoformat(sep=" ", timespec="microseconds")
-            return f"""TO_TIMESTAMP('{dttm_formatted}', 'YYYY-MM-DD HH24:MI:SS.US')"""
-        return None
+    def get_schema_names(cls, inspector: Inspector) -> set[str]:
+        """
+        Return all schema names, excluding the ``pg_``-prefixed Postgres
+        system schemas (e.g. ``pg_catalog``, ``pg_toast``).
+
+        SQLAlchemy's Postgres dialect filters out system schemas with the
+        query ``nspname NOT LIKE 'pg_%'``. Since ``_`` is a single-character
+        wildcard in SQL ``LIKE`` patterns, this unintentionally excludes any
+        user-defined schema that merely starts with ``pg`` followed by any
+        other character (e.g. ``pgsql``, ``pgstats``), not only the
+        ``pg_``-prefixed system schemas. Matching on the literal ``pg_``
+        prefix instead keeps those user-defined schemas.
+
+        TODO: drop this override once sqlalchemy/sqlalchemy#13471 is merged
+        and released, and SQLAlchemy is bumped past that version.
+        """
+        with inspector.engine.connect() as conn:
+            return {
+                name
+                for (name,) in conn.execute(
+                    text("SELECT nspname FROM pg_namespace ORDER BY nspname")
+                )
+                if not name.startswith("pg_")
+            }
+
+    @classmethod
+    def get_table_names(
+        cls, database: Database, inspector: PGInspector, schema: str | None
+    ) -> set[str]:
+        """Need to consider foreign tables for PostgreSQL"""
+        return set(inspector.get_table_names(schema)) | set(
+            inspector.get_foreign_table_names(schema)
+        )
 
     @staticmethod
-    def get_extra_params(database: "Database") -> Dict[str, Any]:
+    def get_extra_params(
+        database: Database, source: QuerySource | None = None
+    ) -> dict[str, Any]:
         """
         For Postgres, the path to a SSL certificate is placed in `connect_args`.
 
@@ -276,30 +1168,18 @@ class PostgresEngineSpec(PostgresBaseEngineSpec, BasicParametersMixin):
         return extra
 
     @classmethod
-    def get_column_spec(
-        cls,
-        native_type: Optional[str],
-        source: utils.ColumnTypeSource = utils.ColumnTypeSource.GET_TABLE,
-        column_type_mappings: Tuple[
-            Tuple[
-                Pattern[str],
-                Union[TypeEngine, Callable[[Match[str]], TypeEngine]],
-                GenericDataType,
-            ],
-            ...,
-        ] = column_type_mappings,
-    ) -> Union[ColumnSpec, None]:
+    def get_datatype(cls, type_code: Any) -> str | None:
+        # pylint: disable=import-outside-toplevel
+        from psycopg2.extensions import binary_types, string_types
 
-        column_spec = super().get_column_spec(native_type)
-        if column_spec:
-            return column_spec
-
-        return super().get_column_spec(
-            native_type, column_type_mappings=column_type_mappings
-        )
+        types = binary_types.copy()
+        types.update(string_types)
+        if type_code in types:
+            return types[type_code].name
+        return None
 
     @classmethod
-    def get_cancel_query_id(cls, cursor: Any, query: Query) -> Optional[str]:
+    def get_cancel_query_id(cls, cursor: Any, query: Query) -> str | None:
         """
         Get Postgres PID that will be used to cancel all other running
         queries in the same session.
@@ -322,9 +1202,14 @@ class PostgresEngineSpec(PostgresBaseEngineSpec, BasicParametersMixin):
         :param cancel_query_id: Postgres PID
         :return: True if query cancelled successfully, False otherwise
         """
+        # Validate cancel_query_id to prevent SQL injection
+        # PostgreSQL pg_backend_pid() returns an integer
+        if not cls.validate_cancel_query_id(cancel_query_id, r"^\d+$"):
+            return False
+
         try:
             cursor.execute(
-                "SELECT pg_terminate_backend(pid) "
+                "SELECT pg_terminate_backend(pid) "  # noqa: S608
                 "FROM pg_stat_activity "
                 f"WHERE pid='{cancel_query_id}'"
             )

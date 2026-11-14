@@ -16,21 +16,18 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React, { useRef } from 'react';
-import {
-  useDrag,
-  useDrop,
-  DropTargetMonitor,
-  DragSourceMonitor,
-} from 'react-dnd';
+import { useRef, useMemo } from 'react';
+import { useSortable } from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
 import { DragContainer } from 'src/explore/components/controls/OptionControls';
 import {
   OptionProps,
   OptionItemInterface,
 } from 'src/explore/components/controls/DndColumnSelectControl/types';
-import { Tooltip } from 'src/components/Tooltip';
+import { Tooltip } from '@superset-ui/core/components';
 import { StyledColumnOption } from 'src/explore/components/optionRenderers';
-import { styled } from '@superset-ui/core';
+import { isAdhocColumn } from '@superset-ui/core';
+import { styled } from '@apache-superset/core/theme';
 import { ColumnMeta } from '@superset-ui/chart-controls';
 import Option from './Option';
 
@@ -57,76 +54,63 @@ export default function OptionWrapper(
     clickClose,
     withCaret,
     isExtra,
+    datasourceWarningMessage,
     canDelete = true,
+    tooltipOverlay,
+    multiValueWarningMessage,
+    partitionMapping,
     ...rest
   } = props;
-  const ref = useRef<HTMLDivElement>(null);
   const labelRef = useRef<HTMLDivElement>(null);
 
-  const [{ isDragging }, drag] = useDrag({
-    item: {
+  // Create a unique sortable ID for this item
+  const sortableId = useMemo(() => `sortable-${type}-${index}`, [type, index]);
+
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({
+    id: sortableId,
+    // Disable @dnd-kit's default FLIP layout animation: on drop it plays a
+    // springy settle that reads as a confusing "bounce" for reordered pills.
+    animateLayoutChanges: () => false,
+    data: {
       type,
       dragIndex: index,
-    },
-    collect: (monitor: DragSourceMonitor) => ({
-      isDragging: monitor.isDragging(),
-    }),
+      onShiftOptions,
+    } as OptionItemInterface & { onShiftOptions: typeof onShiftOptions },
   });
 
-  const [, drop] = useDrop({
-    accept: type,
-
-    hover: (item: OptionItemInterface, monitor: DropTargetMonitor) => {
-      if (!ref.current) {
-        return;
-      }
-      const { dragIndex } = item;
-      const hoverIndex = index;
-
-      // Don't replace items with themselves
-      if (dragIndex === hoverIndex) {
-        return;
-      }
-      // Determine rectangle on screen
-      const hoverBoundingRect = ref.current?.getBoundingClientRect();
-      // Get vertical middle
-      const hoverMiddleY =
-        (hoverBoundingRect.bottom - hoverBoundingRect.top) / 2;
-      // Determine mouse position
-      const clientOffset = monitor.getClientOffset();
-      // Get pixels to the top
-      const hoverClientY = clientOffset
-        ? clientOffset.y - hoverBoundingRect.top
-        : 0;
-      // Only perform the move when the mouse has crossed half of the items height
-      // When dragging downwards, only move when the cursor is below 50%
-      // When dragging upwards, only move when the cursor is above 50%
-      // Dragging downwards
-      if (dragIndex < hoverIndex && hoverClientY < hoverMiddleY) {
-        return;
-      }
-      // Dragging upwards
-      if (dragIndex > hoverIndex && hoverClientY > hoverMiddleY) {
-        return;
-      }
-
-      // Time to actually perform the action
-      onShiftOptions(dragIndex, hoverIndex);
-      // eslint-disable-next-line no-param-reassign
-      item.dragIndex = hoverIndex;
-    },
-  });
+  const style = {
+    // Translate only (no scaleX/scaleY) so variable-width pills slide into
+    // place without morphing into their neighbor's size during reorder.
+    transform: CSS.Translate.toString(transform),
+    transition,
+    opacity: isDragging ? 0.5 : 1,
+  };
 
   const shouldShowTooltip =
     (!isDragging && tooltipTitle && label && tooltipTitle !== label) ||
     (!isDragging &&
       labelRef &&
       labelRef.current &&
-      labelRef.current.scrollWidth > labelRef.current.clientWidth);
+      labelRef.current.scrollWidth > labelRef.current.clientWidth) ||
+    (!isDragging && tooltipOverlay);
 
   const LabelContent = () => {
     if (!shouldShowTooltip) {
       return <span>{label}</span>;
+    }
+    if (tooltipOverlay) {
+      return (
+        <Tooltip overlay={tooltipOverlay}>
+          <span>{label}</span>
+        </Tooltip>
+      );
     }
     return (
       <Tooltip title={tooltipTitle || label}>
@@ -135,14 +119,19 @@ export default function OptionWrapper(
     );
   };
 
-  const ColumnOption = () => (
-    <StyledColumnOption
-      column={column as ColumnMeta}
-      labelRef={labelRef}
-      showTooltip={!!shouldShowTooltip}
-      showType
-    />
-  );
+  const ColumnOption = () => {
+    const transformedCol =
+      column && isAdhocColumn(column)
+        ? { verbose_name: column.label, expression: column.sqlExpression }
+        : column;
+    return (
+      <StyledColumnOption
+        column={transformedCol as ColumnMeta}
+        labelRef={labelRef}
+        showType
+      />
+    );
+  };
 
   const Label = () => {
     if (label) {
@@ -162,16 +151,23 @@ export default function OptionWrapper(
     return null;
   };
 
-  drag(drop(ref));
-
   return (
-    <DragContainer ref={ref} {...rest}>
+    <DragContainer
+      ref={setNodeRef}
+      style={style}
+      {...attributes}
+      {...listeners}
+      {...rest}
+    >
       <Option
         index={index}
         clickClose={clickClose}
         withCaret={withCaret}
         isExtra={isExtra}
+        datasourceWarningMessage={datasourceWarningMessage}
         canDelete={canDelete}
+        multiValueWarningMessage={multiValueWarningMessage}
+        partitionMapping={partitionMapping}
       >
         <Label />
       </Option>

@@ -17,84 +17,161 @@
  * under the License.
  */
 
+import { logging } from '@apache-superset/core/utils';
+import { t } from '@apache-superset/core/translation';
 import {
-  t,
   SupersetClient,
   SupersetClientResponse,
-  logging,
-  styled,
-  SupersetTheme,
-  css,
+  getClientErrorObject,
+  lruCache,
 } from '@superset-ui/core';
+import { styled } from '@apache-superset/core/theme';
+import { isMobileConsumptionEnabled } from 'src/hooks/useIsMobile';
 import Chart from 'src/types/Chart';
+import {
+  deletedToastContent,
+  rememberArchivedType,
+  ToastContent,
+  deleteFailedToast,
+} from 'src/utils/softDeleteCopy';
+import { intersection } from 'lodash-es';
 import rison from 'rison';
-import { getClientErrorObject } from 'src/utils/getClientErrorObject';
-import { FetchDataConfig } from 'src/components/ListView';
+import type {
+  ListViewFetchDataConfig as FetchDataConfig,
+  ListViewFilterValue as FilterValue,
+} from 'src/components';
 import SupersetText from 'src/utils/textUtils';
-import { Dashboard, Filters } from './types';
+import { findPermission } from 'src/utils/findPermission';
+import { User } from 'src/types/bootstrapTypes';
+import getBootstrapData from 'src/utils/getBootstrapData';
+import { RecentActivity, WelcomeTable } from 'src/features/home/types';
+import { normalizeSubjectToPickerValue } from 'src/features/subjects/SubjectPicker/utils';
+import {
+  Dashboard,
+  EncryptedExtraField,
+  FileEncryptedExtraFields,
+  Filter,
+  TableTab,
+} from './types';
 
-const createFetchResourceMethod = (method: string) => (
-  resource: string,
-  relation: string,
-  handleError: (error: Response) => void,
-  user?: { userId: string | number; firstName: string; lastName: string },
-) => async (filterValue = '', page: number, pageSize: number) => {
-  const resourceEndpoint = `/api/v1/${resource}/${method}/${relation}`;
-  const queryParams = rison.encode({
-    filter: filterValue,
-    page,
-    page_size: pageSize,
-  });
-  const { json = {} } = await SupersetClient.get({
-    endpoint: `${resourceEndpoint}?q=${queryParams}`,
-  });
+// Modifies the rison encoding slightly to match the backend's rison encoding/decoding. Applies globally.
+// Code pulled from rison.js (https://github.com/Nanonid/rison), rison is licensed under the MIT license.
+(() => {
+  const risonRef: {
+    not_idchar: string;
+    not_idstart: string;
+    id_ok: RegExp;
+    next_id: RegExp;
+  } = rison as any;
 
-  let fetchedLoggedUser = false;
-  const loggedUser = user
-    ? {
-        label: `${user.firstName} ${user.lastName}`,
-        value: user.userId,
-      }
-    : undefined;
-
-  const data: { label: string; value: string | number }[] = [];
-  json?.result?.forEach(
-    ({ text, value }: { text: string; value: string | number }) => {
-      if (
-        loggedUser &&
-        value === loggedUser.value &&
-        text === loggedUser.label
-      ) {
-        fetchedLoggedUser = true;
-      } else {
-        data.push({
-          label: text,
-          value,
-        });
-      }
-    },
-  );
-
-  if (loggedUser && (!filterValue || fetchedLoggedUser)) {
-    data.unshift(loggedUser);
+  const l = [];
+  for (let hi = 0; hi < 16; hi += 1) {
+    for (let lo = 0; lo < 16; lo += 1) {
+      if (hi + lo === 0) continue;
+      const c = String.fromCharCode(hi * 16 + lo);
+      if (!/\w|[-_./~]/.test(c))
+        l.push(`\\u00${hi.toString(16)}${lo.toString(16)}`);
+    }
   }
 
-  return {
-    data,
-    totalCount: json?.count,
+  risonRef.not_idchar = l.join('');
+  risonRef.not_idstart = '-0123456789';
+
+  const idrx = `[^${risonRef.not_idstart}${risonRef.not_idchar}][^${risonRef.not_idchar}]*`;
+
+  risonRef.id_ok = new RegExp(`^${idrx}$`);
+  risonRef.next_id = new RegExp(idrx, 'g');
+})();
+
+export const Actions = styled.div`
+  color: ${({ theme }) => theme.colorText};
+`;
+
+const createFetchResourceMethod =
+  (method: string) =>
+  (
+    resource: string,
+    relation: string,
+    handleError: (error: Response) => void,
+    user?: { userId?: string | number; firstName: string; lastName: string },
+  ) =>
+  async (filterValue = '', page: number, pageSize: number) => {
+    const resourceEndpoint = `/api/v1/${resource}/${method}/${relation}`;
+    const queryParams = rison.encode_uri({
+      filter: filterValue,
+      page,
+      page_size: pageSize,
+    });
+    const { json = {} } = await SupersetClient.get({
+      endpoint: `${resourceEndpoint}?q=${queryParams}`,
+    });
+
+    let fetchedLoggedUser = false;
+    let loggedUserExtra: Record<string, unknown> | undefined;
+    const loggedUser =
+      user?.userId === undefined
+        ? undefined
+        : {
+            label: `${user.firstName} ${user.lastName}`,
+            value: user.userId,
+          };
+
+    const data: {
+      label: string;
+      value: string | number;
+      extra?: Record<string, unknown>;
+    }[] = [];
+    json?.result
+      ?.filter(({ text }: { text: string }) => text.trim().length > 0)
+      .forEach(
+        ({
+          text,
+          value,
+          extra,
+        }: {
+          text: string;
+          value: string | number;
+          extra?: Record<string, unknown>;
+        }) => {
+          if (
+            loggedUser &&
+            value === loggedUser.value &&
+            text === loggedUser.label
+          ) {
+            fetchedLoggedUser = true;
+            loggedUserExtra = extra;
+          } else {
+            data.push({
+              label: text,
+              value,
+              extra,
+            });
+          }
+        },
+      );
+
+    if (loggedUser && (!filterValue || fetchedLoggedUser)) {
+      data.unshift({ ...loggedUser, extra: loggedUserExtra });
+    }
+
+    return {
+      data,
+      totalCount: json?.count,
+    };
   };
-};
 
 export const PAGE_SIZE = 5;
-const getParams = (filters?: Array<Filters>) => {
+const getParams = (filters?: Filter[], selectColumns?: string[]) => {
   const params = {
     order_column: 'changed_on_delta_humanized',
     order_direction: 'desc',
     page: 0,
     page_size: PAGE_SIZE,
     filters,
+    select_columns: selectColumns,
   };
   if (!filters) delete params.filters;
+  if (!selectColumns) delete params.select_columns;
   return rison.encode(params);
 };
 
@@ -127,62 +204,128 @@ export const getEditedObjects = (userId: string | number) => {
     .catch(err => err);
 };
 
-export const getUserOwnedObjects = (
+export const getUserEditableObjects = (
   userId: string | number,
   resource: string,
-) => {
-  const filters = {
-    created: [
-      {
-        col: 'created_by',
-        opr: 'rel_o_m',
-        value: `${userId}`,
-      },
-    ],
-  };
-  return SupersetClient.get({
-    endpoint: `/api/v1/${resource}/?q=${getParams(filters.created)}`,
+  filters: Filter[] = [
+    {
+      col: 'id',
+      opr: 'is_editable',
+      value: 1,
+    },
+  ],
+  selectColumns?: string[],
+) =>
+  SupersetClient.get({
+    endpoint: `/api/v1/${resource}/?q=${getParams(filters, selectColumns)}`,
   }).then(res => res.json?.result);
+
+export const getFilteredChartsandDashboards = (
+  addDangerToast: (arg1: string, arg2: any) => any,
+  filters: Filter[],
+  dashboardSelectColumns?: string[],
+  chartSelectColumns?: string[],
+) => {
+  const newBatch = [
+    SupersetClient.get({
+      endpoint: `/api/v1/chart/?q=${getParams(filters, chartSelectColumns)}`,
+    }),
+    SupersetClient.get({
+      endpoint: `/api/v1/dashboard/?q=${getParams(
+        filters,
+        dashboardSelectColumns,
+      )}`,
+    }),
+  ];
+  return Promise.all(newBatch)
+    .then(([chartRes, dashboardRes]) => ({
+      other: [...chartRes.json.result, ...dashboardRes.json.result],
+    }))
+    .catch(errMsg => {
+      addDangerToast(
+        t('There was an error fetching the filtered charts and dashboards:'),
+        errMsg,
+      );
+      return { other: [] };
+    });
 };
 
-export const getRecentAcitivtyObjs = (
+export const getRecentActivityObjs = (
   userId: string | number,
   recent: string,
   addDangerToast: (arg1: string, arg2: any) => any,
+  filters: Filter[],
 ) =>
   SupersetClient.get({ endpoint: recent }).then(recentsRes => {
     const res: any = {};
-    const filters = [
-      {
-        col: 'created_by',
-        opr: 'rel_o_m',
-        value: 0,
-      },
-    ];
-    const newBatch = [
-      SupersetClient.get({
-        endpoint: `/api/v1/chart/?q=${getParams(filters)}`,
-      }),
-      SupersetClient.get({
-        endpoint: `/api/v1/dashboard/?q=${getParams(filters)}`,
-      }),
-    ];
-    return Promise.all(newBatch)
-      .then(([chartRes, dashboardRes]) => {
-        res.examples = [...chartRes.json.result, ...dashboardRes.json.result];
-        res.viewed = recentsRes.json;
+    const distinctRes = lruCache<RecentActivity>(6);
+    recentsRes.json.result.reverse().forEach((record: RecentActivity) => {
+      distinctRes.set(record.item_url, record);
+    });
+    return getFilteredChartsandDashboards(addDangerToast, filters).then(
+      ({ other }) => {
+        res.other = other;
+        res.viewed = distinctRes.values().reverse();
         return res;
-      })
-      .catch(errMsg =>
-        addDangerToast(
-          t('There was an error fetching your recent activity:'),
-          errMsg,
-        ),
-      );
+      },
+    );
   });
 
 export const createFetchRelated = createFetchResourceMethod('related');
 export const createFetchDistinct = createFetchResourceMethod('distinct');
+
+const createFetchSubjectRelation =
+  (relation: string) =>
+  (
+    resource: string,
+    handleError: (error: Response) => void,
+    user?: { userId?: string | number; firstName: string; lastName: string },
+  ) => {
+    const currentUserSubjectId = getBootstrapData()?.common?.user_subject_id;
+    const subjectUser =
+      currentUserSubjectId === undefined || !user
+        ? undefined
+        : {
+            ...user,
+            userId: currentUserSubjectId,
+          };
+    const fetchRelated = createFetchRelated(
+      resource,
+      relation,
+      handleError,
+      subjectUser,
+    );
+    return async (filterValue = '', page: number, pageSize: number) => {
+      const result = await fetchRelated(filterValue, page, pageSize);
+      return {
+        ...result,
+        data: result.data.flatMap(item => {
+          const secondaryLabel = item.extra?.secondary_label as
+            | string
+            | undefined;
+          const type = item.extra?.type as number | undefined;
+          const value = normalizeSubjectToPickerValue({
+            value: item.value,
+            text: item.label,
+            type,
+            secondary_label: secondaryLabel,
+          });
+          return value
+            ? [
+                {
+                  ...value,
+                  title: item.label,
+                },
+              ]
+            : [];
+        }),
+      };
+    };
+  };
+
+export const createFetchEditors = createFetchSubjectRelation('editors');
+export const createFetchSubjects = createFetchSubjectRelation('subjects');
+export const createFetchViewers = createFetchSubjectRelation('viewers');
 
 export function createErrorHandler(
   handleErrorFunc: (
@@ -192,14 +335,11 @@ export function createErrorHandler(
   return async (e: SupersetClientResponse | string) => {
     const parsedError = await getClientErrorObject(e);
     // Taking the first error returned from the API
-    // @ts-ignore
     const errorsArray = parsedError?.errors;
     const config = await SupersetText;
     if (
-      errorsArray &&
-      errorsArray.length &&
-      config &&
-      config.ERRORS &&
+      errorsArray?.length &&
+      config?.ERRORS &&
       errorsArray[0].error_type in config.ERRORS
     ) {
       parsedError.message = config.ERRORS[errorsArray[0].error_type];
@@ -211,11 +351,12 @@ export function createErrorHandler(
 
 export function handleChartDelete(
   { id, slice_name: sliceName }: Chart,
-  addSuccessToast: (arg0: string) => void,
+  addSuccessToast: (arg0: string, options?: ToastContent['options']) => void,
   addDangerToast: (arg0: string) => void,
   refreshData: (arg0?: FetchDataConfig | null) => void,
   chartFilter?: string,
-  userId?: number,
+  userId?: string | number,
+  getData?: (tab: TableTab) => void,
 ) {
   const filters = {
     pageIndex: 0,
@@ -239,22 +380,26 @@ export function handleChartDelete(
   }).then(
     () => {
       if (chartFilter === 'Mine') refreshData(filters);
+      else if (chartFilter && getData) getData(chartFilter as TableTab);
       else refreshData();
-      addSuccessToast(t('Deleted: %s', sliceName));
+      rememberArchivedType('chart');
+      const toast = deletedToastContent(sliceName, 'chart');
+      addSuccessToast(toast.text, toast.options);
     },
-    () => {
-      addDangerToast(t('There was an issue deleting: %s', sliceName));
-    },
+    createErrorHandler(errMsg =>
+      addDangerToast(deleteFailedToast(sliceName, errMsg)),
+    ),
   );
 }
 
 export function handleDashboardDelete(
   { id, dashboard_title: dashboardTitle }: Dashboard,
   refreshData: (config?: FetchDataConfig | null) => void,
-  addSuccessToast: (arg0: string) => void,
+  addSuccessToast: (arg0: string, options?: ToastContent['options']) => void,
   addDangerToast: (arg0: string) => void,
   dashboardFilter?: string,
-  userId?: number,
+  userId?: string | number,
+  getData?: (tab: TableTab) => void,
 ) {
   return SupersetClient.delete({
     endpoint: `/api/v1/dashboard/${id}`,
@@ -271,20 +416,22 @@ export function handleDashboardDelete(
         ],
         filters: [
           {
-            id: 'owners',
-            operator: 'rel_m_m',
-            value: `${userId}`,
+            id: 'id',
+            operator: 'is_editable',
+            value: true,
           },
         ],
       };
       if (dashboardFilter === 'Mine') refreshData(filters);
+      else if (dashboardFilter === 'Other' && getData)
+        getData(dashboardFilter as TableTab);
       else refreshData();
-      addSuccessToast(t('Deleted: %s', dashboardTitle));
+      rememberArchivedType('dashboard');
+      const toast = deletedToastContent(dashboardTitle, 'dashboard');
+      addSuccessToast(toast.text, toast.options);
     },
     createErrorHandler(errMsg =>
-      addDangerToast(
-        t('There was an issue deleting %s: %s', dashboardTitle, errMsg),
-      ),
+      addDangerToast(deleteFailedToast(dashboardTitle, errMsg)),
     ),
   );
 }
@@ -310,15 +457,27 @@ export const CardContainer = styled.div<{
   ${({ showThumbnails, theme }) => `
     overflow: hidden;
     display: grid;
-    grid-gap: ${theme.gridUnit * 12}px ${theme.gridUnit * 4}px;
+    justify-content: start;
+    grid-gap: ${theme.sizeUnit * 12}px ${theme.sizeUnit * 4}px;
     grid-template-columns: repeat(auto-fit, 300px);
     max-height: ${showThumbnails ? '314' : '148'}px;
-    margin-top: ${theme.gridUnit * -6}px;
+    margin-top: ${theme.sizeUnit * -6}px;
     padding: ${
       showThumbnails
-        ? `${theme.gridUnit * 8 + 3}px ${theme.gridUnit * 9}px`
-        : `${theme.gridUnit * 8 + 1}px ${theme.gridUnit * 9}px`
+        ? `${theme.sizeUnit * 8 + 3}px ${theme.sizeUnit * 20}px`
+        : `${theme.sizeUnit * 8 + 1}px ${theme.sizeUnit * 20}px`
     };
+
+    /* Full-width cards on mobile (consumption mode) */
+    ${
+      isMobileConsumptionEnabled()
+        ? `@media (max-width: ${theme.screenSMMax}px) {
+      grid-template-columns: 1fr;
+      padding-left: ${theme.sizeUnit * 4}px;
+      padding-right: ${theme.sizeUnit * 4}px;
+    }`
+        : ''
+    }
   `}
 `;
 
@@ -333,44 +492,234 @@ export const CardStyles = styled.div`
   }
 `;
 
-export const StyledIcon = (theme: SupersetTheme) => css`
-  margin: auto ${theme.gridUnit * 2}px auto 0;
-  color: ${theme.colors.grayscale.base};
-`;
+/**
+ * Cards make their whole surface clickable, but `ListViewCard` also renders its
+ * cover as a router `<Link>`. A click on the cover is therefore handled twice —
+ * once by the link and once by the card wrapper — pushing two identical history
+ * entries for a single click, so the Back button only pops the duplicate and
+ * leaves the user on the page they tried to leave. Let the link win in that case.
+ */
+export const isNavigationHandledByLink = (event: {
+  target: EventTarget | null;
+}): boolean =>
+  Boolean((event.target as HTMLElement | null)?.closest?.('a[href]'));
 
 export /* eslint-disable no-underscore-dangle */
 const isNeedsPassword = (payload: any) =>
   typeof payload === 'object' &&
   Array.isArray(payload._schema) &&
-  payload._schema.length === 1 &&
-  payload._schema[0] === 'Must provide a password for the database';
+  !!payload._schema?.find(
+    (e: string) => e === 'Must provide a password for the database',
+  );
+
+export /* eslint-disable no-underscore-dangle */
+const isNeedsSSHPassword = (payload: any) =>
+  typeof payload === 'object' &&
+  Array.isArray(payload._schema) &&
+  !!payload._schema?.find(
+    (e: string) => e === 'Must provide a password for the ssh tunnel',
+  );
+
+export /* eslint-disable no-underscore-dangle */
+const isNeedsSSHPrivateKey = (payload: any) =>
+  typeof payload === 'object' &&
+  Array.isArray(payload._schema) &&
+  !!payload._schema?.find(
+    (e: string) => e === 'Must provide a private key for the ssh tunnel',
+  );
+
+export /* eslint-disable no-underscore-dangle */
+const isNeedsSSHPrivateKeyPassword = (payload: any) =>
+  typeof payload === 'object' &&
+  Array.isArray(payload._schema) &&
+  !!payload._schema?.find(
+    (e: string) =>
+      e === 'Must provide a private key password for the ssh tunnel',
+  );
 
 export const isAlreadyExists = (payload: any) =>
   typeof payload === 'string' &&
   payload.includes('already exists and `overwrite=true` was not passed');
 
 export const getPasswordsNeeded = (errors: Record<string, any>[]) =>
-  errors
-    .map(error =>
-      Object.entries(error.extra)
-        .filter(([, payload]) => isNeedsPassword(payload))
-        .map(([fileName]) => fileName),
-    )
-    .flat();
+  errors.flatMap(error =>
+    Object.entries(error.extra)
+      .filter(([, payload]) => isNeedsPassword(payload))
+      .map(([fileName]) => fileName),
+  );
+
+export const getSSHPasswordsNeeded = (errors: Record<string, any>[]) =>
+  errors.flatMap(error =>
+    Object.entries(error.extra)
+      .filter(([, payload]) => isNeedsSSHPassword(payload))
+      .map(([fileName]) => fileName),
+  );
+
+export const getSSHPrivateKeysNeeded = (errors: Record<string, any>[]) =>
+  errors.flatMap(error =>
+    Object.entries(error.extra)
+      .filter(([, payload]) => isNeedsSSHPrivateKey(payload))
+      .map(([fileName]) => fileName),
+  );
+
+export const getSSHPrivateKeyPasswordsNeeded = (
+  errors: Record<string, any>[],
+) =>
+  errors.flatMap(error =>
+    Object.entries(error.extra)
+      .filter(([, payload]) => isNeedsSSHPrivateKeyPassword(payload))
+      .map(([fileName]) => fileName),
+  );
 
 export const getAlreadyExists = (errors: Record<string, any>[]) =>
-  errors
-    .map(error =>
-      Object.entries(error.extra)
-        .filter(([, payload]) => isAlreadyExists(payload))
-        .map(([fileName]) => fileName),
-    )
-    .flat();
+  errors.flatMap(error =>
+    Object.entries(error.extra)
+      .filter(([, payload]) => isAlreadyExists(payload))
+      .map(([fileName]) => fileName),
+  );
+
+// Matches error messages for masked_encrypted_extra fields.
+// Format: "Must provide value for masked_encrypted_extra field: $.path (Label)"
+// The label in parentheses is optional.
+const ENCRYPTED_EXTRA_FIELD_REGEX =
+  /^Must provide value for masked_encrypted_extra field: (.+?)(?:\s+\((.+)\))?$/;
+
+export /* eslint-disable no-underscore-dangle */
+const isNeedsEncryptedExtraField = (payload: any) =>
+  typeof payload === 'object' &&
+  Array.isArray(payload._schema) &&
+  payload._schema?.some((e: string) => ENCRYPTED_EXTRA_FIELD_REGEX.test(e));
+
+export const getEncryptedExtraFieldsNeeded = (
+  errors: Record<string, any>[],
+): FileEncryptedExtraFields[] =>
+  errors.flatMap(error =>
+    Object.entries(error.extra)
+      .filter(([, payload]) => isNeedsEncryptedExtraField(payload))
+      .map(([fileName, payload]) => ({
+        fileName,
+        fields: (payload as any)._schema
+          .filter((e: string) => ENCRYPTED_EXTRA_FIELD_REGEX.test(e))
+          .map((e: string) => {
+            const match = e.match(ENCRYPTED_EXTRA_FIELD_REGEX);
+            if (!match) return null;
+            const path = match[1];
+            return { path, label: match[2] || path };
+          })
+          .filter(Boolean) as EncryptedExtraField[],
+      })),
+  );
 
 export const hasTerminalValidation = (errors: Record<string, any>[]) =>
-  errors.some(
-    error =>
-      !Object.values(error.extra).some(
-        payload => isNeedsPassword(payload) || isAlreadyExists(payload),
-      ),
-  );
+  errors.some(error => {
+    const noIssuesCodes = Object.entries(error.extra).filter(
+      ([key]) => key !== 'issue_codes',
+    );
+
+    if (noIssuesCodes.length === 0) return true;
+
+    return !noIssuesCodes.every(
+      ([, payload]) =>
+        isNeedsPassword(payload) ||
+        isAlreadyExists(payload) ||
+        isNeedsSSHPassword(payload) ||
+        isNeedsSSHPrivateKey(payload) ||
+        isNeedsSSHPrivateKeyPassword(payload) ||
+        isNeedsEncryptedExtraField(payload),
+    );
+  });
+
+export const checkUploadExtensions = (
+  perm: Array<string>,
+  cons: Array<string>,
+) => {
+  if (perm !== undefined) {
+    return intersection(perm, cons).length > 0;
+  }
+  return false;
+};
+
+export const uploadUserPerms = (
+  roles: Record<string, [string, string][]>,
+  csvExt: Array<string>,
+  colExt: Array<string>,
+  excelExt: Array<string>,
+  allowedExt: Array<string>,
+) => {
+  const canUploadCSV =
+    findPermission('can_upload', 'Database', roles) &&
+    checkUploadExtensions(csvExt, allowedExt);
+  const canUploadColumnar =
+    checkUploadExtensions(colExt, allowedExt) &&
+    findPermission('can_upload', 'Database', roles);
+  const canUploadExcel =
+    checkUploadExtensions(excelExt, allowedExt) &&
+    findPermission('can_upload', 'Database', roles);
+  return {
+    canUploadCSV,
+    canUploadColumnar,
+    canUploadExcel,
+    canUploadData: canUploadCSV || canUploadColumnar || canUploadExcel,
+  };
+};
+
+export function getFilterValues(
+  tab: TableTab,
+  welcomeTable: WelcomeTable,
+  user?: User,
+  otherTabFilters?: Filter[],
+): FilterValue[] {
+  if (
+    tab === TableTab.Created ||
+    (welcomeTable === WelcomeTable.SavedQueries && tab === TableTab.Mine)
+  ) {
+    return [
+      {
+        id: 'created_by',
+        operator: 'rel_o_m',
+        value: `${user?.userId}`,
+      },
+    ];
+  }
+  if (welcomeTable === WelcomeTable.SavedQueries && tab === TableTab.Favorite) {
+    return [
+      {
+        id: 'id',
+        operator: 'saved_query_is_fav',
+        value: true,
+      },
+    ];
+  }
+  if (tab === TableTab.Mine && user) {
+    return [
+      {
+        id: 'id',
+        operator: 'is_editable',
+        value: true,
+      },
+    ];
+  }
+  if (
+    tab === TableTab.Favorite &&
+    [WelcomeTable.Dashboards, WelcomeTable.Charts].includes(welcomeTable)
+  ) {
+    return [
+      {
+        id: 'id',
+        operator:
+          welcomeTable === WelcomeTable.Dashboards
+            ? 'dashboard_is_favorite'
+            : 'chart_is_favorite',
+        value: true,
+      },
+    ];
+  }
+  if (tab === TableTab.Other) {
+    return (otherTabFilters || []).map(flt => ({
+      id: flt.col,
+      operator: flt.opr,
+      value: flt.value,
+    }));
+  }
+  return [];
+}

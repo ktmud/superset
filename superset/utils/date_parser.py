@@ -14,18 +14,21 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+from __future__ import annotations
+
 import calendar
 import logging
 import re
 from datetime import datetime, timedelta
+from functools import lru_cache
 from time import struct_time
-from typing import Dict, List, Optional, Tuple
 
+import pandas as pd
 import parsedatetime
 from dateutil.parser import parse
 from dateutil.relativedelta import relativedelta
 from flask_babel import lazy_gettext as _
-from holidays import CountryHoliday
+from holidays import country_holidays
 from pyparsing import (
     CaselessKeyword,
     Forward,
@@ -35,21 +38,56 @@ from pyparsing import (
     ParserElement,
     ParseResults,
     pyparsing_common,
-    quotedString,
+    quoted_string,
     Suppress,
 )
 
-from superset.charts.commands.exceptions import (
+from superset.commands.chart.exceptions import (
     TimeDeltaAmbiguousError,
     TimeRangeAmbiguousError,
     TimeRangeParseFailError,
 )
-from superset.utils.core import NO_TIME_RANGE
-from superset.utils.memoized import memoized
+from superset.constants import InstantTimeComparison, LRU_CACHE_MAX_SIZE, NO_TIME_RANGE
 
-ParserElement.enablePackrat()
+ParserElement.enable_packrat()
+
+# parsedatetime emits a noisy DEBUG record ("eval now with context - False, False")
+# on every relative-date evaluation. Superset has no actionable use for that
+# internal trace, and it floods production logs whenever the root logger is at
+# DEBUG. Suppress the library's own logger to WARNING; real failures still
+# surface, just not the per-call chatter.
+logging.getLogger("parsedatetime").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+# Source times used by ``is_constant_human_timedelta`` to tell a delta from an
+# anchor. The first two share a date and differ only in the hour, detecting
+# sensitivity to time of day. The third changes the date and weekday, detecting
+# weekday and month-name anchors. All are mid-month and mid-year, away from any
+# boundary a relative shift could clamp against. Neither hour is parsedatetime's
+# 09:00 default, so an anchor cannot coincide with a probe and masquerade as a
+# zero shift.
+_SHIFT_PROBE_TIMES: tuple[datetime, ...] = (
+    datetime(2024, 6, 15, 3, 0, 0),
+    datetime(2024, 6, 15, 21, 0, 0),
+    datetime(2024, 6, 18, 3, 0, 0),
+)
+
+# Mapping of ordinal words to their numeric values for date expressions
+ORDINAL_MAP: dict[str, int] = {
+    "first": 1,
+    "1st": 1,
+}
+
+# parsedatetime does not understand "N quarters" (it leaves the source time
+# unchanged), so such phrases are rewritten to the equivalent number of months
+# before parsing. The lookbehind and the bounded repetition keep matching
+# linear on user-provided strings (every suffix of an unbounded digit run
+# would be re-scanned) and keep the int() conversion small; longer digit
+# runs fall through to parsedatetime like any other unparseable phrase.
+_QUARTERS_PATTERN: re.Pattern[str] = re.compile(
+    r"(?<![0-9])([0-9]{1,10})\s+quarters?\b", re.IGNORECASE
+)
 
 
 def parse_human_datetime(human_readable: str) -> datetime:
@@ -74,15 +112,18 @@ def parse_human_datetime(human_readable: str) -> datetime:
     return dttm
 
 
-def normalize_time_delta(human_readable: str) -> Dict[str, int]:
-    x_unit = r"^\s*([0-9]+)\s+(second|minute|hour|day|week|month|quarter|year)s?\s+(ago|later)*$"  # pylint: disable=line-too-long,useless-suppression
+def normalize_time_delta(human_readable: str) -> dict[str, int]:
+    x_unit = r"^\s*([0-9]+)\s+(second|minute|hour|day|week|month|quarter|year)s?\s+(ago|later)*$"  # noqa: E501
     matched = re.match(x_unit, human_readable, re.IGNORECASE)
     if not matched:
         raise TimeDeltaAmbiguousError(human_readable)
 
-    key = matched[2] + "s"
+    key = matched[2].lower() + "s"
     value = int(matched[1])
-    value = -value if matched[3] == "ago" else value
+    value = -value if (matched[3] or "").lower() == "ago" else value
+    if key == "quarters":
+        # pd.DateOffset does not accept a `quarters` argument
+        key, value = "months", value * 3
     return {key: value}
 
 
@@ -97,18 +138,67 @@ def dttm_from_timetuple(date_: struct_time) -> datetime:
     )
 
 
+def _rewrite_quarters_as_months(human_readable: str | None) -> str:
+    return _QUARTERS_PATTERN.sub(
+        lambda match: f"{int(match[1]) * 3} months",
+        human_readable or "",
+    )
+
+
 def get_past_or_future(
-    human_readable: Optional[str], source_time: Optional[datetime] = None,
+    human_readable: str | None,
+    source_time: datetime | None = None,
 ) -> datetime:
     cal = parsedatetime.Calendar()
     source_dttm = dttm_from_timetuple(
         source_time.timetuple() if source_time else datetime.now().timetuple()
     )
-    return dttm_from_timetuple(cal.parse(human_readable or "", source_dttm)[0])
+    human_readable = _rewrite_quarters_as_months(human_readable)
+    return dttm_from_timetuple(cal.parse(human_readable, source_dttm)[0])
+
+
+def is_parseable_human_timedelta(human_readable: str | None) -> bool:
+    """
+    Returns whether parsedatetime understands the phrase.
+
+    parsedatetime echoes the source time back for phrases it cannot parse,
+    so a zero ``parse_human_timedelta`` result cannot distinguish an
+    uninterpretable phrase from one that legitimately parses to no shift
+    (e.g. "0 days ago"). The parse flag makes that distinction: it is 0
+    only when nothing in the phrase was understood.
+    """
+    cal = parsedatetime.Calendar()
+    return cal.parse(_rewrite_quarters_as_months(human_readable))[1] != 0
+
+
+def is_constant_human_timedelta(human_readable: str | None) -> bool:
+    """
+    Returns whether the phrase shifts every source time by the same amount.
+
+    ``is_parseable_human_timedelta`` accepts anchors such as "yesterday" and
+    "last month" alongside true deltas such as "1 year ago", but the two
+    behave differently when applied per row: an anchor resolves to a single
+    timestamp (parsedatetime defaults to 09:00) no matter where the source
+    time sits within the day, so it shifts each row by a different amount.
+
+    Probing source times across hours and dates separates the two. A delta
+    shifts every probe equally; an anchor depends on at least the source hour,
+    weekday, or month and therefore yields differing shifts. The probes avoid
+    calendar boundaries so leap years and month lengths cannot skew the
+    comparison.
+    """
+    if not is_parseable_human_timedelta(human_readable):
+        return False
+    deltas = {
+        get_past_or_future(human_readable, probe) - probe
+        for probe in _SHIFT_PROBE_TIMES
+    }
+    return len(deltas) == 1
 
 
 def parse_human_timedelta(
-    human_readable: Optional[str], source_time: Optional[datetime] = None,
+    human_readable: str | None,
+    source_time: datetime | None = None,
 ) -> timedelta:
     """
     Returns ``datetime.timedelta`` from natural language time deltas
@@ -123,7 +213,7 @@ def parse_human_timedelta(
 
 
 def parse_past_timedelta(
-    delta_str: str, source_time: Optional[datetime] = None
+    delta_str: str, source_time: datetime | None = None
 ) -> timedelta:
     """
     Takes a delta like '1 year' and finds the timedelta for that period in
@@ -134,22 +224,290 @@ def parse_past_timedelta(
     or datetime.timedelta(365).
     """
     return -parse_human_timedelta(
-        delta_str if delta_str.startswith("-") else f"-{delta_str}", source_time,
+        delta_str if delta_str.startswith("-") else f"-{delta_str}",
+        source_time,
     )
 
 
-def get_since_until(  # pylint: disable=too-many-arguments,too-many-locals,too-many-branches
-    time_range: Optional[str] = None,
-    since: Optional[str] = None,
-    until: Optional[str] = None,
-    time_shift: Optional[str] = None,
-    relative_start: Optional[str] = None,
-    relative_end: Optional[str] = None,
-) -> Tuple[Optional[datetime], Optional[datetime]]:
+def get_relative_base(unit: str, relative_start: str | None = None) -> str:
+    """
+    Determines the relative base (`now` or `today`) based on the granularity of the unit
+    and an optional user-provided base expression. This is used as the base for all
+    queries parsed from `time_range_lookup`.
+
+    Args:
+        unit (str): The time unit (e.g., "second", "minute", "hour", "day", etc.).
+        relative_start (datetime | None): Optional user-provided base time.
+
+    Returns:
+        datetime: The base time (`now`, `today`, or user-provided).
+    """
+    if relative_start is not None:
+        return relative_start
+
+    granular_units = {"second", "minute", "hour"}
+    broad_units = {"day", "week", "month", "quarter", "year"}
+
+    if unit.lower() in granular_units:
+        return "now"
+    elif unit.lower() in broad_units:
+        return "today"
+    raise ValueError(f"Unknown unit: {unit}")
+
+
+def handle_start_of(base_expression: str, unit: str) -> str:
+    """
+    Generates a datetime expression for the start of a given unit (e.g., start of month,
+     start of year).
+    This function is used to handle queries matching the first regex in
+    `time_range_lookup`.
+
+    Args:
+        base_expression (str): The base datetime expression (e.g., "DATETIME('now')"),
+            provided by `get_relative_base`.
+        unit (str): The granularity to calculate the start for (e.g., "year",
+        "month", "week"),
+            extracted from the regex.
+
+    Returns:
+        str: The resulting expression for the start of the specified unit.
+
+    Raises:
+        ValueError: If the unit is not one of the valid options.
+
+    Relation to `time_range_lookup`:
+        - Handles the "start of" or "beginning of" modifiers in the first regex pattern.
+        - Example: "start of this month" → `DATETRUNC(DATETIME('today'), month)`.
+    """
+    valid_units = {"year", "quarter", "month", "week", "day"}
+    if unit in valid_units:
+        return f"DATETRUNC({base_expression}, {unit})"
+    raise ValueError(f"Invalid unit for 'start of': {unit}")
+
+
+def handle_end_of(base_expression: str, unit: str) -> str:
+    """
+    Generates a datetime expression for the end of a given unit (e.g., end of month,
+      end of year).
+    This function is used to handle queries matching the first regex in
+    `time_range_lookup`.
+
+    Args:
+        base_expression (str): The base datetime expression (e.g., "DATETIME('now')"),
+            provided by `get_relative_base`.
+        unit (str): The granularity to calculate the end for (e.g., "year", "month",
+          "week"), extracted from the regex.
+
+    Returns:
+        str: The resulting expression for the end of the specified unit.
+
+    Raises:
+        ValueError: If the unit is not one of the valid options.
+
+    Relation to `time_range_lookup`:
+        - Handles the "end of" modifier in the first regex pattern.
+        - Example: "end of last month" → `LASTDAY(DATETIME('today'), month)`.
+    """
+    valid_units = {"year", "quarter", "month", "week", "day"}
+    if unit in valid_units:
+        return f"LASTDAY({base_expression}, {unit})"
+    raise ValueError(f"Invalid unit for 'end of': {unit}")
+
+
+def handle_nth_of(
+    ordinal: str,
+    subunit: str | None,
+    scope: str | None,
+    unit: str,
+    relative_start: str | None,
+) -> str:
+    """
+    Handles "first" time expressions like "first of the month" or
+    "first week of this year".
+
+    This handler returns either a single date expression or a range expression
+    depending on whether a subunit is provided.
+
+    Args:
+        ordinal: The ordinal word or number ("first", "1st")
+        subunit: The smaller time unit ("week", "day", "month") or None
+        scope: Time scope ("this", "last", "next", "prior") or None
+            (defaults to "this")
+        unit: The larger time unit ("month", "year", "quarter", "week")
+        relative_start: Optional user-provided base time
+
+    Returns:
+        - Single date expression if subunit is None (e.g., "first of the month")
+        - Range expression "since : until" if subunit is provided
+          (e.g., "first week of year")
+
+    Examples:
+        >>> handle_nth_of("first", None, "this", "month", None)
+        "DATETRUNC(DATETIME('today'), month)"
+
+        >>> handle_nth_of("first", "week", "this", "year", None)
+        "DATETRUNC(..., year) : DATEADD(DATETRUNC(..., year), 1, week)"
+    """
+    # Convert ordinal to number
+    n = ORDINAL_MAP.get(ordinal.lower(), int(ordinal) if ordinal.isdecimal() else 1)
+
+    relative_base = get_relative_base(unit, relative_start)
+    effective_scope = scope.lower() if scope else "this"
+
+    # Get the start of the larger unit with scope applied
+    base_expr = handle_scope_and_unit(effective_scope, "", unit, relative_base)
+    start_of_unit = f"DATETRUNC({base_expr}, {unit.lower()})"
+
+    if subunit is None:
+        # "first of the month" -> single date (first day of the unit)
+        return start_of_unit
+    else:
+        # "first week of the year" -> range
+        # Start: beginning of unit + (n-1) subunits
+        if n == 1:
+            range_start = start_of_unit
+        else:
+            range_start = f"DATEADD({start_of_unit}, {n - 1}, {subunit.lower()})"
+
+        # End: start + 1 subunit
+        range_end = f"DATEADD({range_start}, 1, {subunit.lower()})"
+
+        return f"{range_start} : {range_end}"
+
+
+def handle_modifier_and_unit(
+    modifier: str, scope: str, delta: str, unit: str, relative_base: str
+) -> str:
+    """
+    Generates a datetime expression based on a modifier, scope, delta, unit,
+    and relative base.
+    This function handles queries matching the first regex pattern in
+    `time_range_lookup`.
+
+    Args:
+        modifier (str): Specifies the operation (e.g., "start of", "end of").
+            Extracted from the regex to determine whether to calculate the start or end.
+        scope (str): The time scope (e.g., "this", "last", "next", "prior"),
+            extracted from the regex.
+        delta (str): The numeric delta value (e.g., "1", "2"), extracted from the regex.
+        unit (str): The granularity (e.g., "day", "month", "year"), extracted from
+                    the regex.
+        relative_base (str): The base datetime expression (e.g., "now" or "today"),
+            determined by `get_relative_base`.
+
+    Returns:
+        str: The resulting datetime expression.
+
+    Raises:
+        ValueError: If the modifier is invalid.
+
+    Relation to `time_range_lookup`:
+        - Processes queries like "start of this month" or "end of prior 2 years".
+        - Example: "start of this month" → `DATETRUNC(DATETIME('today'), month)`.
+
+    Example:
+        >>> handle_modifier_and_unit("start of", "this", "", "month", "today")
+        "DATETRUNC(DATETIME('today'), month)"
+
+        >>> handle_modifier_and_unit("end of", "last", "1", "year", "today")
+        "LASTDAY(DATEADD(DATETIME('today'), -1, year), year)"
+    """
+    base_expression = handle_scope_and_unit(scope, delta, unit, relative_base)
+
+    if modifier.lower() in ["start of", "beginning of"]:
+        return handle_start_of(base_expression, unit.lower())
+    elif modifier.lower() == "end of":
+        return handle_end_of(base_expression, unit.lower())
+    else:
+        raise ValueError(f"Unknown modifier: {modifier}")
+
+
+def handle_scope_and_unit(scope: str, delta: str, unit: str, relative_base: str) -> str:
+    """
+    Generates a datetime expression based on the scope, delta, unit, and relative base.
+    This function handles queries matching the second regex pattern in
+    `time_range_lookup`.
+
+    Args:
+        scope (str): The time scope (e.g., "this", "last", "next", "prior"),
+            extracted from the regex.
+        delta (str): The numeric delta value (e.g., "1", "2"), extracted from the regex.
+        unit (str): The granularity (e.g., "second", "minute", "hour", "day"),
+            extracted from the regex.
+        relative_base (str): The base datetime expression (e.g., "now" or "today"),
+            determined by `get_relative_base`.
+
+    Returns:
+        str: The resulting datetime expression.
+
+    Raises:
+        ValueError: If the scope is invalid.
+
+    Relation to `time_range_lookup`:
+        - Processes queries like "last 2 weeks" or "this month".
+        - Example: "last 2 weeks" → `DATEADD(DATETIME('today'), -2, week)`.
+    """
+    _delta = int(delta) if delta else 1
+    if scope.lower() == "this":
+        return f"DATETIME('{relative_base}')"
+    elif scope.lower() in ["last", "prior"]:
+        return f"DATEADD(DATETIME('{relative_base}'), -{_delta}, {unit})"
+    elif scope.lower() == "next":
+        return f"DATEADD(DATETIME('{relative_base}'), {_delta}, {unit})"
+    else:
+        raise ValueError(f"Invalid scope: {scope}")
+
+
+# Shared by _shorthand_unit_pattern below and the "this|last|next|prior <unit>"
+# regex in get_since_until()'s time_range_lookup -- kept as one constant so the
+# two can't drift out of sync the way this alternation once did (it was missing
+# "hour" in one of the two, which is what caused this file's sub-day bug).
+_RELATIVE_UNIT_PATTERN = r"(second|minute|hour|day|week|month|quarter|year)"
+
+_shorthand_unit_pattern = re.compile(
+    r"^(?:Last|Next)\s{1,5}(?:[0-9]+\s{0,5})?" + _RELATIVE_UNIT_PATTERN + r"s?$",
+    re.IGNORECASE,
+)
+
+
+def get_default_bound_for_shorthand(time_range: str) -> str:
+    """
+    Determines the default anchor (`now` or `today`) for the bound not covered by
+    a separator-less "Last <unit>" / "Next <unit>" `time_range` shorthand, matching
+    the anchor `get_relative_base` picks for the unit that *is* covered.
+
+    Without this, a sub-day unit (second/minute/hour) paired an unconditional
+    "today" (midnight) against a "now"-anchored other bound, so "Last hour" and
+    similar resolved to since > until whenever evaluated after local midnight.
+
+    Args:
+        time_range (str): The separator-less shorthand, e.g. "Last hour".
+
+    Returns:
+        str: `now` for a granular unit (second/minute/hour), `today` otherwise.
+    """
+    match = _shorthand_unit_pattern.match(time_range)
+    return get_relative_base(match.group(1)) if match else "today"
+
+
+def is_no_time_range(time_range: str | None) -> bool:
+    """Recognize the canonical or request-localized unbounded time range."""
+    return time_range == NO_TIME_RANGE or time_range == _(NO_TIME_RANGE)
+
+
+def get_since_until(  # pylint: disable=too-many-arguments,too-many-locals,too-many-branches,too-many-statements  # noqa: C901
+    time_range: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    time_shift: str | None = None,
+    relative_start: str | None = None,
+    relative_end: str | None = None,
+    instant_time_comparison_range: str | None = None,
+) -> tuple[datetime | None, datetime | None]:
     """Return `since` and `until` date time tuple from string representations of
     time_range, since, until and time_shift.
 
-    This functiom supports both reading the keys separately (from `since` and
+    This function supports both reading the keys separately (from `since` and
     `until`), as well as the new `time_range` key. Valid formats are:
 
         - ISO 8601
@@ -171,59 +529,149 @@ def get_since_until(  # pylint: disable=too-many-arguments,too-many-locals,too-m
 
     """
     separator = " : "
-    _relative_start = relative_start if relative_start else "today"
     _relative_end = relative_end if relative_end else "today"
 
-    if time_range == NO_TIME_RANGE:
+    if is_no_time_range(time_range):
         return None, None
 
     if time_range and time_range.startswith("Last") and separator not in time_range:
-        time_range = time_range + separator + _relative_end
+        _end = relative_end or get_default_bound_for_shorthand(time_range)
+        time_range = time_range + separator + _end
 
     if time_range and time_range.startswith("Next") and separator not in time_range:
-        time_range = _relative_start + separator + time_range
+        _start = relative_start or get_default_bound_for_shorthand(time_range)
+        time_range = _start + separator + time_range
 
     if (
         time_range
         and time_range.startswith("previous calendar week")
         and separator not in time_range
     ):
-        time_range = "DATETRUNC(DATEADD(DATETIME('today'), -1, WEEK), WEEK) : DATETRUNC(DATETIME('today'), WEEK)"  # pylint: disable=line-too-long,useless-suppression
+        time_range = "DATETRUNC(DATEADD(DATETIME('today'), -1, WEEK), WEEK) : DATETRUNC(DATETIME('today'), WEEK)"  # noqa: E501
     if (
         time_range
         and time_range.startswith("previous calendar month")
         and separator not in time_range
     ):
-        time_range = "DATETRUNC(DATEADD(DATETIME('today'), -1, MONTH), MONTH) : DATETRUNC(DATETIME('today'), MONTH)"  # pylint: disable=line-too-long,useless-suppression
+        time_range = "DATETRUNC(DATEADD(DATETIME('today'), -1, MONTH), MONTH) : DATETRUNC(DATETIME('today'), MONTH)"  # noqa: E501
+    if (
+        time_range
+        and time_range.startswith("previous calendar quarter")
+        and separator not in time_range
+    ):
+        time_range = (
+            "DATETRUNC(DATEADD(DATETIME('today'), -1, QUARTER), QUARTER) : "
+            "DATETRUNC(DATETIME('today'), QUARTER)"  # noqa: E501
+        )
     if (
         time_range
         and time_range.startswith("previous calendar year")
         and separator not in time_range
     ):
-        time_range = "DATETRUNC(DATEADD(DATETIME('today'), -1, YEAR), YEAR) : DATETRUNC(DATETIME('today'), YEAR)"  # pylint: disable=line-too-long,useless-suppression
+        time_range = "DATETRUNC(DATEADD(DATETIME('today'), -1, YEAR), YEAR) : DATETRUNC(DATETIME('today'), YEAR)"  # noqa: E501
+    if (
+        time_range
+        and time_range.startswith("Current day")
+        and separator not in time_range
+    ):
+        time_range = "DATETRUNC(DATEADD(DATETIME('today'), 0, DAY), DAY) : DATETRUNC(DATEADD(DATETIME('today'), 1, DAY), DAY)"  # noqa: E501
+    if (
+        time_range
+        and time_range.startswith("Current week")
+        and separator not in time_range
+    ):
+        time_range = "DATETRUNC(DATEADD(DATETIME('today'), 0, WEEK), WEEK) : DATETRUNC(DATEADD(DATETIME('today'), 1, WEEK), WEEK)"  # noqa: E501
+    if (
+        time_range
+        and time_range.startswith("Current month")
+        and separator not in time_range
+    ):
+        time_range = "DATETRUNC(DATEADD(DATETIME('today'), 0, MONTH), MONTH) : DATETRUNC(DATEADD(DATETIME('today'), 1, MONTH), MONTH)"  # noqa: E501
+    if (
+        time_range
+        and time_range.startswith("Current quarter")
+        and separator not in time_range
+    ):
+        time_range = "DATETRUNC(DATEADD(DATETIME('today'), 0, QUARTER), QUARTER) : DATETRUNC(DATEADD(DATETIME('today'), 1, QUARTER), QUARTER)"  # noqa: E501
+    if (
+        time_range
+        and time_range.startswith("Current year")
+        and separator not in time_range
+    ):
+        time_range = "DATETRUNC(DATEADD(DATETIME('today'), 0, YEAR), YEAR) : DATETRUNC(DATEADD(DATETIME('today'), 1, YEAR), YEAR)"  # noqa: E501
+
+    # Handle "first [subunit] of [scope] [unit]" patterns that produce a range
+    # e.g., "first week of this year" -> returns start of year to end of first week
+    # e.g., "first month of this quarter" -> returns start of first month to end
+    # Note: "day" is NOT included as a subunit here because "first day of X" should
+    # return a single date, not a range. Those are handled in time_range_lookup below.
+    if time_range and separator not in time_range:
+        nth_subunit_pattern = (
+            r"^(first|1st)\s{1,5}"
+            r"(week|month|quarter)\s{1,5}of\s{1,5}"
+            r"(?:(this|last|next|prior)\s{1,5})?"
+            r"(?:the\s{1,5})?"
+            r"(week|month|quarter|year)$"
+        )
+        match = re.search(nth_subunit_pattern, time_range, re.IGNORECASE)
+        if match:
+            ordinal, subunit, scope, unit = match.groups()
+            time_range = handle_nth_of(ordinal, subunit, scope, unit, relative_start)
 
     if time_range and separator in time_range:
         time_range_lookup = [
             (
-                r"^last\s+(day|week|month|quarter|year)$",
-                lambda unit: f"DATEADD(DATETIME('{_relative_start}'), -1, {unit})",
+                r"^(start of|beginning of|end of)\s{1,5}"
+                r"(this|last|next|prior)\s{1,5}"
+                r"([0-9]+)?\s{0,5}"
+                r"(day|week|month|quarter|year)s?$",  # Matches phrases like "start of next month"  # noqa: E501
+                lambda modifier, scope, delta, unit: handle_modifier_and_unit(
+                    modifier,
+                    scope,
+                    delta,
+                    unit,
+                    get_relative_base(unit, relative_start),
+                ),
             ),
             (
-                r"^last\s+([0-9]+)\s+(second|minute|hour|day|week|month|year)s?$",
-                lambda delta, unit: f"DATEADD(DATETIME('{_relative_start}'), -{int(delta)}, {unit})",  # pylint: disable=line-too-long,useless-suppression
+                # Pattern for "first of [scope] [unit]" - single date
+                # e.g., "first of this month", "first of last year"
+                r"^(first|1st)\s{1,5}"
+                r"(?:day\s{1,5})?of\s{1,5}"
+                r"(this|last|next|prior)\s{1,5}"
+                r"(day|week|month|quarter|year)s?$",
+                lambda ordinal, scope, unit: handle_nth_of(
+                    ordinal, None, scope, unit, relative_start
+                ),
             ),
             (
-                r"^next\s+([0-9]+)\s+(second|minute|hour|day|week|month|year)s?$",
-                lambda delta, unit: f"DATEADD(DATETIME('{_relative_end}'), {int(delta)}, {unit})",  # pylint: disable=line-too-long,useless-suppression
+                # Pattern for "first of the [unit]" - single date with default scope
+                # e.g., "first of the month", "first day of the year"
+                r"^(first|1st)\s{1,5}"
+                r"(?:day\s{1,5})?of\s{1,5}"
+                r"(?:the\s{1,5})?"
+                r"(week|month|quarter|year)$",
+                lambda ordinal, unit: handle_nth_of(
+                    ordinal, None, None, unit, relative_start
+                ),
             ),
             (
-                r"^(DATETIME.*|DATEADD.*|DATETRUNC.*|LASTDAY.*|HOLIDAY.*)$",
+                r"^(this|last|next|prior)\s{1,5}"
+                r"([0-9]+)?\s{0,5}"
+                + _RELATIVE_UNIT_PATTERN
+                + r"s?$",  # Matches "next 5 days" or "last 2 weeks" # noqa: E501
+                lambda scope, delta, unit: handle_scope_and_unit(
+                    scope, delta, unit, get_relative_base(unit, relative_start)
+                ),
+            ),
+            (
+                r"^(DATETIME.*|DATEADD.*|DATETRUNC.*|LASTDAY.*|HOLIDAY.*)$",  # Matches date-related keywords # noqa: E501
                 lambda text: text,
             ),
         ]
 
         since_and_until_partition = [_.strip() for _ in time_range.split(separator, 1)]
-        since_and_until: List[Optional[str]] = []
+        since_and_until: list[str | None] = []
         for part in since_and_until_partition:
             if not part:
                 # if since or until is "", set as None
@@ -244,6 +692,10 @@ def get_since_until(  # pylint: disable=too-many-arguments,too-many-locals,too-m
 
         _since, _until = map(datetime_eval, since_and_until)
     else:
+        # Only an omitted time_range may use the legacy separate bounds.
+        # Explicit values must resolve through the range grammar above.
+        if time_range is not None:
+            raise TimeRangeParseFailError(time_range)
         since = since or ""
         if since:
             since = add_ago_to_since(since)
@@ -255,9 +707,61 @@ def get_since_until(  # pylint: disable=too-many-arguments,too-many-locals,too-m
         )
 
     if time_shift:
-        time_delta = parse_past_timedelta(time_shift)
-        _since = _since if _since is None else (_since - time_delta)
-        _until = _until if _until is None else (_until - time_delta)
+        separator = " : "
+        if separator in time_shift:
+            # Date range format: parse as a new time range
+            parts = time_shift.split(separator, 1)
+            if len(parts) != 2:
+                raise ValueError(f"Invalid time_shift format: {time_shift}")
+            since_part, until_part = (part.strip() for part in parts)
+            _since = parse_human_datetime(since_part)
+            _until = parse_human_datetime(until_part)
+        else:
+            time_delta_since = parse_past_timedelta(time_shift, _since)
+            time_delta_until = parse_past_timedelta(time_shift, _until)
+            _since = _since if _since is None else (_since - time_delta_since)
+            _until = _until if _until is None else (_until - time_delta_until)
+
+    if instant_time_comparison_range:
+        # This is only set using the new time comparison controls
+        # that is made available in some plugins behind the experimental
+        # feature flag.
+        # pylint: disable=import-outside-toplevel
+        from superset import feature_flag_manager
+
+        if feature_flag_manager.is_feature_enabled("CHART_PLUGINS_EXPERIMENTAL"):
+            time_unit = ""
+            delta_in_days = None
+            if instant_time_comparison_range == InstantTimeComparison.YEAR:
+                time_unit = "YEAR"
+            elif instant_time_comparison_range == InstantTimeComparison.MONTH:
+                time_unit = "MONTH"
+            elif instant_time_comparison_range == InstantTimeComparison.WEEK:
+                time_unit = "WEEK"
+            elif instant_time_comparison_range == InstantTimeComparison.INHERITED:
+                delta_in_days = (_until - _since).days if _since and _until else None
+                time_unit = "DAY"
+
+            if time_unit:
+                strtfime_since = (
+                    _since.strftime("%Y-%m-%dT%H:%M:%S") if _since else relative_start
+                )
+                strtfime_until = (
+                    _until.strftime("%Y-%m-%dT%H:%M:%S") if _until else relative_end
+                )
+
+                since_and_until = [
+                    (
+                        f"DATEADD(DATETIME('{strtfime_since}'), "
+                        f"-{delta_in_days or 1}, {time_unit})"
+                    ),
+                    (
+                        f"DATEADD(DATETIME('{strtfime_until}'), "
+                        f"-{delta_in_days or 1}, {time_unit})"
+                    ),
+                ]
+
+                _since, _until = map(datetime_eval, since_and_until)
 
     if _since and _until and _since > _until:
         raise ValueError(_("From date cannot be larger than to date"))
@@ -305,10 +809,29 @@ class EvalDateAddFunc:  # pylint: disable=too-few-public-methods
     def eval(self) -> datetime:
         dttm_expression, delta, unit = self.value
         dttm = dttm_expression.eval()
+        delta = delta.eval() if hasattr(delta, "eval") else delta
         if unit.lower() == "quarter":
             delta = delta * 3
             unit = "month"
         return dttm + parse_human_timedelta(f"{delta} {unit}s", dttm)
+
+
+class EvalDateDiffFunc:  # pylint: disable=too-few-public-methods
+    def __init__(self, tokens: ParseResults) -> None:
+        self.value = tokens[1]
+
+    def eval(self) -> int:
+        if len(self.value) == 2:
+            _dttm_from, _dttm_to = self.value
+            return (_dttm_to.eval() - _dttm_from.eval()).days
+
+        if len(self.value) == 3:
+            _dttm_from, _dttm_to, _unit = self.value
+            if _unit == "year":
+                return _dttm_to.eval().year - _dttm_from.eval().year
+            if _unit == "day":
+                return (_dttm_to.eval() - _dttm_from.eval()).days
+        raise ValueError(_("Unable to calculate such a date delta"))
 
 
 class EvalDateTruncFunc:  # pylint: disable=too-few-public-methods
@@ -322,10 +845,14 @@ class EvalDateTruncFunc:  # pylint: disable=too-few-public-methods
             dttm = dttm.replace(
                 month=1, day=1, hour=0, minute=0, second=0, microsecond=0
             )
+        if unit == "quarter":
+            dttm = (
+                pd.Period(pd.Timestamp(dttm), freq="Q").to_timestamp().to_pydatetime()
+            )
         elif unit == "month":
             dttm = dttm.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         elif unit == "week":
-            dttm = dttm - relativedelta(days=dttm.weekday())
+            dttm -= relativedelta(days=dttm.weekday())
             dttm = dttm.replace(hour=0, minute=0, second=0, microsecond=0)
         elif unit == "day":
             dttm = dttm.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -349,6 +876,19 @@ class EvalLastDayFunc:  # pylint: disable=too-few-public-methods
             return dttm.replace(
                 month=12, day=31, hour=0, minute=0, second=0, microsecond=0
             )
+        if unit == "quarter":
+            # Both arguments are passed to a single `replace` so the day is
+            # never briefly out of range for the new month (e.g. the 31st
+            # moving into a 30-day quarter-end month).
+            last_month = 3 * ((dttm.month - 1) // 3) + 3
+            return dttm.replace(
+                month=last_month,
+                day=calendar.monthrange(dttm.year, last_month)[1],
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
         if unit == "month":
             return dttm.replace(
                 day=calendar.monthrange(dttm.year, dttm.month)[1],
@@ -357,6 +897,11 @@ class EvalLastDayFunc:  # pylint: disable=too-few-public-methods
                 second=0,
                 microsecond=0,
             )
+        if unit == "day":
+            # The last day of a day is that same day. Truncating to midnight
+            # keeps the result consistent with every other unit here, which
+            # all return the final day at midnight rather than at its end.
+            return dttm.replace(hour=0, minute=0, second=0, microsecond=0)
         # unit == "week":
         mon = dttm - relativedelta(days=dttm.weekday())
         mon = mon.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -369,59 +914,82 @@ class EvalHolidayFunc:  # pylint: disable=too-few-public-methods
 
     def eval(self) -> datetime:
         holiday = self.value[0].eval()
-        dttm, country = [None, None]
-        if len(self.value) >= 2:
-            dttm = self.value[1].eval()
-        if len(self.value) == 3:
-            country = self.value[2]
+        dttm: datetime | None = None
+        country: str | None = None
+        # Both arguments after the holiday name are optional, so the second one
+        # is the datetime or the country depending on which were supplied. What
+        # tells them apart is the kind of argument: a datetime is always a
+        # function call (`datetime(...)`, `dateadd(...)`, ...) and a country is
+        # always quoted text.
+        for argument in self.value[1:]:
+            if isinstance(argument, EvalText):
+                country = argument.eval()
+            else:
+                dttm = argument.eval()
         holiday_year = dttm.year if dttm else parse_human_datetime("today").year
-        country = country.eval() if country else "US"
 
-        holiday_lookup = CountryHoliday(country, years=[holiday_year], observed=False)
-        searched_result = holiday_lookup.get_named(holiday)
-        if len(searched_result) == 1:
+        try:
+            holiday_lookup = country_holidays(
+                country or "US", years=[holiday_year], observed=False
+            )
+        except NotImplementedError as ex:
+            # `country_holidays` has no calendar for the country, which the
+            # caller can correct: the accepted spellings are the ISO code and
+            # the registered name, so a lowercase code or a country written out
+            # in full both land here.
+            raise ValueError(
+                _("Unable to find such a country: [%(country)s]", country=country)
+            ) from ex
+        searched_result = holiday_lookup.get_named(holiday, lookup="istartswith")
+        if len(searched_result) > 0:
             return dttm_from_timetuple(searched_result[0].timetuple())
         raise ValueError(
             _("Unable to find such a holiday: [%(holiday)s]", holiday=holiday)
         )
 
 
-@memoized
+@lru_cache(maxsize=LRU_CACHE_MAX_SIZE)
 def datetime_parser() -> ParseResults:  # pylint: disable=too-many-locals
     (  # pylint: disable=invalid-name
-        DATETIME,
-        DATEADD,
-        DATETRUNC,
-        LASTDAY,
-        HOLIDAY,
-        YEAR,
-        QUARTER,
-        MONTH,
-        WEEK,
-        DAY,
-        HOUR,
-        MINUTE,
-        SECOND,
+        DATETIME,  # noqa: N806
+        DATEADD,  # noqa: N806
+        DATEDIFF,  # noqa: N806
+        DATETRUNC,  # noqa: N806
+        LASTDAY,  # noqa: N806
+        HOLIDAY,  # noqa: N806
+        YEAR,  # noqa: N806
+        QUARTER,  # noqa: N806
+        MONTH,  # noqa: N806
+        WEEK,  # noqa: N806
+        DAY,  # noqa: N806
+        HOUR,  # noqa: N806
+        MINUTE,  # noqa: N806
+        SECOND,  # noqa: N806
     ) = map(
         CaselessKeyword,
-        "datetime dateadd datetrunc lastday holiday "
+        "datetime dateadd datediff datetrunc lastday holiday "
         "year quarter month week day hour minute second".split(),
     )
     lparen, rparen, comma = map(Suppress, "(),")
-    int_operand = pyparsing_common.signed_integer().setName("int_operand")
-    text_operand = quotedString.setName("text_operand").setParseAction(EvalText)
+    text_operand = quoted_string.set_name("text_operand").set_parse_action(EvalText)
 
     # allow expression to be used recursively
-    datetime_func = Forward().setName("datetime")
-    dateadd_func = Forward().setName("dateadd")
-    datetrunc_func = Forward().setName("datetrunc")
-    lastday_func = Forward().setName("lastday")
-    holiday_func = Forward().setName("holiday")
+    datetime_func = Forward().set_name("datetime")
+    dateadd_func = Forward().set_name("dateadd")
+    datetrunc_func = Forward().set_name("datetrunc")
+    lastday_func = Forward().set_name("lastday")
+    holiday_func = Forward().set_name("holiday")
     date_expr = (
         datetime_func | dateadd_func | datetrunc_func | lastday_func | holiday_func
     )
 
-    datetime_func <<= (DATETIME + lparen + text_operand + rparen).setParseAction(
+    # literal integer and expression that return a literal integer
+    datediff_func = Forward().set_name("datediff")
+    int_operand = (
+        pyparsing_common.signed_integer().set_name("int_operand") | datediff_func
+    )
+
+    datetime_func <<= (DATETIME + lparen + text_operand + rparen).set_parse_action(
         EvalDateTimeFunc
     )
     dateadd_func <<= (
@@ -436,24 +1004,29 @@ def datetime_parser() -> ParseResults:  # pylint: disable=too-many-locals
             + ppOptional(comma)
         )
         + rparen
-    ).setParseAction(EvalDateAddFunc)
+    ).set_parse_action(EvalDateAddFunc)
     datetrunc_func <<= (
         DATETRUNC
         + lparen
         + Group(
             date_expr
             + comma
-            + (YEAR | MONTH | WEEK | DAY | HOUR | MINUTE | SECOND)
+            + (YEAR | QUARTER | MONTH | WEEK | DAY | HOUR | MINUTE | SECOND)
             + ppOptional(comma)
         )
         + rparen
-    ).setParseAction(EvalDateTruncFunc)
+    ).set_parse_action(EvalDateTruncFunc)
     lastday_func <<= (
         LASTDAY
         + lparen
-        + Group(date_expr + comma + (YEAR | MONTH | WEEK) + ppOptional(comma))
+        + Group(
+            date_expr
+            + comma
+            + (YEAR | QUARTER | MONTH | WEEK | DAY)
+            + ppOptional(comma)
+        )
         + rparen
-    ).setParseAction(EvalLastDayFunc)
+    ).set_parse_action(EvalLastDayFunc)
     holiday_func <<= (
         HOLIDAY
         + lparen
@@ -466,15 +1039,26 @@ def datetime_parser() -> ParseResults:  # pylint: disable=too-many-locals
             + ppOptional(comma)
         )
         + rparen
-    ).setParseAction(EvalHolidayFunc)
+    ).set_parse_action(EvalHolidayFunc)
+    datediff_func <<= (
+        DATEDIFF
+        + lparen
+        + Group(
+            date_expr
+            + comma
+            + date_expr
+            + ppOptional(comma + (YEAR | DAY) + ppOptional(comma))
+        )
+        + rparen
+    ).set_parse_action(EvalDateDiffFunc)
 
-    return date_expr
+    return date_expr | datediff_func
 
 
-def datetime_eval(datetime_expression: Optional[str] = None) -> Optional[datetime]:
+def datetime_eval(datetime_expression: str | None = None) -> datetime | None:
     if datetime_expression:
         try:
-            return datetime_parser().parseString(datetime_expression)[0].eval()
+            return datetime_parser().parse_string(datetime_expression)[0].eval()
         except ParseException as ex:
             raise ValueError(ex) from ex
     return None

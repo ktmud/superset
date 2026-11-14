@@ -43,6 +43,7 @@ import {
   ROW_TYPE,
   TABS_TYPE,
   TAB_TYPE,
+  DYNAMIC_TYPE,
 } from './componentTypes';
 
 import { DASHBOARD_ROOT_DEPTH as rootDepth } from './constants';
@@ -54,7 +55,7 @@ const depthFour = rootDepth + 4;
 const depthFive = rootDepth + 5;
 
 // when moving components around the depth of child is irrelevant, note these are parent depths
-const parentMaxDepthLookup = {
+const parentMaxDepthLookup: Record<string, Record<string, number>> = {
   [DASHBOARD_ROOT_TYPE]: {
     [TABS_TYPE]: rootDepth,
     [DASHBOARD_GRID_TYPE]: rootDepth,
@@ -62,6 +63,7 @@ const parentMaxDepthLookup = {
 
   [DASHBOARD_GRID_TYPE]: {
     [CHART_TYPE]: depthOne,
+    [DYNAMIC_TYPE]: depthOne,
     [MARKDOWN_TYPE]: depthOne,
     [COLUMN_TYPE]: depthOne,
     [DIVIDER_TYPE]: depthOne,
@@ -72,6 +74,7 @@ const parentMaxDepthLookup = {
 
   [ROW_TYPE]: {
     [CHART_TYPE]: depthFour,
+    [DYNAMIC_TYPE]: depthFour,
     [MARKDOWN_TYPE]: depthFour,
     [COLUMN_TYPE]: depthFour,
   },
@@ -82,6 +85,7 @@ const parentMaxDepthLookup = {
 
   [TAB_TYPE]: {
     [CHART_TYPE]: depthFive,
+    [DYNAMIC_TYPE]: depthFive,
     [MARKDOWN_TYPE]: depthFive,
     [COLUMN_TYPE]: depthThree,
     [DIVIDER_TYPE]: depthFive,
@@ -101,6 +105,7 @@ const parentMaxDepthLookup = {
 
   // these have no valid children
   [CHART_TYPE]: {},
+  [DYNAMIC_TYPE]: {},
   [DIVIDER_TYPE]: {},
   [HEADER_TYPE]: {},
   [MARKDOWN_TYPE]: {},
@@ -118,9 +123,8 @@ export default function isValidChild(child: IsValidChildProps): boolean {
     return false;
   }
 
-  const maxParentDepth: number | undefined = (parentMaxDepthLookup[
-    parentType
-  ] || {})[childType];
+  const maxParentDepth: number | undefined =
+    parentMaxDepthLookup[parentType]?.[childType];
 
   return typeof maxParentDepth === 'number' && parentDepth <= maxParentDepth;
 }

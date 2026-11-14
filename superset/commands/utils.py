@@ -14,67 +14,403 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-from typing import List, Optional
+from __future__ import annotations
 
-from flask_appbuilder.security.sqla.models import Role, User
+from collections import Counter
+from collections.abc import Sequence
+from typing import Any, Optional, TYPE_CHECKING
 
+from flask import current_app, has_app_context
+from flask_appbuilder.models.sqla import Model
+from marshmallow import ValidationError
+
+from superset import is_feature_enabled, security_manager
 from superset.commands.exceptions import (
     DatasourceNotFoundValidationError,
-    OwnersNotFoundValidationError,
-    RolesNotFoundValidationError,
+    TagForbiddenError,
+    TagNotFoundValidationError,
 )
-from superset.connectors.base.models import BaseDatasource
-from superset.connectors.connector_registry import ConnectorRegistry
-from superset.datasets.commands.exceptions import DatasetNotFoundError
-from superset.extensions import db, security_manager
+from superset.daos.datasource import DatasourceDAO
+from superset.daos.exceptions import DatasourceNotFound
+from superset.daos.tag import TagDAO
+from superset.exceptions import SupersetSecurityException
+from superset.subjects.exceptions import (
+    SubjectsNotFoundValidationError,
+    ViewersDisabledValidationError,
+)
+from superset.subjects.models import Subject
+from superset.subjects.types import SubjectReference
+from superset.subjects.utils import (
+    get_default_viewers_for_new_asset,
+    get_or_create_group_subject,
+    get_or_create_role_subject,
+    get_or_create_user_subject as get_user_subject,
+    get_subject,
+    get_user_subject_ids,
+)
+from superset.tags.models import ObjectType, Tag, TagType
+from superset.utils import json
+from superset.utils.core import DatasourceType, get_user_id
+
+if TYPE_CHECKING:
+    from superset.connectors.sqla.models import BaseDatasource
 
 
-def populate_owners(
-    user: User, owner_ids: Optional[List[int]], default_to_user: bool,
-) -> List[User]:
-    """
-    Helper function for commands, will fetch all users from owners id's
-    :param user: current user
-    :param owner_ids: list of owners by id's
-    :param default_to_user: make user the owner if `owner_ids` is None or empty
-    :raises OwnersNotFoundValidationError: if at least one owner id can't be resolved
-    :returns: Final list of owners
-    """
-    owner_ids = owner_ids or []
-    owners = []
-    if not owner_ids and default_to_user:
-        return [user]
-    if user.id not in owner_ids and "admin" not in [
-        role.name.lower() for role in user.roles
-    ]:
-        # make sure non-admins can't remove themselves as owner by mistake
-        owners.append(user)
-    for owner_id in owner_ids:
-        owner = security_manager.get_user_by_id(owner_id)
-        if not owner:
-            raise OwnersNotFoundValidationError()
-        owners.append(owner)
-    return owners
+def _has_extra_editors_resolver() -> bool:
+    return bool(has_app_context() and current_app.config.get("EXTRA_EDITORS_RESOLVER"))
 
 
-def populate_roles(role_ids: Optional[List[int]] = None) -> List[Role]:
+def current_user_can_modify_object(model: Any) -> bool:
+    """Whether the current user is authorized to create/modify ``model``.
+
+    Delegates to ``security_manager.raise_for_editorship``, which grants
+    access to admins and any subject in ``model.editors`` (when that
+    relationship exists). For models that don't carry an ``editors``
+    relationship, or when the current subject isn't one of them, this falls
+    back to allowing the object's creator.
+
+    Callers that need to distinguish "not found" from "no access" should
+    look the model up bypassing DAO base filters (e.g.
+    ``skip_base_filter=True``) before calling this, so an object the user
+    cannot access reaches the check instead of resolving to ``None`` and
+    being written without any check.
     """
-    Helper function for commands, will fetch all roles from roles id's
-     :raises RolesNotFoundValidationError: If a role in the input list is not found
-    :param role_ids: A List of roles by id's
+    try:
+        security_manager.raise_for_editorship(model)
+        return True
+    except SupersetSecurityException:
+        return bool(
+            model.created_by and model.created_by == security_manager.current_user
+        )
+
+
+def raise_if_managed_externally(model: Any, forbidden_exc: type[Exception]) -> None:
+    """Refuse a mutation of an externally managed entity.
+
+    An entity with ``is_managed_externally`` set has its source of truth
+    outside Superset: an in-app write would be overwritten on the next
+    external sync, which is why the browser hides the edit affordances for
+    such entities. The refusal must also be enforced server-side -- an
+    otherwise-authorized editor could call the API directly. (Version
+    restore is the same class of mutation; apache/superset#44013 adds the
+    matching gate there.) Raised as the caller's
+    editorship-denial exception (HTTP 403) so the response body is
+    identical to a permission denial and discloses nothing new.
+
+    Call this *after* the editorship check: a caller with no edit rights
+    at all should keep receiving the plain editorship denial.
     """
-    roles: List[Role] = []
-    if role_ids:
-        roles = security_manager.find_roles_by_id(role_ids)
-        if len(roles) != len(role_ids):
-            raise RolesNotFoundValidationError()
-    return roles
+    if model.is_managed_externally:
+        raise forbidden_exc()
+
+
+def populate_subject_list(
+    subject_ids: Sequence[SubjectReference] | None,
+    default_to_user: bool,
+    ensure_no_lockout: bool = False,
+    field_name: str = "subjects",
+) -> list[Subject]:
+    """
+    Helper function for commands, will fetch all subjects from subject id's.
+
+    :param subject_ids: list of subject id's
+    :param default_to_user: add current user's subject if list is empty
+    :param ensure_no_lockout: prevent non-admins from removing themselves
+    :param field_name: field name for validation errors
+    :raises SubjectsNotFoundValidationError: if a subject id can't be resolved
+    :returns: Final list of subjects
+    """
+    subject_ids = subject_ids or []
+    subjects: list[Subject] = []
+    user_id = get_user_id()
+
+    if not subject_ids and default_to_user:
+        if user_id:
+            user_subject = get_user_subject(user_id)
+            return [user_subject] if user_subject else []
+        return []
+
+    # Resolve typed references before applying lockout checks. A user ID must
+    # never fall back to the Subject with the same numeric primary key.
+    for reference in subject_ids:
+        if not isinstance(reference, dict):
+            subject = get_subject(reference)
+        else:
+            resolver = {
+                "user": get_user_subject,
+                "role": get_or_create_role_subject,
+                "group": get_or_create_group_subject,
+                "subject": get_subject,
+            }.get(reference["type"])
+            subject = resolver(reference["id"]) if resolver else None
+        if not subject:
+            raise SubjectsNotFoundValidationError(field_name)
+        subjects.append(subject)
+
+    resolved_ids = {subject.id for subject in subjects}
+    if ensure_no_lockout and not security_manager.is_admin() and user_id:
+        user_subject = get_user_subject(user_id)
+        if (
+            user_subject
+            and user_subject.id not in resolved_ids
+            and not _has_extra_editors_resolver()
+        ):
+            user_subject_ids = set(get_user_subject_ids(user_id))
+            if not (user_subject_ids & resolved_ids):
+                subjects.insert(0, user_subject)
+    return subjects
+
+
+def compute_subject_list(
+    current_subjects: list[Subject] | None,
+    new_subject_ids: Sequence[SubjectReference] | None,
+    ensure_no_lockout: bool = False,
+    field_name: str = "subjects",
+) -> list[Subject]:
+    """
+    Helper function for update commands, to properly handle the subjects list.
+    Preserve the previous configuration unless included in the update payload.
+
+    :param current_subjects: list of current subjects
+    :param new_subject_ids: list of new subject ids specified in the update payload
+    :param ensure_no_lockout: prevent non-admins from removing themselves
+    :param field_name: field name for validation errors
+    :returns: Final list of subjects
+    """
+    current_subjects = current_subjects or []
+    subject_ids = (
+        [s.id for s in current_subjects] if new_subject_ids is None else new_subject_ids
+    )
+    return populate_subject_list(
+        subject_ids,
+        default_to_user=False,
+        ensure_no_lockout=ensure_no_lockout,
+        field_name=field_name,
+    )
+
+
+def raise_if_adding_viewers_while_disabled(
+    new_viewers: list[Subject],
+    current_viewers: list[Subject] | None = None,
+) -> None:
+    """
+    Reject viewer additions while ``ENABLE_VIEWERS`` is off.
+
+    Viewers are enforced whenever the relationship is non-empty, independent of
+    the flag, but the flag hides them from the UI. Allowing writes while it is
+    off lets an API client lock a dashboard or chart down in a way admins can
+    neither see nor undo in the UI. Removing viewers (or re-sending the current
+    list) remains allowed so stale assignments can always be cleared.
+
+    :raises ViewersDisabledValidationError: when the flag is off and
+        *new_viewers* contains a subject not already in *current_viewers*
+    """
+    if is_feature_enabled("ENABLE_VIEWERS"):
+        return
+    current_ids = {subject.id for subject in current_viewers or []}
+    if any(subject.id not in current_ids for subject in new_viewers):
+        raise ViewersDisabledValidationError()
+
+
+def populate_subjects(
+    properties: dict[str, Any],
+    exceptions: list[ValidationError],
+    *,
+    include_viewers: bool = True,
+) -> None:
+    """
+    Populate editors (and optionally viewers) on a properties dict for
+    create commands.
+
+    Appends any validation errors to *exceptions*.
+    """
+    try:
+        properties["editors"] = populate_subject_list(
+            properties.get("editors"),
+            default_to_user=True,
+            ensure_no_lockout=True,
+            field_name="editors",
+        )
+    except ValidationError as ex:
+        exceptions.append(ex)
+
+    if not include_viewers:
+        return
+
+    if properties.get("viewers") is not None:
+        try:
+            viewers = populate_subject_list(
+                properties["viewers"],
+                default_to_user=False,
+                field_name="viewers",
+            )
+            raise_if_adding_viewers_while_disabled(viewers)
+            properties["viewers"] = viewers
+        except ValidationError as ex:
+            exceptions.append(ex)
+    elif default_viewers := get_default_viewers_for_new_asset(get_user_id()):
+        properties["viewers"] = default_viewers
+
+
+def compute_subjects(
+    model: Model,
+    properties: dict[str, Any],
+    exceptions: list[ValidationError],
+    *,
+    include_viewers: bool = True,
+) -> None:
+    """
+    Compute editors (and optionally viewers) on a properties dict for
+    update commands, preserving existing values when the payload omits them.
+
+    Appends any validation errors to *exceptions*.
+    """
+    try:
+        properties["editors"] = compute_subject_list(
+            model.editors,
+            properties.get("editors"),
+            ensure_no_lockout=True,
+            field_name="editors",
+        )
+    except ValidationError as ex:
+        exceptions.append(ex)
+
+    if include_viewers and hasattr(model, "viewers"):
+        try:
+            viewers = compute_subject_list(
+                model.viewers,
+                properties.get("viewers"),
+                field_name="viewers",
+            )
+            if properties.get("viewers") is not None:
+                raise_if_adding_viewers_while_disabled(viewers, model.viewers)
+            properties["viewers"] = viewers
+        except ValidationError as ex:
+            exceptions.append(ex)
 
 
 def get_datasource_by_id(datasource_id: int, datasource_type: str) -> BaseDatasource:
     try:
-        return ConnectorRegistry.get_datasource(
-            datasource_type, datasource_id, db.session
+        return DatasourceDAO.get_datasource(
+            DatasourceType(datasource_type), datasource_id
         )
-    except DatasetNotFoundError as ex:
+    except DatasourceNotFound as ex:
         raise DatasourceNotFoundValidationError() from ex
+
+
+def validate_tags(
+    object_type: ObjectType,
+    current_tags: list[Tag],
+    new_tag_ids: Optional[list[int]],
+) -> None:
+    """
+    Helper function for update commands, to validate the tags list. Users
+    with `can_write` on `Tag` are allowed to both create new tags and manage
+    tag association with objects. Users with `can_tag` on `object_type` are
+    only allowed to manage existing existing tags' associations with the object.
+
+    :param current_tags: list of current tags
+    :param new_tag_ids: list of tags specified in the update payload
+    """
+
+    # `tags` not part of the update payload
+    if new_tag_ids is None:
+        return
+
+    # No changes in the list
+    current_custom_tags = [tag.id for tag in current_tags if tag.type == TagType.custom]
+    if Counter(current_custom_tags) == Counter(new_tag_ids):
+        return
+
+    # No perm to tags assets
+    if not (
+        security_manager.can_access("can_write", "Tag")
+        or security_manager.can_access("can_tag", object_type.name.capitalize())
+    ):
+        validation_error = (
+            f"You do not have permission to manage tags on {object_type.name}s"
+        )
+        raise TagForbiddenError(validation_error)
+
+    # Validate if new tags already exist
+    additional_tags = [tag for tag in new_tag_ids if tag not in current_custom_tags]
+    for tag_id in additional_tags:
+        if not TagDAO.find_by_id(tag_id):
+            validation_error = f"Tag ID {tag_id} not found"
+            raise TagNotFoundValidationError(validation_error)
+
+    return
+
+
+def update_tags(
+    object_type: ObjectType,
+    object_id: int,
+    current_tags: list[Tag],
+    new_tag_ids: list[int],
+) -> None:
+    """
+    Helper function for update commands, to update the tag relationship.
+
+    :param object_id: The object (dashboard, chart, etc) ID
+    :param object_type: The object type
+    :param current_tags: list of current tags
+    :param new_tag_ids: list of tags specified in the update payload
+    """
+
+    current_custom_tags = [tag for tag in current_tags if tag.type == TagType.custom]
+    current_custom_tag_ids = [
+        tag.id for tag in current_tags if tag.type == TagType.custom
+    ]
+
+    tags_to_delete = [tag for tag in current_custom_tags if tag.id not in new_tag_ids]
+    for tag in tags_to_delete:
+        TagDAO.delete_tagged_object(object_type, object_id, tag.name)
+
+    tag_ids_to_add = [
+        tag_id for tag_id in new_tag_ids if tag_id not in current_custom_tag_ids
+    ]
+    if tag_ids_to_add:
+        tags_to_add = TagDAO.find_by_ids(tag_ids_to_add)
+        TagDAO.create_custom_tagged_objects(
+            object_type, object_id, [tag.name for tag in tags_to_add]
+        )
+
+
+def update_chart_config_dataset(
+    config: dict[str, Any], dataset_info: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Update the chart configuration and query_context with new dataset information
+
+    :param config: The original chart configuration
+    :param dataset_info: Dict with datasource_id, datasource_type, and datasource_name
+    :return: The updated chart configuration
+    """
+    # Update datasource id, type, and name
+    config.update(dataset_info)
+
+    dataset_uid = f"{dataset_info['datasource_id']}__{dataset_info['datasource_type']}"
+    config["params"].update({"datasource": dataset_uid})
+
+    if "query_context" in config and config["query_context"] is not None:
+        try:
+            query_context = json.loads(config["query_context"])
+
+            query_context["datasource"] = {
+                "id": dataset_info["datasource_id"],
+                "type": dataset_info["datasource_type"],
+            }
+
+            if "form_data" in query_context:
+                query_context["form_data"]["datasource"] = dataset_uid
+
+            if "queries" in query_context:
+                for query in query_context["queries"]:
+                    if "datasource" in query:
+                        query["datasource"] = query_context["datasource"]
+
+            config["query_context"] = json.dumps(query_context)
+        except json.JSONDecodeError:
+            config["query_context"] = None
+
+    return config

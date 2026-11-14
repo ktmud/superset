@@ -34,14 +34,14 @@
 **/*.sqllite
 **/*.swp
 **/.terser-plugin-cache/
-**/.storybook/
 **/node_modules/
 
 tests/
 docs/
 install/
-superset-frontend/cypress-base/
 superset-frontend/coverage/
+superset-frontend/.temp_cache/
 superset/static/assets/
 superset-websocket/dist/
 venv
+.venv

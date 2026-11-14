@@ -16,124 +16,187 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React from 'react';
-import { t, styled, supersetTheme } from '@superset-ui/core';
-
-import { Menu } from 'src/common/components';
-import Button, { ButtonProps } from 'src/components/Button';
-import Icons from 'src/components/Icons';
 import {
-  DropdownButton,
-  DropdownButtonProps,
-} from 'src/components/DropdownButton';
+  useMemo,
+  FC,
+  ReactElement,
+  type SyntheticEvent,
+  type ReactNode,
+} from 'react';
 
-interface Props {
-  allowAsync: boolean;
+import { t } from '@apache-superset/core/translation';
+import { styled, useTheme, SupersetTheme } from '@apache-superset/core/theme';
+
+import { Button, DropdownButton } from '@superset-ui/core/components';
+import { Icons } from '@superset-ui/core/components/Icons';
+import { detectOS } from 'src/utils/common';
+import { QueryButtonProps } from 'src/SqlLab/types';
+import useQueryEditor from 'src/SqlLab/hooks/useQueryEditor';
+import useRunStopButton from 'src/hooks/useRunStopButton';
+import {
+  LOG_ACTIONS_SQLLAB_RUN_QUERY,
+  LOG_ACTIONS_SQLLAB_STOP_QUERY,
+} from 'src/logger/LogUtils';
+import useLogAction from 'src/logger/useLogAction';
+
+export interface RunQueryActionButtonProps {
+  compactMode?: boolean;
+  queryEditorId: string;
   queryState?: string;
-  runQuery: (c?: boolean) => void;
-  selectedText?: string;
+  runQuery: () => void;
   stopQuery: () => void;
-  sql: string;
-  overlayCreateAsMenu: typeof Menu | null;
+  overlayCreateAsMenu: ReactElement | null;
 }
 
-type QueryButtonProps = DropdownButtonProps | ButtonProps;
-
-const buildText = (
+const buildTextAndIcon = (
   shouldShowStopButton: boolean,
   selectedText: string | undefined,
-): string | JSX.Element => {
-  if (shouldShowStopButton) {
-    return (
-      <>
-        <i className="fa fa-stop" /> {t('Stop')}
-      </>
-    );
-  }
+  theme: SupersetTheme,
+): { text: string; icon?: ReactNode } => {
+  let text = t('Run');
+  let icon: ReactNode = <Icons.CaretRightOutlined />;
   if (selectedText) {
-    return t('Run selection');
+    text = t('Run selection');
+    icon = <Icons.StepForwardOutlined />;
   }
-  return t('Run');
+  if (shouldShowStopButton) {
+    text = t('Stop');
+    icon = <Icons.Square iconColor={theme.colorIcon} />;
+  }
+  return {
+    text,
+    icon,
+  };
 };
 
 const onClick = (
-  shouldShowStopButton: boolean,
-  allowAsync: boolean,
-  runQuery: (c?: boolean) => void = () => undefined,
+  isStopAction: boolean,
+  runQuery: () => void = () => undefined,
   stopQuery = () => {},
+  logAction: (name: string, payload: Record<string, any>) => void,
 ): void => {
-  if (shouldShowStopButton) return stopQuery();
-  if (allowAsync) {
-    return runQuery(true);
-  }
-  return runQuery(false);
+  const eventName = isStopAction
+    ? LOG_ACTIONS_SQLLAB_STOP_QUERY
+    : LOG_ACTIONS_SQLLAB_RUN_QUERY;
+
+  logAction(eventName, { shortcut: false });
+  if (isStopAction) return stopQuery();
+  runQuery();
 };
+
+/** Only the main split button changes action; caret gestures open a menu. */
+const isMainButtonGesture = (event: SyntheticEvent<HTMLSpanElement>) =>
+  event.target instanceof Element &&
+  event.target.closest('button') ===
+    event.currentTarget.querySelector('button');
 
 const StyledButton = styled.span`
   button {
     line-height: 13px;
-    // this is to over ride a previous transition built into the component
-    transition: background-color 0ms;
-    &:last-of-type {
-      margin-right: ${({ theme }) => theme.gridUnit * 2}px;
-    }
+    min-width: auto !important;
+    padding: 0 ${({ theme }) => theme.sizeUnit * 3}px 0
+      ${({ theme }) => theme.sizeUnit * 2}px;
+
     span[name='caret-down'] {
       display: flex;
-      margin-right: ${({ theme }) => theme.gridUnit * -2}px;
+      margin-left: ${({ theme }) => theme.sizeUnit * 1}px;
     }
   }
 `;
 
 const RunQueryActionButton = ({
-  allowAsync = false,
+  queryEditorId,
   queryState,
-  selectedText,
-  sql = '',
   overlayCreateAsMenu,
   runQuery,
   stopQuery,
-}: Props) => {
+}: RunQueryActionButtonProps) => {
+  const theme = useTheme();
+  const logAction = useLogAction({ queryEditorId });
+  const userOS = detectOS();
+
+  const { selectedText, sql } = useQueryEditor(queryEditorId, [
+    'selectedText',
+    'sql',
+  ]);
+
   const shouldShowStopBtn =
     !!queryState && ['running', 'pending'].indexOf(queryState) > -1;
+  const {
+    onPointerDownCapture,
+    onKeyDownCapture,
+    onBlurCapture,
+    onClick: handleClick,
+  } = useRunStopButton(shouldShowStopBtn, () =>
+    onClick(shouldShowStopBtn, runQuery, stopQuery, logAction),
+  );
 
-  const ButtonComponent: React.FC<QueryButtonProps> = overlayCreateAsMenu
-    ? (DropdownButton as React.FC)
+  const ButtonComponent: FC<QueryButtonProps> = overlayCreateAsMenu
+    ? (DropdownButton as FC)
     : Button;
 
-  const isDisabled = !sql.trim();
+  const sqlContent = selectedText || sql || '';
+  const isDisabled = !sqlContent
+    ?.replace(/(\/\*[^*]*\*\/)|(\/\/[^*]*)|(--[^.].*)/gm, '')
+    .trim();
+
+  const stopButtonTooltipText = useMemo(
+    () =>
+      userOS === 'MacOS'
+        ? t('Stop running (Ctrl + x)')
+        : t('Stop running (Ctrl + e)'),
+    [userOS],
+  );
+
+  const { text, icon } = useMemo(
+    () => buildTextAndIcon(shouldShowStopBtn, selectedText, theme),
+    [shouldShowStopBtn, selectedText, theme],
+  );
 
   return (
-    <StyledButton>
+    <StyledButton
+      onBlurCapture={onBlurCapture}
+      onPointerDownCapture={event => {
+        if (isMainButtonGesture(event)) onPointerDownCapture(event);
+      }}
+      onKeyDownCapture={event => {
+        if (isMainButtonGesture(event)) onKeyDownCapture(event);
+      }}
+    >
       <ButtonComponent
-        onClick={() =>
-          onClick(shouldShowStopBtn, allowAsync, runQuery, stopQuery)
-        }
+        data-test="run-query-action"
+        onClick={handleClick}
         disabled={isDisabled}
         tooltip={
           (!isDisabled &&
             (shouldShowStopBtn
-              ? t('Stop running (Ctrl + x)')
+              ? stopButtonTooltipText
               : t('Run query (Ctrl + Return)'))) as string
         }
         cta
         {...(overlayCreateAsMenu
           ? {
-              overlay: overlayCreateAsMenu,
+              popupRender: () => overlayCreateAsMenu,
               icon: (
-                <Icons.CaretDown
+                <Icons.DownOutlined
                   iconColor={
                     isDisabled
-                      ? supersetTheme.colors.grayscale.base
-                      : supersetTheme.colors.grayscale.light5
+                      ? theme.colorTextDisabled
+                      : theme.colorTextLightSolid
                   }
-                  name="caret-down"
                 />
               ),
+              type: 'primary',
+              danger: shouldShowStopBtn,
               trigger: 'click',
             }
-          : { buttonStyle: 'primary' })}
+          : {
+              buttonStyle: shouldShowStopBtn ? 'danger' : 'primary',
+              icon,
+            })}
       >
-        {buildText(shouldShowStopBtn, selectedText)}
+        {overlayCreateAsMenu && <>{icon}</>}
+        {text}
       </ButtonComponent>
     </StyledButton>
   );

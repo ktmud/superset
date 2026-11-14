@@ -16,24 +16,48 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import userEvent from '@testing-library/user-event';
-import React from 'react';
-import { render, screen } from 'spec/helpers/testing-library';
-import { FormInstance } from 'src/common/components';
-import {
-  Filter,
-  NativeFilterType,
-} from 'src/dashboard/components/nativeFilters/types';
+import { DatasourceType, Filter, NativeFilterType } from '@superset-ui/core';
+import { render, screen, userEvent } from 'spec/helpers/testing-library';
+import type { FormInstance } from '@superset-ui/core/components';
 import getControlItemsMap, { ControlItemsProps } from './getControlItemsMap';
-import { getControlItems, setNativeFilterFieldValues } from './utils';
+import {
+  getControlItems,
+  setNativeFilterFieldValues,
+  doesColumnMatchFilterType,
+} from './utils';
 
 jest.mock('./utils', () => ({
   getControlItems: jest.fn(),
   setNativeFilterFieldValues: jest.fn(),
+  doesColumnMatchFilterType: jest.fn(),
+}));
+
+// Mock ColumnSelect to test filterValues logic
+jest.mock('./ColumnSelect', () => ({
+  ColumnSelect: ({
+    filterValues,
+  }: {
+    filterValues: (column: any) => boolean;
+  }) => {
+    const columns = [
+      { name: 'col1', filterable: true },
+      { name: 'col2', filterable: false },
+      { name: 'col3', filterable: true },
+    ];
+    return (
+      <>
+        {columns.filter(filterValues).map(column => (
+          <div key={column.name}>{column.name}</div>
+        ))}
+      </>
+    );
+  },
 }));
 
 const formMock: FormInstance = {
-  __INTERNAL__: { itemRef: () => () => {} },
+  focusField: () => {},
+  getFieldWarning: () => [],
+  setFieldValue: () => {},
   scrollToField: () => {},
   getFieldInstance: () => {},
   getFieldValue: () => {},
@@ -63,11 +87,12 @@ const filterMock: Filter = {
   filterType: '',
   targets: [{}],
   controlValues: {},
-  type: NativeFilterType.NATIVE_FILTER,
+  type: NativeFilterType.NativeFilter,
   description: '',
 };
 
-const createProps: () => ControlItemsProps = () => ({
+const createProps = (): ControlItemsProps => ({
+  expanded: false,
   datasetId: 1,
   disabled: false,
   forceUpdate: jest.fn(),
@@ -75,6 +100,7 @@ const createProps: () => ControlItemsProps = () => ({
   filterId: 'filterId',
   filterToEdit: filterMock,
   filterType: 'filterType',
+  formChanged: jest.fn(),
 });
 
 const createControlItems = () => [
@@ -93,7 +119,6 @@ function renderControlItems(
   controlItemsMap: ReturnType<typeof getControlItemsMap>,
 ) {
   return render(
-    // @ts-ignore
     <>
       {Object.values(controlItemsMap.controlItems).map(value => value.element)}
     </>,
@@ -125,6 +150,16 @@ test('Should render null empty when "getControlItems" return []', () => {
   expect(container.children).toHaveLength(0);
 });
 
+test('Should render null empty when "getControlItems" return enableSingleValue', () => {
+  const props = createProps();
+  (getControlItems as jest.Mock).mockReturnValue([
+    { name: 'enableSingleValue', config: { renderTrigger: true } },
+  ]);
+  const controlItemsMap = getControlItemsMap(props);
+  const { container } = renderControlItems(controlItemsMap);
+  expect(container.children).toHaveLength(0);
+});
+
 test('Should render null empty when "controlItems" are falsy', () => {
   const props = createProps();
   const controlItems = [null, false, {}, { config: { renderTrigger: false } }];
@@ -134,7 +169,7 @@ test('Should render null empty when "controlItems" are falsy', () => {
   expect(container.children).toHaveLength(0);
 });
 
-test('Should render render ControlItems', () => {
+test('Should render ControlItems', () => {
   const props = createProps();
 
   const controlItems = [
@@ -147,28 +182,101 @@ test('Should render render ControlItems', () => {
   expect(screen.getAllByRole('checkbox')).toHaveLength(2);
 });
 
-test('Clickin on checkbox', () => {
+test('Clicking on checkbox', async () => {
   const props = createProps();
   (getControlItems as jest.Mock).mockReturnValue(createControlItems());
   const controlItemsMap = getControlItemsMap(props);
   renderControlItems(controlItemsMap);
-  expect(props.forceUpdate).not.toBeCalled();
-  expect(setNativeFilterFieldValues).not.toBeCalled();
-  userEvent.click(screen.getByRole('checkbox'));
-  expect(setNativeFilterFieldValues).toBeCalled();
-  expect(props.forceUpdate).toBeCalled();
+  expect(props.forceUpdate).not.toHaveBeenCalled();
+  expect(setNativeFilterFieldValues).not.toHaveBeenCalled();
+  await userEvent.click(screen.getByRole('checkbox'));
+  expect(setNativeFilterFieldValues).toHaveBeenCalled();
+  expect(props.forceUpdate).toHaveBeenCalled();
 });
 
-test('Clickin on checkbox when resetConfig:flase', () => {
+test('excludes displayFormat from the generic checkbox control items', () => {
+  const props = createProps();
+  (getControlItems as jest.Mock).mockReturnValue([
+    {
+      name: 'displayFormat',
+      config: { renderTrigger: true, label: 'Display format' },
+    },
+  ]);
+  const controlItemsMap = getControlItemsMap(props);
+  expect(controlItemsMap.controlItems).not.toHaveProperty('displayFormat');
+  renderControlItems(controlItemsMap);
+  expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+});
+
+test('Clicking on checkbox when resetConfig:false', async () => {
   const props = createProps();
   (getControlItems as jest.Mock).mockReturnValue([
     { name: 'name_1', config: { renderTrigger: true, resetConfig: false } },
   ]);
   const controlItemsMap = getControlItemsMap(props);
   renderControlItems(controlItemsMap);
-  expect(props.forceUpdate).not.toBeCalled();
-  expect(setNativeFilterFieldValues).not.toBeCalled();
-  userEvent.click(screen.getByRole('checkbox'));
-  expect(props.forceUpdate).toBeCalled();
-  expect(setNativeFilterFieldValues).not.toBeCalled();
+  expect(props.forceUpdate).not.toHaveBeenCalled();
+  expect(setNativeFilterFieldValues).not.toHaveBeenCalled();
+  await userEvent.click(screen.getByRole('checkbox'));
+  expect(props.forceUpdate).toHaveBeenCalled();
+  expect(setNativeFilterFieldValues).not.toHaveBeenCalled();
+});
+
+// eslint-disable-next-line no-restricted-globals -- TODO: Migrate from describe blocks
+describe('ColumnSelect filterValues behavior', () => {
+  beforeEach(() => {
+    (getControlItems as jest.Mock).mockReturnValue([
+      {
+        name: 'groupby',
+        config: { label: 'Column', multiple: false, required: false },
+      },
+    ]);
+  });
+
+  test('only renders filterable columns when doesColumnMatchFilterType returns true', () => {
+    (doesColumnMatchFilterType as jest.Mock).mockReturnValue(true);
+    const props = {
+      ...createProps(),
+      formFilter: { filterType: 'filterType' },
+    };
+    // @ts-expect-error: bypass incomplete formFilter type for test
+    const element = getControlItemsMap(props).mainControlItems.groupby
+      .element as React.ReactElement;
+    render(element);
+    expect(screen.getByText('col1')).toBeInTheDocument();
+    expect(screen.getByText('col3')).toBeInTheDocument();
+    expect(screen.queryByText('col2')).not.toBeInTheDocument();
+  });
+
+  test('renders no columns when doesColumnMatchFilterType returns false', () => {
+    (doesColumnMatchFilterType as jest.Mock).mockReturnValue(false);
+    const props = {
+      ...createProps(),
+      formFilter: { filterType: 'filterType' },
+    };
+    // @ts-expect-error: bypass incomplete formFilter type for test
+    const element = getControlItemsMap(props).mainControlItems.groupby
+      .element as React.ReactElement;
+    render(element);
+    expect(screen.queryByText('col1')).not.toBeInTheDocument();
+    expect(screen.queryByText('col3')).not.toBeInTheDocument();
+    expect(screen.queryByText('col2')).not.toBeInTheDocument();
+  });
+  test('passes the datasource type so semantic range filters can require numeric columns', () => {
+    (doesColumnMatchFilterType as jest.Mock).mockReturnValue(true);
+    const props = {
+      ...createProps(),
+      datasourceType: DatasourceType.SemanticView,
+      formFilter: { filterType: 'filter_range' },
+    };
+    // @ts-expect-error: bypass incomplete formFilter type for test
+    const element = getControlItemsMap(props).mainControlItems.groupby
+      .element as React.ReactElement;
+    render(element);
+    expect(doesColumnMatchFilterType).toHaveBeenCalledWith(
+      'filter_range',
+      expect.objectContaining({ name: 'col1' }),
+      DatasourceType.SemanticView,
+    );
+  });
 });

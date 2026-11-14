@@ -16,145 +16,140 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React, { RefObject } from 'react';
-import Select, { propertyComparator } from 'src/components/Select/Select';
-import { t, styled } from '@superset-ui/core';
-import Alert from 'src/components/Alert';
-import Button from 'src/components/Button';
+import { useMemo, useState } from 'react';
+import { useSelector } from 'react-redux';
+import { t } from '@apache-superset/core/translation';
+import { styled } from '@apache-superset/core/theme';
+import { Form, Checkbox } from '@superset-ui/core/components';
+import { StandardModal } from 'src/components/Modal';
+import { RootState } from 'src/dashboard/types';
+import {
+  RefreshFrequencySelect,
+  validateRefreshFrequency,
+  getRefreshWarningMessage,
+} from './RefreshFrequency';
 
-import ModalTrigger from 'src/components/ModalTrigger';
-import { FormLabel } from 'src/components/Form';
-
-export const options = [
-  [0, t("Don't refresh")],
-  [10, t('10 seconds')],
-  [30, t('30 seconds')],
-  [60, t('1 minute')],
-  [300, t('5 minutes')],
-  [1800, t('30 minutes')],
-  [3600, t('1 hour')],
-  [21600, t('6 hours')],
-  [43200, t('12 hours')],
-  [86400, t('24 hours')],
-].map(o => ({ value: o[0] as number, label: o[1] }));
-
-const StyledModalTrigger = styled(ModalTrigger)`
-  .ant-modal-body {
-    overflow: visible;
-  }
+const ModalContent = styled.div`
+  padding: ${({ theme }) => theme.sizeUnit * 4}px;
 `;
 
-const RefreshWarningContainer = styled.div`
-  margin-top: ${({ theme }) => theme.gridUnit * 6}px;
+const CheckboxFormItem = styled(Form.Item)`
+  padding-top: ${({ theme }) => theme.sizeUnit * 4}px;
 `;
 
-type RefreshIntervalModalProps = {
-  triggerNode: JSX.Element;
+interface RefreshIntervalModalProps {
+  show: boolean;
+  onHide: () => void;
   refreshFrequency: number;
   onChange: (refreshLimit: number, editMode: boolean) => void;
   editMode: boolean;
-  refreshLimit?: number;
-  refreshWarning: string | null;
-};
+  addSuccessToast: (msg: string) => void;
+  pauseOnInactiveTab: boolean;
+  onPauseOnInactiveTabChange: (checked: boolean) => void;
+}
 
-type RefreshIntervalModalState = {
-  refreshFrequency: number;
-};
+/**
+ * Simple refresh interval modal for View Mode (session-only refresh)
+ * Separate from PropertiesModal to provide focused UX for temporary refresh
+ */
+const RefreshIntervalModal = ({
+  show,
+  onHide,
+  refreshFrequency: initialFrequency,
+  onChange,
+  editMode,
+  addSuccessToast,
+  pauseOnInactiveTab,
+  onPauseOnInactiveTabChange,
+}: RefreshIntervalModalProps) => {
+  const [refreshFrequency, setRefreshFrequency] = useState(initialFrequency);
+  const [localPauseOnInactiveTab, setLocalPauseOnInactiveTab] =
+    useState(pauseOnInactiveTab);
+  const refreshLimit = useSelector(
+    (state: RootState) =>
+      state.dashboardInfo?.common?.conf
+        ?.SUPERSET_DASHBOARD_PERIODICAL_REFRESH_LIMIT,
+  );
+  const refreshWarning = useSelector(
+    (state: RootState) =>
+      state.dashboardInfo?.common?.conf
+        ?.SUPERSET_DASHBOARD_PERIODICAL_REFRESH_WARNING_MESSAGE,
+  );
+  const refreshErrors = useMemo(
+    () => validateRefreshFrequency(refreshFrequency, refreshLimit),
+    [refreshFrequency, refreshLimit],
+  );
+  const refreshWarningMessage = useMemo(
+    () =>
+      getRefreshWarningMessage(refreshFrequency, refreshLimit, refreshWarning),
+    [refreshFrequency, refreshLimit, refreshWarning],
+  );
 
-class RefreshIntervalModal extends React.PureComponent<
-  RefreshIntervalModalProps,
-  RefreshIntervalModalState
-> {
-  static defaultProps = {
-    refreshLimit: 0,
-    refreshWarning: null,
+  const handleFrequencyChange = (value: number) => {
+    setRefreshFrequency(value);
   };
 
-  modalRef: RefObject<ModalTrigger>;
-
-  constructor(props: RefreshIntervalModalProps) {
-    super(props);
-    this.modalRef = React.createRef();
-    this.state = {
-      refreshFrequency: props.refreshFrequency,
-    };
-    this.handleFrequencyChange = this.handleFrequencyChange.bind(this);
-    this.onSave = this.onSave.bind(this);
-    this.onCancel = this.onCancel.bind(this);
-  }
-
-  onSave() {
-    this.props.onChange(this.state.refreshFrequency, this.props.editMode);
-    this.modalRef.current?.close();
-  }
-
-  onCancel() {
-    this.setState({
-      refreshFrequency: this.props.refreshFrequency,
-    });
-    this.modalRef.current?.close();
-  }
-
-  handleFrequencyChange(value: number) {
-    this.setState({
-      refreshFrequency: value || options[0].value,
-    });
-  }
-
-  render() {
-    const { refreshLimit = 0, refreshWarning, editMode } = this.props;
-    const { refreshFrequency = 0 } = this.state;
-    const showRefreshWarning =
-      !!refreshFrequency && !!refreshWarning && refreshFrequency < refreshLimit;
-
-    return (
-      <StyledModalTrigger
-        ref={this.modalRef}
-        triggerNode={this.props.triggerNode}
-        modalTitle={t('Refresh interval')}
-        modalBody={
-          <div>
-            <FormLabel>{t('Refresh frequency')}</FormLabel>
-            <Select
-              ariaLabel={t('Refresh interval')}
-              options={options}
-              value={refreshFrequency}
-              onChange={this.handleFrequencyChange}
-              sortComparator={propertyComparator('value')}
-            />
-            {showRefreshWarning && (
-              <RefreshWarningContainer>
-                <Alert
-                  type="warning"
-                  message={
-                    <>
-                      <div>{refreshWarning}</div>
-                      <br />
-                      <strong>{t('Are you sure you want to proceed?')}</strong>
-                    </>
-                  }
-                />
-              </RefreshWarningContainer>
-            )}
-          </div>
-        }
-        modalFooter={
-          <>
-            <Button
-              buttonStyle="primary"
-              buttonSize="small"
-              onClick={this.onSave}
-            >
-              {editMode ? t('Save') : t('Save for this session')}
-            </Button>
-            <Button onClick={this.onCancel} buttonSize="small">
-              {t('Cancel')}
-            </Button>
-          </>
-        }
-      />
+  const handleSave = () => {
+    if (refreshErrors.length > 0) {
+      return;
+    }
+    onChange(refreshFrequency, editMode);
+    onPauseOnInactiveTabChange(localPauseOnInactiveTab);
+    onHide();
+    addSuccessToast(
+      editMode
+        ? t('Refresh interval saved')
+        : t('Refresh interval set for this session'),
     );
-  }
-}
+  };
+
+  const handleCancel = () => {
+    setRefreshFrequency(initialFrequency);
+    setLocalPauseOnInactiveTab(pauseOnInactiveTab);
+    onHide();
+  };
+
+  return (
+    <StandardModal
+      show={show}
+      onHide={handleCancel}
+      onSave={handleSave}
+      title={t('Refresh interval')}
+      width={400}
+      saveText={editMode ? t('Save') : t('Save for this session')}
+      saveDisabled={refreshErrors.length > 0}
+      errorTooltip={refreshErrors[0]}
+    >
+      <ModalContent>
+        <Form layout="vertical">
+          <Form.Item
+            label={t('Refresh frequency')}
+            help={
+              refreshErrors[0] ||
+              (editMode
+                ? t('Set the automatic refresh frequency for this dashboard.')
+                : t('Set refresh frequency for current session only.'))
+            }
+            extra={refreshWarningMessage}
+            validateStatus={refreshErrors.length ? 'error' : undefined}
+          >
+            <RefreshFrequencySelect
+              value={refreshFrequency}
+              onChange={handleFrequencyChange}
+            />
+          </Form.Item>
+          <CheckboxFormItem>
+            <Checkbox
+              checked={localPauseOnInactiveTab}
+              onChange={e => setLocalPauseOnInactiveTab(e.target.checked)}
+            >
+              {t('Pause auto refresh if tab is inactive')}
+            </Checkbox>
+          </CheckboxFormItem>
+        </Form>
+      </ModalContent>
+    </StandardModal>
+  );
+};
 
 export default RefreshIntervalModal;

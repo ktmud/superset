@@ -14,28 +14,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-FROM python:3.8-buster
+FROM python:3.11-slim-trixie
 
 RUN useradd --user-group --create-home --no-log-init --shell /bin/bash superset
 
 # Configure environment
 ENV LANG=C.UTF-8 \
-    LC_ALL=C.UTF-8
+  LC_ALL=C.UTF-8
 
 RUN apt-get update -y
 
-# Install dependencies to fix `curl https support error` and `elaying package configuration warning`
+# Install dependencies to fix `curl https support error` and `delaying package configuration warning`
 RUN apt-get install -y apt-transport-https apt-utils
 
 # Install superset dependencies
 # https://superset.apache.org/docs/installation/installing-superset-from-scratch
 RUN apt-get install -y build-essential libssl-dev \
-    libffi-dev python3-dev libsasl2-dev libldap2-dev libxi-dev
+  libffi-dev python3-dev libsasl2-dev libldap2-dev libxi-dev chromium zstd
 
-# Install nodejs for custom build
-# https://nodejs.org/en/download/package-manager/
-RUN curl -sL https://deb.nodesource.com/setup_12.x | bash - \
-    && apt-get install -y nodejs
+# Install nodejs for custom build, from the same image the main Dockerfile builds on
+COPY --from=node:24-trixie-slim /usr/local/bin/node /usr/local/bin/node
+COPY --from=node:24-trixie-slim /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+RUN set -eux; \
+  ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm; \
+  ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx; \
+  node --version; \
+  npm --version;
 
 RUN mkdir -p /home/superset
 RUN chown superset /home/superset
@@ -47,20 +51,21 @@ ARG SUPERSET_RELEASE_RC_TARBALL
 # Can fetch source from svn or copy tarball from local mounted directory
 COPY $SUPERSET_RELEASE_RC_TARBALL ./
 RUN tar -xvf *.tar.gz
-WORKDIR /home/superset/apache-superset-$VERSION/superset-frontend
+WORKDIR /home/superset/apache_superset-$VERSION/superset-frontend
 
 RUN npm ci \
-    && npm run build \
-    && rm -rf node_modules
+  && npm run build \
+  && rm -rf node_modules
 
-WORKDIR /home/superset/apache-superset-$VERSION
+WORKDIR /home/superset/apache_superset-$VERSION
 RUN pip install --upgrade setuptools pip \
-    && pip install -r requirements/base.txt \
-    && pip install --no-cache-dir .
+  && pip install -r requirements/base.txt \
+  && pip install --no-cache-dir .
 
 RUN flask fab babel-compile --target superset/translations
 
 ENV PATH=/home/superset/superset/bin:$PATH \
-    PYTHONPATH=/home/superset/superset/:$PYTHONPATH
+  PYTHONPATH=/home/superset/superset/ \
+  SUPERSET_TESTENV=true
 COPY from_tarball_entrypoint.sh /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]

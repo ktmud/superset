@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -16,22 +15,37 @@
 # specific language governing permissions and limitations
 # under the License.
 from dataclasses import dataclass
-from typing import Any, List, Optional, Type
+from typing import Any, Optional
 
 import pandas as pd
 
-from superset.models.reports import ReportRecipients, ReportRecipientType
+from superset.reports.models import ReportRecipients, ReportRecipientType
+from superset.utils.core import HeaderDataType
 
 
 @dataclass
 class NotificationContent:
     name: str
+    header_data: HeaderDataType  # this is optional to account for error states
     csv: Optional[bytes] = None  # bytes for csv file
-    screenshot: Optional[bytes] = None  # bytes for the screenshot
+    xlsx: Optional[bytes] = None  # bytes for Excel file
+    pdf: Optional[bytes] = None  # bytes for PDF file
+    screenshots: Optional[list[bytes]] = None  # bytes for a list of screenshots
     text: Optional[str] = None
     description: Optional[str] = ""
     url: Optional[str] = None  # url to chart/dashboard for this screenshot
     embedded_data: Optional[pd.DataFrame] = None
+    slack_retry_deadline: Optional[float] = None
+    # Populated only when this is a per-retry or final-failure notification
+    retry_attempt: Optional[int] = None
+    retry_max_attempts: Optional[int] = None
+    include_cta: bool = True  # include the call-to-action link back to Superset
+    is_editor_error: bool = False  # diagnostic email restricted to schedule editors
+
+    @property
+    def has_attachments(self) -> bool:
+        """Return whether the notification contains any file attachment."""
+        return bool(self.csv or self.xlsx or self.pdf or self.screenshots)
 
 
 class BaseNotification:  # pylint: disable=too-few-public-methods
@@ -42,7 +56,7 @@ class BaseNotification:  # pylint: disable=too-few-public-methods
     notification type
     """
 
-    plugins: List[Type["BaseNotification"]] = []
+    plugins: list[type["BaseNotification"]] = []
     type: Optional[ReportRecipientType] = None
     """
     Child classes set their notification type ex: `type = "email"` this string will be
@@ -50,7 +64,7 @@ class BaseNotification:  # pylint: disable=too-few-public-methods
     """
 
     def __init_subclass__(cls, *args: Any, **kwargs: Any) -> None:
-        super().__init_subclass__(*args, **kwargs)  # type: ignore
+        super().__init_subclass__(*args, **kwargs)
         cls.plugins.append(cls)
 
     def __init__(

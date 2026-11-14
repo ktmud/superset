@@ -18,21 +18,27 @@ from marshmallow import fields, Schema
 from marshmallow.validate import Length
 
 openapi_spec_methods_override = {
-    "get": {"get": {"description": "Get an Annotation layer"}},
+    "get": {"get": {"summary": "Get an annotation layer"}},
     "get_list": {
         "get": {
-            "description": "Get a list of Annotation layers, use Rison or JSON "
+            "summary": "Get a list of annotation layers",
+            "description": "Gets a list of annotation layers, use Rison or JSON "
             "query parameters for filtering, sorting,"
             " pagination and for selecting specific"
             " columns and metadata.",
         }
     },
-    "post": {"post": {"description": "Create an Annotation layer"}},
-    "put": {"put": {"description": "Update an Annotation layer"}},
-    "delete": {"delete": {"description": "Delete Annotation layer"}},
+    "post": {"post": {"summary": "Create an annotation layer"}},
+    "put": {"put": {"summary": "Update an annotation layer"}},
+    "delete": {"delete": {"summary": "Delete annotation layer"}},
+    "info": {"get": {"summary": "Get metadata information about this API resource"}},
 }
 
-get_delete_ids_schema = {"type": "array", "items": {"type": "integer"}}
+get_delete_ids_schema = {
+    "type": "array",
+    "items": {"type": "integer"},
+    "example": [1, 2, 3],
+}
 
 annotation_layer_name = "The annotation layer name"
 annotation_layer_descr = "Give a description for this annotation layer"
@@ -40,13 +46,42 @@ annotation_layer_descr = "Give a description for this annotation layer"
 
 class AnnotationLayerPostSchema(Schema):
     name = fields.String(
-        description=annotation_layer_name, required=True, validate=[Length(1, 250)]
+        metadata={"description": annotation_layer_name},
+        required=True,
+        validate=[Length(1, 250)],
     )
-    descr = fields.String(description=annotation_layer_descr, allow_none=True)
+    descr = fields.String(
+        metadata={"description": annotation_layer_descr}, allow_none=True
+    )
 
 
 class AnnotationLayerPutSchema(Schema):
     name = fields.String(
-        description=annotation_layer_name, required=False, validate=[Length(1, 250)]
+        metadata={"description": annotation_layer_name},
+        required=False,
+        validate=[Length(1, 250)],
     )
-    descr = fields.String(description=annotation_layer_descr, required=False)
+    descr = fields.String(
+        metadata={"description": annotation_layer_descr}, required=False
+    )
+
+
+class ImportV1AnnotationSchema(Schema):
+    """Schema for validating individual annotations within an exported layer."""
+
+    start_dttm = fields.DateTime(allow_none=True)
+    end_dttm = fields.DateTime(allow_none=True)
+    short_descr = fields.String(allow_none=True, validate=Length(0, 500))
+    long_descr = fields.String(allow_none=True)
+    json_metadata = fields.Dict(allow_none=True)
+    uuid = fields.UUID(required=True)
+
+
+class ImportV1AnnotationLayerSchema(Schema):
+    """Schema for importing V1 annotation layers from YAML export files."""
+
+    name = fields.String(required=True, validate=Length(1, 250))
+    descr = fields.String(allow_none=True)
+    uuid = fields.UUID(required=True)
+    version = fields.String(required=True)
+    annotation = fields.List(fields.Nested(ImportV1AnnotationSchema), load_default=list)

@@ -1,0 +1,418 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import {
+  ComparisonType,
+  QueryObject,
+  SqlaFormData,
+  VizType,
+} from '@superset-ui/core';
+import { renameOperator } from '@superset-ui/chart-controls';
+
+const formData: SqlaFormData = {
+  x_axis: 'dttm',
+  metrics: ['count(*)'],
+  groupby: ['gender'],
+  time_range: '2015 : 2016',
+  granularity: 'month',
+  datasource: 'foo',
+  viz_type: VizType.Table,
+  truncate_metric: true,
+};
+const queryObject: QueryObject = {
+  is_timeseries: true,
+  metrics: ['count(*)'],
+  columns: ['gender', 'dttm'],
+  time_range: '2015 : 2016',
+  granularity: 'month',
+  post_processing: [],
+};
+
+test('should skip renameOperator for empty metrics', () => {
+  expect(
+    renameOperator(formData, {
+      ...queryObject,
+
+      metrics: [],
+    }),
+  ).toEqual(undefined);
+});
+
+test('should skip renameOperator if series does not exist', () => {
+  expect(
+    renameOperator(formData, {
+      ...queryObject,
+
+      columns: [],
+    }),
+  ).toEqual(undefined);
+});
+
+test('should skip renameOperator if series does not exist and a single time shift exists', () => {
+  expect(
+    renameOperator(
+      { ...formData, time_compare: ['1 year ago'] },
+      {
+        ...queryObject,
+
+        columns: [],
+      },
+    ),
+  ).toEqual(undefined);
+});
+
+test('should skip renameOperator if does not exist x_axis and is_timeseries', () => {
+  expect(
+    renameOperator(
+      {
+        ...formData,
+        x_axis: null,
+      },
+      { ...queryObject, is_timeseries: false },
+    ),
+  ).toEqual(undefined);
+});
+
+test('should skip renameOperator if not is_timeseries and multi metrics', () => {
+  expect(
+    renameOperator(formData, {
+      ...queryObject,
+      is_timeseries: false,
+      metrics: ['count(*)', 'sum(val)'],
+    }),
+  ).toEqual(undefined);
+});
+
+test('should add renameOperator', () => {
+  expect(renameOperator(formData, queryObject)).toEqual({
+    operation: 'rename',
+    options: { columns: { 'count(*)': null }, inplace: true, level: 0 },
+  });
+});
+
+test('should add renameOperator if a metric exists and multiple time shift', () => {
+  expect(
+    renameOperator(
+      {
+        ...formData,
+        time_compare: ['1 year ago', '2 years ago'],
+      },
+      {
+        ...queryObject,
+
+        columns: [],
+      },
+    ),
+  ).toEqual({
+    operation: 'rename',
+    options: { columns: { 'count(*)': null }, inplace: true, level: 0 },
+  });
+});
+
+test('should add renameOperator if exists derived metrics', () => {
+  [
+    ComparisonType.Difference,
+    ComparisonType.Ratio,
+    ComparisonType.Percentage,
+  ].forEach(type => {
+    expect(
+      renameOperator(
+        {
+          ...formData,
+
+          comparison_type: type,
+          time_compare: ['1 year ago'],
+        },
+        {
+          ...queryObject,
+
+          metrics: ['count(*)'],
+        },
+      ),
+    ).toEqual({
+      operation: 'rename',
+      options: {
+        columns: { [`${type}__count(*)__count(*)__1 year ago`]: '1 year ago' },
+        inplace: true,
+        level: 0,
+      },
+    });
+  });
+});
+
+test('should add renameOperator if isTimeComparisonValue without columns', () => {
+  [
+    ComparisonType.Difference,
+    ComparisonType.Ratio,
+    ComparisonType.Percentage,
+  ].forEach(type => {
+    expect(
+      renameOperator(
+        {
+          ...formData,
+
+          comparison_type: type,
+          time_compare: ['1 year ago'],
+        },
+        {
+          ...queryObject,
+
+          columns: [],
+          metrics: ['sum(val)', 'avg(val2)'],
+        },
+      ),
+    ).toEqual({
+      operation: 'rename',
+      options: {
+        columns: {
+          [`${type}__avg(val2)__avg(val2)__1 year ago`]:
+            'avg(val2), 1 year ago',
+          [`${type}__sum(val)__sum(val)__1 year ago`]: 'sum(val), 1 year ago',
+        },
+        inplace: true,
+        level: 0,
+      },
+    });
+  });
+});
+
+test('should add renameOperator if x_axis does not exist', () => {
+  expect(
+    renameOperator(
+      {
+        ...formData,
+        x_axis: null,
+        granularity_sqla: 'time column',
+      },
+      queryObject,
+    ),
+  ).toEqual({
+    operation: 'rename',
+    options: { columns: { 'count(*)': null }, inplace: true, level: 0 },
+  });
+});
+
+test('should add renameOperator if based on series_columns', () => {
+  expect(
+    renameOperator(
+      {
+        ...formData,
+        x_axis: null,
+        granularity_sqla: 'time column',
+      },
+      {
+        ...queryObject,
+        columns: [],
+        series_columns: ['gender', 'dttm'],
+      },
+    ),
+  ).toEqual({
+    operation: 'rename',
+    options: { columns: { 'count(*)': null }, inplace: true, level: 0 },
+  });
+});
+
+test('should add renameOperator if exist "actual value" time comparison', () => {
+  expect(
+    renameOperator(
+      {
+        ...formData,
+
+        comparison_type: ComparisonType.Values,
+        time_compare: ['1 year ago', '1 year later'],
+      },
+      queryObject,
+    ),
+  ).toEqual({
+    operation: 'rename',
+    options: {
+      columns: {
+        'count(*)__1 year ago': '1 year ago',
+        'count(*)__1 year later': '1 year later',
+      },
+      inplace: true,
+      level: 0,
+    },
+  });
+});
+
+test('should add renameOperator if derived time comparison exists', () => {
+  expect(
+    renameOperator(
+      {
+        ...formData,
+
+        comparison_type: ComparisonType.Ratio,
+        time_compare: ['1 year ago', '1 year later'],
+      },
+      queryObject,
+    ),
+  ).toEqual({
+    operation: 'rename',
+    options: {
+      columns: {
+        'ratio__count(*)__count(*)__1 year ago': '1 year ago',
+        'ratio__count(*)__count(*)__1 year later': '1 year later',
+      },
+      inplace: true,
+      level: 0,
+    },
+  });
+});
+
+test('should add renameOperator if multiple metrics exist', () => {
+  expect(
+    renameOperator(
+      {
+        ...formData,
+
+        comparison_type: ComparisonType.Values,
+        time_compare: ['1 year ago'],
+      },
+      {
+        ...queryObject,
+
+        metrics: ['count(*)', 'sum(sales)'],
+      },
+    ),
+  ).toEqual({
+    operation: 'rename',
+    options: {
+      columns: {
+        'count(*)__1 year ago': 'count(*), 1 year ago',
+        'sum(sales)__1 year ago': 'sum(sales), 1 year ago',
+      },
+      inplace: true,
+      level: 0,
+    },
+  });
+});
+
+test('should correctly match offsets that share a numeric prefix', () => {
+  expect(
+    renameOperator(
+      {
+        ...formData,
+
+        comparison_type: ComparisonType.Values,
+        time_compare: ['1 year ago', '11 year ago'],
+      },
+      queryObject,
+    ),
+  ).toEqual({
+    operation: 'rename',
+    options: {
+      columns: {
+        'count(*)__1 year ago': '1 year ago',
+        'count(*)__11 year ago': '11 year ago',
+      },
+      inplace: true,
+      level: 0,
+    },
+  });
+});
+
+test('should not collide a sort-only metric labeled like a time offset with the renamed metric column', () => {
+  // A single displayed metric ("count(*)") with an "actual values" time
+  // comparison and a sort-only metric (queried via `timeseries_limit_metric`
+  // for `x_axis_sort`, see extractExtraMetrics) labeled exactly like the
+  // time offset, "1 year ago". Without accounting for that extra metric,
+  // `count(*)__1 year ago` would rename to the bare offset label "1 year
+  // ago", colliding with the sort metric's own unrenamed base column of the
+  // same name.
+  expect(
+    renameOperator(
+      {
+        ...formData,
+        comparison_type: ComparisonType.Values,
+        time_compare: ['1 year ago'],
+        x_axis_sort: '1 year ago',
+        timeseries_limit_metric: '1 year ago',
+      },
+      queryObject,
+    ),
+  ).toEqual({
+    operation: 'rename',
+    options: {
+      columns: { 'count(*)__1 year ago': 'count(*), 1 year ago' },
+      inplace: true,
+      level: 0,
+    },
+  });
+});
+
+test('should keep the unrenamed comparison column when its target collides with a sort-only metric label', () => {
+  // With a sort-only metric labeled `count(*), 1 year ago`, renaming
+  // `count(*)__1 year ago` to that same label would make the backend `rename`
+  // fail with "Label already exists", so the column keeps its own label.
+  expect(
+    renameOperator(
+      {
+        ...formData,
+        comparison_type: ComparisonType.Values,
+        time_compare: ['1 year ago'],
+        x_axis_sort: 'count(*), 1 year ago',
+        timeseries_limit_metric: 'count(*), 1 year ago',
+      },
+      queryObject,
+    ),
+  ).toEqual(undefined);
+});
+
+test('should still truncate the metric prefix when a sort-only metric is added', () => {
+  // The sort-only metric is hidden from rendering, so a single displayed
+  // metric with dimensions and `truncate_metric` keeps dropping its prefix.
+  expect(
+    renameOperator(
+      {
+        ...formData,
+        x_axis_sort: 'sales',
+        timeseries_limit_metric: 'sales',
+      },
+      queryObject,
+    ),
+  ).toEqual({
+    operation: 'rename',
+    options: {
+      columns: { 'count(*)': null },
+      inplace: true,
+      level: 0,
+    },
+  });
+});
+
+test('should remove renameOperator', () => {
+  expect(
+    renameOperator(
+      {
+        ...formData,
+        truncate_metric: false,
+      },
+      queryObject,
+    ),
+  ).toEqual(undefined);
+  expect(
+    renameOperator(
+      {
+        ...formData,
+        truncate_metric: undefined,
+      },
+      queryObject,
+    ),
+  ).toEqual(undefined);
+});

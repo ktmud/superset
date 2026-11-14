@@ -14,18 +14,33 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-from typing import Any, Dict, List, Optional
 
-from superset import app
-from superset.models.core import Database
+from __future__ import annotations
 
-custom_password_store = app.config["SQLALCHEMY_CUSTOM_PASSWORD_STORE"]
+from collections.abc import Callable
+from typing import Any, TYPE_CHECKING
+
+from sqlalchemy.engine.url import make_url, URL
+from sqlalchemy.exc import NoSuchTableError
+
+from superset.commands.database.exceptions import DatabaseInvalidError
+from superset.constants import EMBEDDED_CREDENTIALS_KEY
+from superset.sql.parse import Table
+from superset.utils import json
+
+if TYPE_CHECKING:
+    from superset.databases.schemas import (
+        TableMetadataColumnsResponse,
+        TableMetadataForeignKeysIndexesResponse,
+        TableMetadataResponse,
+    )
 
 
 def get_foreign_keys_metadata(
-    database: Database, table_name: str, schema_name: Optional[str]
-) -> List[Dict[str, Any]]:
-    foreign_keys = database.get_foreign_keys(table_name, schema_name)
+    database: Any,
+    table: Table,
+) -> list[TableMetadataForeignKeysIndexesResponse]:
+    foreign_keys = database.get_foreign_keys(table)
     for fk in foreign_keys:
         fk["column_names"] = fk.pop("constrained_columns")
         fk["type"] = "fk"
@@ -33,15 +48,16 @@ def get_foreign_keys_metadata(
 
 
 def get_indexes_metadata(
-    database: Database, table_name: str, schema_name: Optional[str]
-) -> List[Dict[str, Any]]:
-    indexes = database.get_indexes(table_name, schema_name)
+    database: Any,
+    table: Table,
+) -> list[TableMetadataForeignKeysIndexesResponse]:
+    indexes = database.get_indexes(table)
     for idx in indexes:
         idx["type"] = "index"
     return indexes
 
 
-def get_col_type(col: Dict[Any, Any]) -> str:
+def get_col_type(col: dict[Any, Any]) -> str:
     try:
         dtype = f"{col['type']}"
     except Exception:  # pylint: disable=broad-except
@@ -50,54 +66,235 @@ def get_col_type(col: Dict[Any, Any]) -> str:
     return dtype
 
 
-def get_table_metadata(
-    database: Database, table_name: str, schema_name: Optional[str]
-) -> Dict[str, Any]:
+def get_table_metadata(database: Any, table: Table) -> TableMetadataResponse:
     """
     Get table metadata information, including type, pk, fks.
     This function raises SQLAlchemyError when a schema is not found.
 
     :param database: The database model
-    :param table_name: Table name
-    :param schema_name: schema name
+    :param table: Table instance
     :return: Dict table metadata ready for API response
     """
     keys = []
-    columns = database.get_columns(table_name, schema_name)
-    primary_key = database.get_pk_constraint(table_name, schema_name)
+    table_missing = False
+    try:
+        # get_columns is the table-existence check: SQLAlchemy 2.0's sqlite
+        # dialect raises NoSuchTableError from reflection for a table that
+        # doesn't exist - 1.4's sqlite dialect silently returned empty
+        # results instead, which this API has always relied on to answer
+        # with an empty-but-200 payload for sqlite specifically (other
+        # backends' dialects already raised on missing tables pre-2.0, so
+        # they're unaffected and still surface as the 422 below). Only
+        # sqlite gets the graceful fallback, matching that pre-existing,
+        # dialect-driven difference in behavior between backends. Only this
+        # first call is guarded, so a NoSuchTableError raised later while
+        # reflecting fks/indexes/comments for a table confirmed to exist
+        # still propagates instead of being mistaken for a missing table.
+        columns = database.get_columns(table)
+    except NoSuchTableError:
+        if database.backend != "sqlite":
+            raise
+        table_missing = True
+        columns = []
+    if not table_missing:
+        primary_key = database.get_pk_constraint(table)
+        foreign_keys = get_foreign_keys_metadata(database, table)
+        indexes = get_indexes_metadata(database, table)
+        table_comment = database.get_table_comment(table)
+    else:
+        primary_key = {"constrained_columns": None, "name": None}
+        foreign_keys = []
+        indexes = []
+        table_comment = None
     if primary_key and primary_key.get("constrained_columns"):
         primary_key["column_names"] = primary_key.pop("constrained_columns")
         primary_key["type"] = "pk"
         keys += [primary_key]
-    foreign_keys = get_foreign_keys_metadata(database, table_name, schema_name)
-    indexes = get_indexes_metadata(database, table_name, schema_name)
     keys += foreign_keys + indexes
-    payload_columns: List[Dict[str, Any]] = []
-    table_comment = database.get_table_comment(table_name, schema_name)
+    payload_columns: list[TableMetadataColumnsResponse] = []
     for col in columns:
         dtype = get_col_type(col)
         payload_columns.append(
             {
-                "name": col["name"],
+                "name": col["column_name"],
                 "type": dtype.split("(")[0] if "(" in dtype else dtype,
                 "longType": dtype,
-                "keys": [k for k in keys if col["name"] in k["column_names"]],
+                "keys": [k for k in keys if col["column_name"] in k["column_names"]],
                 "comment": col.get("comment"),
             }
         )
     return {
-        "name": table_name,
+        "name": table.table,
         "columns": payload_columns,
         "selectStar": database.select_star(
-            table_name,
-            schema=schema_name,
-            show_cols=True,
+            table,
+            show_cols=True if columns else False,
             indent=True,
             cols=columns,
-            latest_partition=True,
+            # A missing table has no partitions to look up, and asking
+            # anyway would just re-trigger the same NoSuchTableError via
+            # select_star()'s own internal database.get_columns() fallback
+            # (it re-fetches columns itself whenever `cols` is empty and
+            # either show_cols or latest_partition is set).
+            latest_partition=not table_missing,
         ),
         "primaryKey": primary_key,
         "foreignKeys": foreign_keys,
         "indexes": keys,
         "comment": table_comment,
     }
+
+
+def make_url_safe(raw_url: str | URL) -> URL:
+    """
+    Wrapper for SQLAlchemy's make_url(), which tends to raise too detailed of
+    errors, which inevitably find their way into server logs. ArgumentErrors
+    tend to contain usernames and passwords, which makes them non-log-friendly
+    :param raw_url:
+    :return:
+    """
+
+    if isinstance(raw_url, str):
+        url = raw_url.strip()
+        try:
+            return make_url(url)  # noqa
+        except Exception as ex:
+            raise DatabaseInvalidError() from ex
+
+    else:
+        return raw_url
+
+
+def _is_present(value: Any) -> bool:
+    """Is a credential field actually filled in? Whitespace does not count."""
+    if isinstance(value, str):
+        return bool(value.strip())
+    return bool(value)
+
+
+def validated_embedded_credentials(credentials: Any) -> dict[str, str] | None:
+    """
+    Return a complete embedded fallback credential, or ``None``.
+
+    The canonical shape is ``{username, password}`` or ``{username, auth_method:
+    "keypair", privatekey_body, privatekey_pass}``; a half-filled credential is
+    ignored rather than half-applied. Engines may override this default through
+    ``BaseEngineSpec.validate_embedded_credentials`` for both query-time and
+    authoring-time validation.
+    """
+    if not isinstance(credentials, dict):
+        return None
+
+    username = credentials.get("username")
+    if not isinstance(username, str) or not _is_present(username):
+        return None
+
+    auth_method = credentials.get("auth_method", "password")
+    if auth_method == "keypair":
+        privatekey_body = credentials.get("privatekey_body")
+        privatekey_pass = credentials.get("privatekey_pass", "")
+        if (
+            not isinstance(privatekey_body, str)
+            or not _is_present(privatekey_body)
+            or not isinstance(privatekey_pass, str)
+        ):
+            return None
+        return {
+            "username": username,
+            "auth_method": "keypair",
+            "privatekey_body": privatekey_body,
+            "privatekey_pass": privatekey_pass,
+        }
+
+    password = credentials.get("password")
+    if auth_method != "password" or not isinstance(password, str) or not password:
+        return None
+    return {"username": username, "password": password}
+
+
+def embedded_credentials_present(value: Any) -> bool:
+    """
+    Does a stored or submitted value configure an embedded credential at all?
+
+    Absent, empty and entirely blank values mean "no credential configured";
+    ``auth_method`` alone does not count, since the dialog writes it as soon as the
+    selector renders. Anything else counts, complete or not.
+    """
+    if value is None or value == "":
+        return False
+    if isinstance(value, dict):
+        return any(
+            _is_present(field) for key, field in value.items() if key != "auth_method"
+        )
+    return True
+
+
+def embedded_credentials_incomplete(
+    value: Any,
+    validate_credentials: Callable[[Any], dict[str, str] | None],
+    *,
+    accept_json_string: bool = True,
+) -> bool:
+    """
+    Is an embedded credential malformed or incomplete for its engine?
+
+    Absent and entirely blank values pass -- they mean "no credential configured".
+    Accepts the value as a dict or as the JSON string the connection dialog posts.
+    Saving passes ``accept_json_string=False``: the value is stored as sent, and a
+    string is refused at query time however complete the JSON inside it.
+    Use the engine's query-time validator when the connection is known, keeping
+    authoring checks consistent with engine-specific credential shapes.
+    """
+    if value is None or value == "":
+        return False
+
+    is_string = isinstance(value, str)
+    if is_string:
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return True
+
+    if value is None:
+        return False
+    if not isinstance(value, dict):
+        return True
+
+    # `auth_method` alone is not a credential -- the dialog writes it as soon as the
+    # selector renders, so an untouched sub-form must not count as half-filled.
+    if not any(
+        _is_present(field) for key, field in value.items() if key != "auth_method"
+    ):
+        return False
+
+    if is_string and not accept_json_string:
+        return True
+
+    return validate_credentials(value) is None
+
+
+def embedded_credentials_missing_fields(credentials: Any) -> list[str]:
+    """
+    Name the fields of the canonical credential shape that ``credentials`` lacks.
+
+    Paths are JSONPath into Secure Extra (``$.embedded_credentials.<field>``), the
+    form the import already uses to name a secret it needs. Returns an empty list
+    when nothing canonical is missing, e.g. an unknown ``auth_method`` or a shape
+    only an engine-specific validator rejects.
+    """
+    if not isinstance(credentials, dict):
+        return []
+
+    missing: list[str] = []
+    if not _is_present(credentials.get("username")):
+        missing.append("username")
+
+    auth_method = credentials.get("auth_method", "password")
+    if auth_method == "keypair":
+        if not _is_present(credentials.get("privatekey_body")):
+            missing.append("privatekey_body")
+    elif auth_method == "password":
+        if not _is_present(credentials.get("password")):
+            missing.append("password")
+
+    return [f"$.{EMBEDDED_CREDENTIALS_KEY}.{field}" for field in missing]

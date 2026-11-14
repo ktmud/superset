@@ -1,0 +1,93 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import { ChartMetadata } from '@superset-ui/core';
+
+describe('ChartMetadata', () => {
+  test('exists', () => {
+    expect(ChartMetadata).toBeDefined();
+  });
+  describe('new ChartMetadata({})', () => {
+    test('creates new metadata instance', () => {
+      const metadata = new ChartMetadata({
+        name: 'test chart',
+        credits: [],
+        description: 'some kind of chart',
+        thumbnail: 'test.png',
+      });
+      expect(metadata).toBeInstanceOf(ChartMetadata);
+    });
+  });
+  describe('.canBeAnnotationType(type)', () => {
+    const metadata = new ChartMetadata({
+      name: 'test chart',
+      canBeAnnotationTypes: ['event'],
+      credits: [],
+      description: 'some kind of chart',
+      thumbnail: 'test.png',
+    });
+    test('returns true if can', () => {
+      expect(metadata.canBeAnnotationType('event')).toBeTruthy();
+    });
+    test('returns false otherwise', () => {
+      expect(metadata.canBeAnnotationType('invalid-type')).toBeFalsy();
+    });
+  });
+  describe('.clone()', () => {
+    const metadata = new ChartMetadata({
+      name: 'test chart',
+      canBeAnnotationTypes: ['event'],
+      credits: [],
+      description: 'some kind of chart',
+      thumbnail: 'test.png',
+    });
+    const clone = metadata.clone();
+
+    test('returns a new instance', () => {
+      expect(metadata).not.toBe(clone);
+    });
+    test('returns a new instance with same field values', () => {
+      expect(metadata.name).toEqual(clone.name);
+      expect(metadata.credits).toEqual(clone.credits);
+      expect(metadata.description).toEqual(clone.description);
+      expect(metadata.canBeAnnotationTypes).toEqual(clone.canBeAnnotationTypes);
+      expect(metadata.thumbnail).toEqual(clone.thumbnail);
+    });
+  });
+  test('stores supportsCascadeDependencies without defaulting unset to false', () => {
+    const unset = new ChartMetadata({
+      name: 'unset',
+      thumbnail: 'test.png',
+    });
+    const optedOut = new ChartMetadata({
+      name: 'opted out',
+      thumbnail: 'test.png',
+      supportsCascadeDependencies: false,
+    });
+    const optedIn = new ChartMetadata({
+      name: 'opted in',
+      thumbnail: 'test.png',
+      supportsCascadeDependencies: true,
+    });
+    expect(unset.supportsCascadeDependencies).toBeUndefined();
+    expect(optedOut.supportsCascadeDependencies).toBe(false);
+    expect(optedIn.supportsCascadeDependencies).toBe(true);
+    expect(optedOut.clone().supportsCascadeDependencies).toBe(false);
+  });
+});

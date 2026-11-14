@@ -16,43 +16,43 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React from 'react';
-import { render, screen } from 'spec/helpers/testing-library';
-import userEvent from '@testing-library/user-event';
+import { render, screen, userEvent } from 'spec/helpers/testing-library';
 import PublishedStatus from '.';
 
 const defaultProps = {
   dashboardId: 1,
   isPublished: false,
   savePublished: jest.fn(),
-  canEdit: false,
-  canSave: false,
+  userCanEdit: false,
+  userCanSave: false,
 };
 
 test('renders with unpublished status and readonly permissions', async () => {
-  const tooltip = /This dashboard is not published which means it will not show up in the list of dashboards/;
+  const tooltip =
+    /This dashboard is not published which means it will not show up in the list of dashboards/;
   render(<PublishedStatus {...defaultProps} />);
   expect(screen.getByText('Draft')).toBeInTheDocument();
-  userEvent.hover(screen.getByText('Draft'));
+  await userEvent.hover(screen.getByText('Draft'));
   expect(await screen.findByText(tooltip)).toBeInTheDocument();
 });
 
 test('renders with unpublished status and write permissions', async () => {
-  const tooltip = /This dashboard is not published, it will not show up in the list of dashboards/;
+  const tooltip =
+    /This dashboard is not published, it will not show up in the list of dashboards/;
   const savePublished = jest.fn();
   render(
     <PublishedStatus
       {...defaultProps}
-      canEdit
-      canSave
+      userCanEdit
+      userCanSave
       savePublished={savePublished}
     />,
   );
   expect(screen.getByText('Draft')).toBeInTheDocument();
-  userEvent.hover(screen.getByText('Draft'));
+  await userEvent.hover(screen.getByText('Draft'));
   expect(await screen.findByText(tooltip)).toBeInTheDocument();
   expect(savePublished).not.toHaveBeenCalled();
-  userEvent.click(screen.getByText('Draft'));
+  await userEvent.click(screen.getByText('Draft'));
   expect(savePublished).toHaveBeenCalledTimes(1);
 });
 
@@ -68,15 +68,15 @@ test('renders with published status and write permissions', async () => {
     <PublishedStatus
       {...defaultProps}
       isPublished
-      canEdit
-      canSave
+      userCanEdit
+      userCanSave
       savePublished={savePublished}
     />,
   );
   expect(screen.getByText('Published')).toBeInTheDocument();
-  userEvent.hover(screen.getByText('Published'));
+  await userEvent.hover(screen.getByText('Published'));
   expect(await screen.findByText(tooltip)).toBeInTheDocument();
   expect(savePublished).not.toHaveBeenCalled();
-  userEvent.click(screen.getByText('Published'));
+  await userEvent.click(screen.getByText('Published'));
   expect(savePublished).toHaveBeenCalledTimes(1);
 });

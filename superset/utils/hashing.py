@@ -14,21 +14,93 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+from __future__ import annotations
+
 import hashlib
-from typing import Any, Callable, Dict, Optional
+import logging
+from typing import Any, Callable, Literal, Optional
 
-import simplejson as json
+from flask import current_app
+
+from superset.utils import json
+
+logger = logging.getLogger(__name__)
+
+HashAlgorithm = Literal["md5", "sha256"]
+
+# Hash algorithm lookup table mapping algorithm name to the raw hashlib
+# constructor. Shared with superset.utils.cache_manager, which needs the
+# constructor itself (not a finalized digest) to satisfy Flask-Caching's
+# hash_method contract.
+_HASH_CONSTRUCTORS: dict[HashAlgorithm, Callable[[bytes], Any]] = {
+    "sha256": hashlib.sha256,
+    "md5": hashlib.md5,  # noqa: S324
+}
+
+# Hash function lookup table for efficient dispatch
+_HASH_FUNCTIONS: dict[HashAlgorithm, Callable[[bytes], str]] = {
+    name: (lambda ctor: lambda data: ctor(data).hexdigest())(ctor)
+    for name, ctor in _HASH_CONSTRUCTORS.items()
+}
 
 
-def md5_sha_from_str(val: str) -> str:
-    return hashlib.md5(val.encode("utf-8")).hexdigest()
+def get_hash_algorithm() -> HashAlgorithm:
+    """
+    Get the configured hash algorithm for non-cryptographic purposes.
+
+    Returns:
+        Hash algorithm name ('md5' or 'sha256')
+    """
+    return current_app.config["HASH_ALGORITHM"]
 
 
-def md5_sha_from_dict(
-    obj: Dict[Any, Any],
+def hash_from_str(val: str, algorithm: Optional[HashAlgorithm] = None) -> str:
+    """
+    Generate a hash from a string using the configured or specified algorithm.
+
+    Args:
+        val: String to hash
+        algorithm: Hash algorithm to use (defaults to configured algorithm)
+
+    Returns:
+        Hexadecimal hash digest string
+
+    Examples:
+        >>> hash_from_str("test")  # Uses configured algorithm
+        '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08'
+        >>> hash_from_str("test", algorithm="md5")  # Force MD5
+        '098f6bcd4621d373cade4e832627b4f6'
+    """
+    if algorithm is None:
+        algorithm = get_hash_algorithm()
+
+    hash_func = _HASH_FUNCTIONS.get(algorithm)
+    if hash_func is None:
+        raise ValueError(f"Unsupported hash algorithm: {algorithm}")
+
+    return hash_func(val.encode("utf-8"))
+
+
+def hash_from_dict(
+    obj: dict[Any, Any],
     ignore_nan: bool = False,
     default: Optional[Callable[[Any], Any]] = None,
+    algorithm: Optional[HashAlgorithm] = None,
 ) -> str:
-    json_data = json.dumps(obj, sort_keys=True, ignore_nan=ignore_nan, default=default)
+    """
+    Generate a hash from a dictionary using the configured or specified algorithm.
 
-    return md5_sha_from_str(json_data)
+    Args:
+        obj: Dictionary to hash
+        ignore_nan: Whether to ignore NaN values in JSON serialization
+        default: Default function for JSON serialization
+        algorithm: Hash algorithm to use (defaults to configured algorithm)
+
+    Returns:
+        Hexadecimal hash digest string
+    """
+    json_data = json.dumps(
+        obj, sort_keys=True, ignore_nan=ignore_nan, default=default, allow_nan=True
+    )
+
+    return hash_from_str(json_data, algorithm=algorithm)

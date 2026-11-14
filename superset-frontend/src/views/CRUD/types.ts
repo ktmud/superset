@@ -16,21 +16,26 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { User } from 'src/types/bootstrapTypes';
+import { QueryState } from '@superset-ui/core';
+import { UserWithPermissionsAndRoles } from 'src/types/bootstrapTypes';
 import Database from 'src/types/Database';
-import Owner from 'src/types/Owner';
+import User from 'src/types/User';
+import Subject from 'src/types/Subject';
 
 export type FavoriteStatus = {
   [id: number]: boolean;
 };
 
-export enum TableTabTypes {
-  FAVORITE = 'Favorite',
-  MINE = 'Mine',
-  EXAMPLES = 'Examples',
+export enum TableTab {
+  Favorite = 'Favorite',
+  Mine = 'Mine',
+  Other = 'Other',
+  Viewed = 'Viewed',
+  Created = 'Created',
+  Edited = 'Edited',
 }
 
-export type Filters = {
+export type Filter = {
   col: string;
   opr: string;
   value: string | number;
@@ -39,17 +44,19 @@ export type Filters = {
 export interface DashboardTableProps {
   addDangerToast: (message: string) => void;
   addSuccessToast: (message: string) => void;
-  search: string;
-  user?: User;
+  user?: UserWithPermissionsAndRoles;
   mine: Array<Dashboard>;
   showThumbnails?: boolean;
-  featureFlag?: boolean;
-  examples: Array<Dashboard>;
+  otherTabData?: Array<Dashboard>;
+  otherTabFilters: Filter[];
+  otherTabTitle: string;
 }
 
 export interface Dashboard {
+  certified_by?: string;
+  certification_details?: string;
   changed_by_name: string;
-  changed_by_url: string;
+  changed_on?: string;
   changed_on_delta_humanized?: string;
   changed_on_utc?: string;
   changed_by: string;
@@ -58,13 +65,17 @@ export interface Dashboard {
   id: number;
   published: boolean;
   url: string;
-  thumbnail_url: string;
-  owners: Owner[];
+  thumbnail_url?: string | null;
+  editors?: Subject[];
+  // Bare subject ids from a deployment's EXTRA_EDITORS_RESOLVER.
+  extra_editors?: number[];
+  viewers?: Subject[];
   loading?: boolean;
 }
 
 export type SavedQueryObject = {
   id: number;
+  catalog: string | null;
   changed_on: string;
   changed_on_delta_humanized: string;
   database: {
@@ -89,14 +100,7 @@ export interface QueryObject {
   sql: string;
   executed_sql: string | null;
   sql_tables?: { catalog?: string; schema: string; table: string }[];
-  status:
-    | 'success'
-    | 'failed'
-    | 'stopped'
-    | 'running'
-    | 'timed_out'
-    | 'scheduled'
-    | 'pending';
+  status: QueryState;
   tab_name: string;
   user: {
     first_name: string;
@@ -105,6 +109,7 @@ export interface QueryObject {
     username: string;
   };
   start_time: number;
+  start_running_time: number | null;
   end_time: number;
   rows: number;
   tmp_table_name: string;
@@ -112,23 +117,25 @@ export interface QueryObject {
 }
 
 export enum QueryObjectColumns {
-  id = 'id',
-  changed_on = 'changed_on',
-  database = 'database',
-  database_name = 'database.database_name',
-  schema = 'schema',
-  sql = 'sql',
-  executed_sql = 'exceuted_sql',
-  sql_tables = 'sql_tables',
-  status = 'status',
-  tab_name = 'tab_name',
-  user = 'user',
-  user_first_name = 'user.first_name',
-  start_time = 'start_time',
-  end_time = 'end_time',
-  rows = 'rows',
-  tmp_table_name = 'tmp_table_name',
-  tracking_url = 'tracking_url',
+  Id = 'id',
+  ChangedOn = 'changed_on',
+  ChangedBy = 'changed_by',
+  Database = 'database',
+  DatabaseName = 'database.database_name',
+  Schema = 'schema',
+  Sql = 'sql',
+  ExecutedSql = 'executed_sql',
+  SqlTables = 'sql_tables',
+  Status = 'status',
+  TabName = 'tab_name',
+  User = 'user',
+  UserFirstName = 'user.first_name',
+  StartTime = 'start_time',
+  StartRunningTime = 'start_running_time',
+  EndTime = 'end_time',
+  Rows = 'rows',
+  TmpTableName = 'tmp_table_name',
+  TrackingUrl = 'tracking_url',
 }
 
 export type ImportResourceName =
@@ -136,7 +143,29 @@ export type ImportResourceName =
   | 'dashboard'
   | 'database'
   | 'dataset'
-  | 'saved_query';
+  | 'saved_query'
+  | 'theme';
+
+export interface Tag {
+  changed_on_delta_humanized: string;
+  changed_by: User;
+  created_on_delta_humanized: string;
+  name: string;
+  id: number;
+  created_by: User;
+  description: string;
+  type: string;
+}
 
 export type DatabaseObject = Partial<Database> &
   Pick<Database, 'sqlalchemy_uri'>;
+
+export interface EncryptedExtraField {
+  path: string;
+  label: string;
+}
+
+export interface FileEncryptedExtraFields {
+  fileName: string;
+  fields: EncryptedExtraField[];
+}

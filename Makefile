@@ -15,22 +15,30 @@
 # limitations under the License.
 #
 
-# Python version installed; we need 3.7-3.9
-PYTHON=`command -v python3.9 || command -v python3.8 || command -v python3.7`
+# Python version installed; we need 3.11-3.12
+PYTHON=`command -v python3.11 || command -v python3.12`
 
-.PHONY: install superset venv pre-commit
+.PHONY: install superset venv pre-commit up down logs ps nuke ports open
 
 install: superset pre-commit
 
 superset:
+	# Bootstrap uv (the project's installer) into the active environment
+	pip install uv
+
 	# Install external dependencies
-	pip install -r requirements/local.txt
+	uv pip install -r requirements/development.txt
 
 	# Install Superset in editable (development) mode
-	pip install -e .
+	uv pip install -e .
 
 	# Create an admin user in your metadata database
-	superset fab create-admin
+	superset fab create-admin \
+                    --username admin \
+                    --firstname "Admin I."\
+                    --lastname Strator \
+                    --email admin@superset.io \
+                    --password general
 
 	# Initialize the database
 	superset db upgrade
@@ -41,14 +49,20 @@ superset:
 	# Load some data to play with
 	superset load-examples
 
+	# Install node packages
+	cd superset-frontend; npm ci
+
 update: update-py update-js
 
 update-py:
+	# Bootstrap uv (the project's installer) into the active environment
+	pip install uv
+
 	# Install external dependencies
-	pip install -r requirements/local.txt
+	uv pip install -r requirements/development.txt
 
 	# Install Superset in editable (development) mode
-	pip install -e .
+	uv pip install -e .
 
 	# Initialize the database
 	superset db upgrade
@@ -62,16 +76,17 @@ update-js:
 
 venv:
 	# Create a virtual environment and activate it (recommended)
-	if ! [ -x "${PYTHON}" ]; then echo "You need Python 3.7, 3.8 or 3.9 installed"; exit 1; fi
+	if ! [ -x "${PYTHON}" ]; then echo "You need Python 3.11 or 3.12 installed"; exit 1; fi
 	test -d venv || ${PYTHON} -m venv venv # setup a python3 virtualenv
 	. venv/bin/activate
 
 activate:
-	source venv/bin/activate
+	. venv/bin/activate
 
 pre-commit:
 	# setup pre commit dependencies
-	pip3 install -r requirements/integration.txt
+	pip install uv
+	uv pip install -r requirements/development.txt
 	pre-commit install
 
 format: py-format js-format
@@ -79,22 +94,45 @@ format: py-format js-format
 py-format: pre-commit
 	pre-commit run black --all-files
 
-py-lint: pre-commit
-	pylint -j 0 superset
-
 js-format:
-	cd superset-frontend; npm run prettier
+	cd superset-frontend; npm run format
 
 flask-app:
-	flask run -p 8088 --with-threads --reload --debugger
+	flask run -p 8088 --reload --debugger
 
 node-app:
 	cd superset-frontend; npm run dev-server
 
-build-cypress:
-	cd superset-frontend; npm run build-instrumented
-	cd superset-frontend/cypress-base; npm install
+report-celery-worker:
+	celery --app=superset.tasks.celery_app:app worker
 
-open-cypress:
-	if ! [ $(port) ]; then cd superset-frontend/cypress-base; CYPRESS_BASE_URL=http://localhost:9000 npm run cypress open; fi
-	cd superset-frontend/cypress-base; CYPRESS_BASE_URL=http://localhost:$(port) npm run cypress open
+report-celery-beat:
+	celery --app=superset.tasks.celery_app:app beat --pidfile /tmp/celerybeat.pid --schedule /tmp/celerybeat-schedulecd
+
+admin-user:
+	superset fab create-admin
+
+# Docker Compose with auto-assigned ports (for running multiple instances)
+up:
+	./scripts/docker-compose-up.sh
+
+up-detached:
+	./scripts/docker-compose-up.sh -d
+
+down:
+	./scripts/docker-compose-up.sh down
+
+logs:
+	./scripts/docker-compose-up.sh logs -f
+
+ps:
+	./scripts/docker-compose-up.sh ps
+
+nuke:
+	./scripts/docker-compose-up.sh nuke
+
+ports:
+	./scripts/docker-compose-up.sh ports
+
+open:
+	./scripts/docker-compose-up.sh open

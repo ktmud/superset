@@ -1,0 +1,646 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+import math
+from typing import Any, Optional
+
+from flask_babel import lazy_gettext as _
+
+from superset.commands.exceptions import (
+    CommandException,
+    CommandInvalidError,
+    CreateFailedError,
+    ForbiddenError,
+    ValidationError,
+)
+from superset.exceptions import SupersetError, SupersetErrorsException
+from superset.reports.models import ReportScheduleType
+
+
+class DatabaseNotFoundValidationError(ValidationError):
+    """
+    Marshmallow validation error for database does not exist
+    """
+
+    def __init__(self) -> None:
+        super().__init__(_("Database does not exist"), field_name="database")
+
+
+class AlertQueryMultipleStatementsValidationError(ValidationError):
+    """
+    Marshmallow validation error for alert SQL containing multiple statements
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            _("Alert query must be a single statement"),
+            field_name="sql",
+        )
+
+
+class AlertQueryDMLNotAllowedValidationError(ValidationError):
+    """
+    Marshmallow validation error for alert SQL that mutates state on a
+    database that does not allow DML
+    """
+
+    def __init__(self) -> None:
+        super().__init__(_("Alert query must be read-only"), field_name="sql")
+
+
+class AlertQueryDataAccessValidationError(ValidationError):
+    """
+    Marshmallow validation error for alert SQL referencing tables the user
+    is not authorized to query
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, field_name="sql")
+
+
+class ReportScheduleDatabaseNotAllowedValidationError(ValidationError):
+    """
+    Marshmallow validation error for database reference on a Report type schedule
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            _("Database reference is not allowed on a report"),
+            field_name="database",
+        )
+
+
+class DashboardNotFoundValidationError(ValidationError):
+    """
+    Marshmallow validation error for dashboard does not exist
+    """
+
+    def __init__(self) -> None:
+        super().__init__(_("Dashboard does not exist"), field_name="dashboard")
+
+
+class ChartNotFoundValidationError(ValidationError):
+    """
+    Marshmallow validation error for chart does not exist
+    """
+
+    def __init__(self) -> None:
+        super().__init__(_("Chart does not exist"), field_name="chart")
+
+
+class ReportScheduleAlertRequiredDatabaseValidationError(ValidationError):
+    """
+    Marshmallow validation error for report schedule alert missing database field
+    """
+
+    def __init__(self) -> None:
+        super().__init__(_("Database is required for alerts"), field_name="database")
+
+
+class ReportScheduleRequiredTypeValidationError(ValidationError):
+    """
+    Marshmallow type validation error for report schedule missing type field
+    """
+
+    def __init__(self) -> None:
+        super().__init__(_("Type is required"), field_name="type")
+
+
+class ReportScheduleOnlyChartOrDashboardError(ValidationError):
+    """
+    Marshmallow validation error for report schedule accept exclusive chart or dashboard
+    """
+
+    def __init__(self) -> None:
+        super().__init__(_("Choose a chart or dashboard not both"), field_name="chart")
+
+
+class ReportScheduleEitherChartOrDashboardError(ValidationError):
+    """
+    Marshmallow validation error for report schedule missing both dashboard and chart id
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            _("Must choose either a chart or a dashboard"), field_name="chart"
+        )
+
+
+class ReportScheduleFrequencyNotAllowed(ValidationError):  # noqa: N818
+    """
+    Marshmallow validation error for report schedule configured to run more
+    frequently than allowed
+    """
+
+    def __init__(
+        self,
+        report_type: str = "Report",
+        minimum_interval: int = 120,
+    ) -> None:
+        interval_in_minutes = math.ceil(minimum_interval / 60)
+
+        super().__init__(
+            _(
+                "%(report_type)s schedule frequency exceeding limit."
+                " Please configure a schedule with a minimum interval of"
+                " %(minimum_interval)d minutes per execution.",
+                report_type=report_type,
+                minimum_interval=interval_in_minutes,
+            ),
+            field_name="crontab",
+        )
+
+
+class ReportScheduleCrontabNotValidError(ValidationError):  # noqa: N818
+    """
+    Marshmallow validation error for a crontab that is syntactically valid
+    but never matches a real calendar date (e.g. February 30th)
+    """
+
+    def __init__(self, cron_schedule: str = "") -> None:
+        super().__init__(
+            _(
+                "Invalid crontab schedule: %(cron_schedule)s never matches"
+                " a valid date",
+                cron_schedule=cron_schedule,
+            ),
+            field_name="crontab",
+        )
+
+
+class ChartNotSavedValidationError(ValidationError):
+    """
+    Marshmallow validation error for charts that haven't been saved yet
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            _("Please save your chart first, then try creating a new email report."),
+            field_name="chart",
+        )
+
+
+class DashboardNotSavedValidationError(ValidationError):
+    """
+    Marshmallow validation error for dashboards that haven't been saved yet
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            _(
+                "Please save your dashboard first, then try creating a new email report."  # noqa: E501
+            ),
+            field_name="dashboard",
+        )
+
+
+class ReportScheduleInvalidError(CommandInvalidError):
+    status = 422
+    message = _("Report Schedule parameters are invalid.")
+
+
+class ReportScheduleCreateFailedError(CreateFailedError):
+    message = _("Report Schedule could not be created.")
+
+
+class ReportScheduleUpdateFailedError(CreateFailedError):
+    message = _("Report Schedule could not be updated.")
+
+
+class ReportScheduleNotFoundError(CommandException):
+    status = 404
+    message = _("Report Schedule not found.")
+
+
+class ReportScheduleDeleteFailedError(CommandException):
+    message = _("Report Schedule delete failed.")
+
+
+class PruneReportScheduleLogFailedError(CommandException):
+    message = _("Report Schedule log prune failed.")
+
+
+class ReportScheduleScreenshotFailedError(CommandException):
+    message = _("Report Schedule execution failed when generating a screenshot.")
+
+
+class ReportSchedulePdfFailedError(CommandException):
+    message = _("Report Schedule execution failed when generating a pdf.")
+
+
+class ReportScheduleCsvFailedError(CommandException):
+    message = _("Report Schedule execution failed when generating a csv.")
+
+
+class ReportScheduleXlsxFailedError(CommandException):
+    """Raised when generating the Excel (xlsx) attachment for a report fails."""
+
+    message = _("Report Schedule execution failed when generating an Excel file.")
+
+
+class ReportScheduleDataFrameFailedError(CommandException):
+    message = _("Report Schedule execution failed when generating a dataframe.")
+
+
+class ReportScheduleExecutorNotFoundError(CommandException):
+    """Raised when the configured report executor user cannot be resolved."""
+
+    # 5xx (not 4xx): a missing executor user is a server-side misconfiguration,
+    # not a malformed client request. The status drives get_logger_from_status,
+    # which marks the Celery task FAILURE for 5xx — keeping the executor problem
+    # visible to ops task-state alerting. A 4xx would log a WARNING and leave the
+    # task non-FAILURE, hiding the misconfiguration from that signal.
+    status = 500
+
+    def __init__(self, username: str = "", exception: Optional[Exception] = None):
+        message = (
+            _(
+                "Report Schedule executor user %(username)s was not found.",
+                username=f'"{username}"',
+            )
+            if username
+            else _("Scheduled task executor not found")
+        )
+        super().__init__(
+            message,
+            exception,
+        )
+
+
+class ReportScheduleExecutorAccessDeniedError(CommandException):
+    """Raised when the identity a report runs as cannot access its target."""
+
+    # 5xx for the same reason as ReportScheduleExecutorNotFoundError: the
+    # schedule cannot deliver until its executor or target is reconfigured,
+    # which task-state alerting should surface as a failure.
+    status = 500
+
+    def __init__(self, kind: str, username: str, reason: str) -> None:
+        super().__init__(
+            _(
+                "The report runs as %(username)s, who cannot access its "
+                "%(kind)s: %(reason)s",
+                username=f'"{username}"',
+                kind=kind,
+                reason=reason,
+            )
+        )
+
+
+class ReportScheduleExecuteUnexpectedError(CommandException):
+    message = _("Report Schedule execution got an unexpected error.")
+
+
+class ReportScheduleTargetChartDeletedError(CommandException):
+    message = _(
+        "The chart this report targets was deleted. Restore the chart, or "
+        "update the report to point at an active chart."
+    )
+
+
+class ReportScheduleTargetDashboardDeletedError(CommandException):
+    message = _(
+        "The dashboard this report targets was deleted. Restore the "
+        "dashboard, or update the report to point at an active dashboard."
+    )
+
+
+class ReportSchedulePreviousWorkingError(CommandException):
+    status = 429
+    message = _("Report Schedule is still working, refusing to re-compute.")
+
+
+class ReportScheduleWorkingTimeoutError(CommandException):
+    status = 408
+    message = _("Report Schedule reached a working timeout.")
+
+
+class ReportScheduleNameUniquenessValidationError(ValidationError):
+    """
+    Marshmallow validation error for Report Schedule name and type already exists
+    """
+
+    def __init__(self, report_type: ReportScheduleType, name: str) -> None:
+        message = _('A report named "%(name)s" already exists', name=name)
+        if report_type == ReportScheduleType.ALERT:
+            message = _('An alert named "%(name)s" already exists', name=name)
+        super().__init__([message], field_name="name")
+
+
+class ReportScheduleCreationMethodUniquenessValidationError(CommandException):
+    status = 409
+    message = _("Resource already has an attached report.")
+
+
+class AlertQueryMultipleRowsError(CommandException):
+    status = 422
+    message = _("Alert query returned more than one row.")
+
+
+class AlertValidatorConfigError(CommandException):
+    status = 422
+    message = _("Alert validator config error.")
+
+
+class AlertQueryMultipleColumnsError(CommandException):
+    status = 422
+    message = _("Alert query returned more than one column.")
+
+
+class AlertQueryInvalidTypeError(CommandException):
+    status = 422
+    message = _("Alert query returned a non-number value.")
+
+
+class AlertQueryError(CommandException):
+    """
+    SQL query is not valid
+    """
+
+    status = 400
+    message = _("Alert found an error while executing a query.")
+
+
+class AlertQueryTimeout(CommandException):
+    status = 408
+    message = _("A timeout occurred while executing the query.")
+
+
+class ReportScheduleScreenshotTimeout(CommandException):
+    status = 408
+    message = _("A timeout occurred while taking a screenshot.")
+
+
+class ReportScheduleCsvTimeout(CommandException):
+    status = 408
+    message = _("A timeout occurred while generating a csv.")
+
+
+class ReportScheduleXlsxTimeout(CommandException):
+    """Raised when generating the Excel (xlsx) attachment for a report times out."""
+
+    status: int = 408
+    message = _("A timeout occurred while generating an Excel file.")
+
+
+class ReportScheduleDataFrameTimeout(CommandException):
+    status = 408
+    message = _("A timeout occurred while generating a dataframe.")
+
+
+class ReportScheduleAlertGracePeriodError(CommandException):
+    status = 429
+    message = _("Alert fired during grace period.")
+
+
+class ReportScheduleAlertEndGracePeriodError(CommandException):
+    status = 429
+    message = _("Alert ended grace period.")
+
+
+class ReportScheduleNotificationError(CommandException):
+    status = 429
+    message = _("Alert on grace period")
+
+
+class ReportScheduleStateNotFoundError(CommandException):
+    message = _("Report Schedule state not found")
+
+
+class ReportScheduleSystemErrorsException(CommandException, SupersetErrorsException):
+    errors: list[SupersetError] = []
+    message = _("Report schedule system error")
+
+
+class ReportScheduleClientErrorsException(CommandException, SupersetErrorsException):
+    status = 400
+    errors: list[SupersetError] = []
+    message = _("Report schedule client error")
+
+
+class ReportScheduleUnexpectedError(CommandException):
+    message = _("Report schedule unexpected error")
+
+
+class ReportScheduleForbiddenError(ForbiddenError):
+    status = 403
+    message = _("Changing this report is forbidden")
+
+
+class ReportSchedulePruneLogError(CommandException):
+    message = _("An error occurred while pruning logs ")
+
+
+class ReportScheduleUserEmailNotFoundError(ValidationError):
+    """
+    Validation error when user email is required but not found
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            _(
+                "Unable to create report: User email address is required but not "
+                "found. Please ensure your user profile has a valid email address."
+            ),
+            field_name="recipients",
+        )
+
+
+class ReportScheduleRunAsNotFoundError(ValidationError):
+    """
+    Validation error when a Run As user does not exist or is inactive
+    """
+
+    def __init__(self, field_name: str = "run_as") -> None:
+        super().__init__(
+            _("User does not exist or is inactive"),
+            field_name=field_name,
+        )
+
+
+class ReportScheduleRunAsForbiddenError(ValidationError):
+    """
+    Validation error when a non-admin attempts to set a Run As field to a user
+    other than themselves
+    """
+
+    def __init__(self, field_name: str = "run_as") -> None:
+        super().__init__(
+            _("Only admins can set this field to a user other than themselves"),
+            field_name=field_name,
+        )
+
+
+class ReportScheduleRunAsContentForbiddenError(ValidationError):
+    """
+    Validation error when a non-admin attempts to change the content of a
+    schedule that executes as another user
+    """
+
+    def __init__(self, field_name: str = "run_as") -> None:
+        super().__init__(
+            _(
+                "This %(schedule)s executes as another user. Only admins can "
+                "change its content; set the Run As field to your own account "
+                "to make this change.",
+                schedule="alert/report",
+            ),
+            field_name=field_name,
+        )
+
+
+class ReportScheduleRunAsConditionForbiddenError(ValidationError):
+    """A non-admin cannot change a condition executed with another identity."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            _(
+                "This alert query is not set to execute as your account. Only admins "
+                'can change its condition; set "Run alert query as" to your own account'
+                " first."
+            ),
+            field_name="run_alert_query_as",
+        )
+
+
+class ReportScheduleRunAlertQueryAsNotAllowedError(ValidationError):
+    """
+    Validation error when ``run_alert_query_as`` is set on a Report schedule
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            _("The alert query executor is only allowed on alerts"),
+            field_name="run_alert_query_as",
+        )
+
+
+class ReportScheduleFormatRequiredError(ValidationError):
+    """
+    Validation error when a Report schedule is configured without an attachment
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            _("Reports require a content format"),
+            field_name="report_format",
+        )
+
+
+class ReportScheduleRecipientNotAllowedError(ValidationError):
+    """
+    Validation error when an e-mail recipient violates the global recipient
+    policy (allowed domains and/or existing users only)
+    """
+
+    def __init__(self, addresses: list[str]) -> None:
+        super().__init__(
+            _(
+                "The following recipients are not allowed by the Alerts & Reports "
+                "configuration: %(addresses)s",
+                addresses=", ".join(addresses),
+            ),
+            field_name="recipients",
+        )
+
+
+class ReportScheduleRecipientsNotAllowedError(CommandException):
+    """
+    Raised at execution time when the recipients no longer comply with the
+    global recipient policy. The notification is not delivered.
+    """
+
+    status = 422
+
+    def __init__(self, addresses: list[str]) -> None:
+        super().__init__(
+            _(
+                "Report Schedule not delivered: the following recipients are not "
+                "allowed by the Alerts & Reports configuration: %(addresses)s",
+                addresses=", ".join(addresses),
+            )
+        )
+
+
+class ReportConfigInvalidError(CommandInvalidError):
+    status = 422
+    message = _("Alerts & Reports configuration parameters are invalid.")
+
+
+class ReportConfigConflictError(CommandException):
+    """
+    Raised when a proposed Alerts & Reports configuration conflicts with
+    existing schedules. ``impacted_schedules`` lists what has to be fixed first.
+    """
+
+    status = 422
+    message = _(
+        "Some existing alerts/reports conflict with the new configuration. "
+        "Please update them first."
+    )
+
+    def __init__(self, impacted_schedules: list[dict[str, Any]]) -> None:
+        super().__init__()
+        self.impacted_schedules = impacted_schedules
+
+
+class ReportConfigUpdateFailedError(CommandException):
+    message = _("Alerts & Reports configuration could not be updated.")
+
+
+class ReportScheduleExecuteNowFailedError(CommandException):
+    """Command exception raised when a report schedule fails to execute immediately."""
+
+    message = _("Report Schedule execute now failed.")
+
+
+class ReportScheduleCeleryNotConfiguredError(CommandException):
+    """Command exception raised when a report schedule is executed but
+    Celery is not configured.
+    """
+
+    status = 503
+    message = _(
+        "Report Schedule execution requires a Celery backend to be configured. "
+        "Please configure a Celery broker (Redis or RabbitMQ) and worker processes."
+    )
+
+
+class ReportScheduleExecutorTargetAccessError(ValidationError):
+    """
+    Validation error when the identity a schedule runs as cannot access the
+    chart or dashboard it delivers
+    """
+
+    def __init__(self, kind: str, username: str | None = None) -> None:
+        message = (
+            _(
+                "This report runs as %(username)s, who cannot access this "
+                "%(kind)s. Choose a %(kind)s that user can access, or a "
+                "different user to run the report as.",
+                username=f'"{username}"',
+                kind=kind,
+            )
+            if username
+            else _(
+                "The user this report runs as cannot access this %(kind)s. "
+                "Choose a %(kind)s that user can access, or ask an admin to "
+                "change who the report runs as.",
+                kind=kind,
+            )
+        )
+        super().__init__(message, field_name=kind)

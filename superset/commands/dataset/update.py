@@ -1,0 +1,773 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import logging
+from collections import Counter
+from functools import partial
+from typing import Any, cast, Optional
+from uuid import UUID
+
+from flask_appbuilder.models.sqla import Model
+from marshmallow import ValidationError
+from sqlalchemy.exc import SQLAlchemyError
+
+from superset import is_feature_enabled, security_manager
+from superset.commands.base import BaseCommand, UpdateMixin
+from superset.commands.dataset.exceptions import (
+    DatabaseNotFoundValidationError,
+    DatasetColumnNotFoundValidationError,
+    DatasetColumnsDuplicateValidationError,
+    DatasetColumnsExistsValidationError,
+    DatasetDataAccessIsNotAllowed,
+    DatasetExistsValidationError,
+    DatasetForbiddenError,
+    DatasetInvalidError,
+    DatasetMetricsDuplicateValidationError,
+    DatasetMetricsExistsValidationError,
+    DatasetMetricsNotFoundValidationError,
+    DatasetNotFoundError,
+    DatasetSoftDeletedTwinExistsError,
+    DatasetSqlRenderValidationError,
+    DatasetUpdateFailedError,
+    MultiCatalogDisabledValidationError,
+    TEMPLATE_RENDER_ERRORS,
+    TemplateParamsInvalidValidationError,
+)
+from superset.commands.utils import compute_subjects, raise_if_managed_externally
+from superset.connectors.sqla.models import SqlaTable, validate_stored_expression
+from superset.connectors.sqla.partition_mapping import (
+    is_unfinished,
+    stored_expression_error,
+    validate_partition_mapping,
+)
+from superset.daos.dataset import DatasetDAO
+from superset.datasets.schemas import FolderSchema
+from superset.exceptions import (
+    QueryClauseValidationException,
+    SupersetParseError,
+    SupersetSecurityException,
+)
+from superset.models.core import Database
+from superset.models.helpers import (
+    parse_template_params,
+    template_params_equivalent,
+    template_params_for_access_check,
+)
+from superset.sql.parse import Table
+from superset.utils.decorators import on_error, transaction
+
+logger = logging.getLogger(__name__)
+
+# Default folder UUIDs matching the frontend constants.
+# Stored as strings so comparisons work whether obj["uuid"] is str or UUID.
+DEFAULT_METRICS_FOLDER_UUID = "255b537d-58c8-443d-9fc1-4e4dc75047e2"
+DEFAULT_COLUMNS_FOLDER_UUID = "83a7ae8f-2e8a-4f2b-a8cb-ebaebef95b9b"
+DEFAULT_FOLDER_UUIDS = frozenset(
+    {DEFAULT_METRICS_FOLDER_UUID, DEFAULT_COLUMNS_FOLDER_UUID}
+)
+
+
+def _template_params_differ(requested: str | None, stored: str | None) -> bool:
+    """
+    Could replacing ``stored`` params with ``requested`` change what a
+    templated SQL renders?
+
+    An identical value is never a change -- including a legacy value that is
+    not a JSON object (the editor echoes the stored params back on every save,
+    so a metadata-only edit must not be treated as a repoint just because the
+    stored params predate object validation). Otherwise, compared the way
+    execution reads them, so re-serialized JSON with the same values is no
+    change while values of different JSON types (e.g. ``1`` vs ``true``, which
+    Jinja distinguishes) are a change.
+    """
+    if requested == stored:
+        return False
+    return not template_params_equivalent(requested, stored)
+
+
+class UpdateDatasetCommand(UpdateMixin, BaseCommand):
+    def __init__(
+        self,
+        model_id: int,
+        data: dict[str, Any],
+        override_columns: Optional[bool] = False,
+        *,
+        preserve_existing_metrics: bool = False,
+        preserve_existing_columns: bool = False,
+        delete_metric_ids: set[int] | None = None,
+    ):
+        self._model_id = model_id
+        self._properties = data.copy()
+        self._model: Optional[SqlaTable] = None
+        self.override_columns = override_columns
+        self._delete_metric_ids = delete_metric_ids
+        self._preserve_existing_metrics = preserve_existing_metrics
+        self._preserve_existing_columns = preserve_existing_columns
+        self._properties["override_columns"] = override_columns
+
+    @transaction(
+        on_error=partial(
+            on_error,
+            catches=(
+                SQLAlchemyError,
+                ValueError,
+            ),
+            reraise=DatasetUpdateFailedError,
+        )
+    )
+    def run(self) -> Model:
+        self.validate()
+        assert self._model
+        return DatasetDAO.update(
+            self._model,
+            attributes=self._properties,
+            preserve_existing_metrics=self._preserve_existing_metrics,
+            delete_metric_ids=self._delete_metric_ids,
+        )
+
+    def validate(self) -> None:
+        exceptions: list[ValidationError] = []
+
+        # Validate/populate model exists
+        self._model = DatasetDAO.find_by_id(self._model_id)
+        if not self._model:
+            raise DatasetNotFoundError()
+
+        # Check permission to update the dataset
+        try:
+            security_manager.raise_for_editorship(self._model)
+        except SupersetSecurityException as ex:
+            raise DatasetForbiddenError() from ex
+
+        raise_if_managed_externally(self._model, DatasetForbiddenError)
+
+        if self._preserve_existing_columns and "columns" in self._properties:
+            self._properties["columns"] = self._with_existing_columns(
+                self._properties["columns"]
+            )
+
+        # Validate/Populate editors
+        compute_subjects(self._model, self._properties, exceptions)
+
+        self._validate_dataset_source(exceptions)
+        self._validate_semantics(exceptions)
+        if (
+            self._delete_metric_ids is not None
+            and not DatasetDAO.validate_metrics_exist(
+                self._model_id, list(self._delete_metric_ids)
+            )
+        ):
+            exceptions.append(DatasetMetricsNotFoundValidationError())
+
+        if exceptions:
+            raise DatasetInvalidError(exceptions=exceptions)
+
+    def _with_existing_columns(
+        self, columns: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """
+        Complete an additive ``columns`` payload with the stored columns it omits.
+
+        A ``columns`` payload replaces the dataset's column list, so a caller
+        that only means to add or edit one column would otherwise have to echo
+        every other column back, and a column another writer added or renamed
+        after the caller read the dataset would be dropped or reverted. Filling
+        the gaps from the model loaded by this command keeps those changes, and
+        hands every downstream check (duplicates, partition mapping, folders)
+        the complete list it expects.
+
+        Payload entries that carry an ``id`` but no ``column_name`` take the
+        stored name, since validation keys on it.
+        """
+        model = cast(SqlaTable, self._model)
+        names_by_id = {column.id: column.column_name for column in model.columns}
+        completed: list[dict[str, Any]] = []
+        for column in columns:
+            if "id" in column and "column_name" not in column:
+                column = {**column, "column_name": names_by_id.get(column["id"])}
+            completed.append(column)
+        payload_ids = {column["id"] for column in columns if "id" in column}
+        for existing in model.columns:
+            if existing.id in payload_ids:
+                continue
+            stub: dict[str, Any] = {
+                "id": existing.id,
+                "column_name": existing.column_name,
+            }
+            # The partition mapping check reads the mapped column's transform
+            # from the payload, so carry the stored one rather than hide it.
+            if existing.partition_value_transform is not None:
+                stub["partition_value_transform"] = existing.partition_value_transform
+            completed.append(stub)
+        return completed
+
+    def _validate_dataset_source(self, exceptions: list[ValidationError]) -> None:
+        # we know we have a valid model
+        self._model = cast(SqlaTable, self._model)
+        database_id = self._properties.pop("database_id", None)
+        new_db_connection = self._get_new_database_connection(database_id, exceptions)
+        db = new_db_connection or self._model.database
+        database_changed = new_db_connection is not None
+
+        # Detect a caller-supplied change to the source binding, inspected
+        # before the catalog normalization below injects derived values. The
+        # connection, catalog and schema decide where a virtual dataset's SQL
+        # resolves its tables; ``table_name`` only names the table a physical
+        # dataset reads (for a virtual one it is a label). An empty catalog or
+        # schema means "none", as in ``/datasource/save/``: the editor can send
+        # ``None`` back for a stored ``""``, which is not a move.
+        location_changed = database_changed or any(
+            field in self._properties
+            and (self._properties[field] or None)
+            != (getattr(self._model, field) or None)
+            for field in ("catalog", "schema")
+        )
+        source_changed = location_changed or (
+            "table_name" in self._properties
+            and self._properties["table_name"] != self._model.table_name
+        )
+
+        catalog, schema, table = self._resolve_catalog_schema_table(db, exceptions)
+
+        # Repointing to a different database connection requires access to
+        # that connection, independent of the caller's editorship of this
+        # dataset -- only persist the change once that's confirmed.
+        if new_db_connection:
+            self._apply_database_repoint(new_db_connection, table, exceptions)
+
+        # Validate uniqueness
+        if not DatasetDAO.validate_update_uniqueness(
+            db,
+            table,
+            self._model_id,
+        ):
+            # Same hidden-twin guidance as the create path: when the blocking
+            # row is a SOFT-DELETED dataset, raise the targeted 422 naming
+            # the twin's uuid and the restore pointer instead of the opaque
+            # "already exists" (the twin is invisible in the caller's list).
+            soft_twin: SqlaTable | None
+            if soft_twin := DatasetDAO.find_soft_deleted_logical_duplicate(db, table):
+                raise DatasetSoftDeletedTwinExistsError(str(soft_twin.uuid))
+            exceptions.append(DatasetExistsValidationError(table))
+
+        # Repointing a physical dataset (or converting a virtual dataset to a
+        # physical one) runs the same data-access check as the create path.
+        # Skip it when the database connection itself changed: that case is
+        # already covered by the repoint check above, against the same
+        # (db, table) pair.
+        sql = self._properties.get("sql", self._model.sql)
+        if (
+            not new_db_connection
+            and not sql
+            and (source_changed or ("sql" in self._properties and self._model.sql))
+        ):
+            self._validate_table_access(db, table, exceptions)
+
+        self._validate_sql_access(db, catalog, schema, location_changed, exceptions)
+
+    def _get_new_database_connection(
+        self, database_id: int | None, exceptions: list[ValidationError]
+    ) -> Database | None:
+        # we know we have a valid model
+        self._model = cast(SqlaTable, self._model)
+        if database_id and database_id != self._model.database.id:
+            if new_db_connection := DatasetDAO.get_database_by_id(database_id):
+                return new_db_connection
+            exceptions.append(DatabaseNotFoundValidationError())
+        return None
+
+    def _resolve_catalog_schema_table(
+        self, db: Database, exceptions: list[ValidationError]
+    ) -> tuple[str | None, str | None, Table]:
+        # we know we have a valid model
+        self._model = cast(SqlaTable, self._model)
+        catalog = self._properties.get("catalog")
+        default_catalog = db.get_default_catalog()
+
+        # If multi-catalog is disabled, and catalog provided is not
+        # the default one, fail
+        if (
+            "catalog" in self._properties
+            and catalog != default_catalog
+            and not db.allow_multi_catalog
+        ):
+            exceptions.append(MultiCatalogDisabledValidationError())
+
+        # If the DB connection does not support multi-catalog,
+        # use the default catalog
+        elif not db.allow_multi_catalog:
+            catalog = self._properties["catalog"] = default_catalog
+
+        # Fallback to using the previous value if not provided
+        elif "catalog" not in self._properties:
+            catalog = self._model.catalog
+
+        schema = (
+            self._properties["schema"]
+            if "schema" in self._properties
+            else self._model.schema
+        )
+
+        table = Table(
+            self._properties.get("table_name", self._model.table_name),
+            schema,
+            catalog,
+        )
+        return catalog, schema, table
+
+    def _apply_database_repoint(
+        self,
+        new_db_connection: Database,
+        table: Table,
+        exceptions: list[ValidationError],
+    ) -> None:
+        try:
+            security_manager.raise_for_access(
+                database=new_db_connection, table=table, allow_editorship=False
+            )
+        except SupersetSecurityException as ex:
+            exceptions.append(DatasetDataAccessIsNotAllowed(ex.error.message))
+        else:
+            self._properties["database"] = new_db_connection
+
+    def _validate_table_access(
+        self, db: Database, table: Table, exceptions: list[ValidationError]
+    ) -> None:
+        try:
+            security_manager.raise_for_access(
+                database=db, table=table, allow_editorship=False
+            )
+        except SupersetSecurityException as ex:
+            exceptions.append(DatasetDataAccessIsNotAllowed(ex.error.message))
+
+    def _validate_sql_access(  # pylint: disable=too-many-arguments
+        self,
+        db: Database,
+        catalog: str | None,
+        schema: str | None,
+        location_changed: bool,
+        exceptions: list[ValidationError],
+    ) -> None:
+        """Validate access to the tables a virtual dataset's SQL will read.
+
+        A virtual dataset's executed tables depend on its SQL text, its
+        template params, and the connection, catalog and schema that
+        unqualified names resolve against, so a change to any of them
+        re-authorizes the SQL -- a params-only edit can repoint a templated
+        ``FROM`` and a schema-only edit can repoint ``SELECT * FROM t``. The
+        check uses the effective (post-update) values so it matches execution.
+        """
+        # we know we have a valid model
+        self._model = cast(SqlaTable, self._model)
+
+        effective_sql = self._properties.get("sql", self._model.sql)
+        if not effective_sql:
+            return  # physical dataset; the table binding is gated elsewhere
+
+        sql_changed = "sql" in self._properties and (
+            self._properties["sql"] != self._model.sql
+        )
+        params_changed = "template_params" in self._properties and (
+            _template_params_differ(
+                self._properties["template_params"], self._model.template_params
+            )
+        )
+        if not (sql_changed or params_changed or location_changed):
+            return
+
+        try:
+            template_params = parse_template_params(
+                self._properties.get("template_params", self._model.template_params)
+            )
+        except ValueError:
+            # Fail closed: params execution would read differently can't be
+            # authorized.
+            exceptions.append(TemplateParamsInvalidValidationError())
+            return
+        try:
+            security_manager.raise_for_access(
+                database=db,
+                sql=effective_sql,
+                catalog=catalog,
+                schema=schema,
+                template_params=template_params_for_access_check(template_params),
+                allow_editorship=False,
+            )
+        except SupersetSecurityException as ex:
+            exceptions.append(DatasetDataAccessIsNotAllowed(ex.error.message))
+        except SupersetParseError as ex:
+            exceptions.append(
+                ValidationError(
+                    f"Invalid SQL: {ex.error.message}",
+                    field_name="sql",
+                )
+            )
+        except TEMPLATE_RENDER_ERRORS as ex:
+            exceptions.append(DatasetSqlRenderValidationError(ex))
+
+    def _validate_semantics(self, exceptions: list[ValidationError]) -> None:
+        # we know we have a valid model
+        self._model = cast(SqlaTable, self._model)
+        if columns := self._properties.get("columns"):
+            self._validate_columns(columns, exceptions)
+            self._validate_expressions(columns, "columns", exceptions)
+
+        if metrics := self._properties.get("metrics"):
+            self._validate_metrics(metrics, exceptions)
+            self._validate_expressions(metrics, "metrics", exceptions)
+
+        if predicate := self._properties.get("fetch_values_predicate"):
+            self._validate_fetch_values_predicate(predicate, exceptions)
+
+        self._validate_partition_mapping(exceptions)
+
+        if folders := self._properties.get("folders"):
+            valid_uuids: set[UUID] = set()
+            if metrics:
+                valid_uuids.update(
+                    metric["uuid"] for metric in metrics if "uuid" in metric
+                )
+            else:
+                valid_uuids.update(metric.uuid for metric in self._model.metrics)
+
+            if columns:
+                valid_uuids.update(
+                    column["uuid"] for column in columns if "uuid" in column
+                )
+            else:
+                valid_uuids.update(column.uuid for column in self._model.columns)
+
+            schema = FolderSchema(many=True)
+            try:
+                loaded_folders = schema.load(folders)
+                validate_folders(loaded_folders, valid_uuids)
+                self._properties["folders"] = schema.dump(loaded_folders)
+            except ValidationError as ex:
+                exceptions.append(ex)
+
+    def _validate_columns(
+        self, columns: list[dict[str, Any]], exceptions: list[ValidationError]
+    ) -> None:
+        # Validate duplicates on data
+        if self._get_duplicates(columns, "column_name"):
+            exceptions.append(DatasetColumnsDuplicateValidationError())
+        else:
+            # validate invalid id's
+            columns_ids: list[int] = [
+                column["id"] for column in columns if "id" in column
+            ]
+            if not DatasetDAO.validate_columns_exist(self._model_id, columns_ids):
+                exceptions.append(DatasetColumnNotFoundValidationError())
+
+            # validate new column names uniqueness
+            if not self.override_columns:
+                columns_names: list[str] = [
+                    column["column_name"] for column in columns if "id" not in column
+                ]
+                if not DatasetDAO.validate_columns_uniqueness(
+                    self._model_id, columns_names
+                ):
+                    exceptions.append(DatasetColumnsExistsValidationError())
+
+    def _validate_metrics(
+        self, metrics: list[dict[str, Any]], exceptions: list[ValidationError]
+    ) -> None:
+        if self._get_duplicates(metrics, "metric_name"):
+            exceptions.append(DatasetMetricsDuplicateValidationError())
+        else:
+            # validate invalid id's
+            metrics_ids: list[int] = [
+                metric["id"] for metric in metrics if "id" in metric
+            ]
+            if not DatasetDAO.validate_metrics_exist(self._model_id, metrics_ids):
+                exceptions.append(DatasetMetricsNotFoundValidationError())
+            # validate new metric names uniqueness
+            metric_names: list[str] = [
+                metric["metric_name"] for metric in metrics if "id" not in metric
+            ]
+            if not DatasetDAO.validate_metrics_uniqueness(self._model_id, metric_names):
+                exceptions.append(DatasetMetricsExistsValidationError())
+
+    def _validate_expressions(
+        self,
+        items: list[dict[str, Any]],
+        label: str,
+        exceptions: list[ValidationError],
+    ) -> None:
+        """
+        Run each item's SQL expression through the parser-based validator that
+        already governs adhoc expressions, so stored column and metric
+        expressions cannot smuggle sub-queries, set operations, or
+        multi-statement SQL into chart queries.
+        """
+        self._model = cast(SqlaTable, self._model)
+        # `_validate_dataset_source` runs first and rebinds
+        # `self._properties["database"]` from the request's `database_id`
+        # to the resolved `Database` model when the user is repointing the
+        # dataset; otherwise the key is absent and we fall back to the
+        # currently-bound database on the model.
+        database = self._properties.get("database") or self._model.database
+        catalog = self._properties.get("catalog", self._model.catalog)
+        schema = self._properties.get("schema", self._model.schema)
+
+        for idx, item in enumerate(items):
+            expression = item.get("expression")
+            if not expression:
+                continue
+            try:
+                validate_stored_expression(database, catalog, schema, expression)
+            except (SupersetSecurityException, QueryClauseValidationException) as ex:
+                message = (
+                    ex.error.message
+                    if isinstance(ex, SupersetSecurityException)
+                    else ex.message
+                )
+                exceptions.append(
+                    ValidationError(
+                        [message],
+                        field_name=f"{label}.{idx}.expression",
+                    )
+                )
+
+    def _validate_partition_mapping(self, exceptions: list[ValidationError]) -> None:
+        """
+        Validate the dataset's partition filter mapping.
+
+        Only the blocking (Tier 1) issues become validation errors. Tier 2
+        issues -- an unparseable transform, a transform missing `:value` --
+        deliberately let the save through and leave the mapping inactive, per
+        the PRD, so a half-written transform doesn't cost the owner the rest of
+        their edits. They are surfaced by the editor, not by rejecting the PUT.
+
+        The transform is authored by a dataset owner, the same principal and
+        trust level as a calculated-column expression, so it also goes through
+        `validate_stored_expression` -- the parser gate that already governs
+        stored expressions. That gate only applies to a transform that parses:
+        it rejects an unparseable expression outright, which would turn a Tier-2
+        issue into a blocking one and undo the paragraph above. Skipping it
+        there costs nothing -- an unparseable transform is never emitted into a
+        query -- and it is not a hole for templating, because Jinja in a
+        transform is already a Tier-1 blocking issue of its own.
+
+        Every path that *reads* a mapping is gated on the feature flag, so this
+        one is too: with the flag off nothing mirrors, and rejecting a save over
+        a mapping that can never be consumed would be a validation error the
+        owner has no way to act on.
+        """
+        if not is_feature_enabled("PARTITION_FILTER_MAPPING"):
+            return
+
+        self._model = cast(SqlaTable, self._model)
+
+        columns = self._properties.get("columns")
+        column_names = (
+            {column["column_name"] for column in columns}
+            if columns is not None
+            else {column.column_name for column in self._model.columns}
+        )
+
+        partition_column = self._properties.get(
+            "partition_column", self._model.partition_column
+        )
+        partition_mapped_column = self._properties.get(
+            "partition_mapped_column", self._model.partition_mapped_column
+        )
+        main_dttm_col = self._properties.get("main_dttm_col", self._model.main_dttm_col)
+        if not partition_column:
+            return
+
+        # A column payload drops every column it omits, and `update_columns`
+        # then runs `DatasetDAO.clear_dangling_partition_mapping` to drop a
+        # mapping whose columns went with them -- but that happens later, during
+        # `run()`. Validate the state that cleanup leaves behind, or a metadata
+        # sync that legitimately removes the mapped column is rejected before
+        # the cleanup meant to handle it ever runs, which is exactly the
+        # orphaned case the cleanup exists for.
+        #
+        # Only a *stored* reference is forgiven. Asking in this very request to
+        # map onto a column the same request does not define is a mistake worth
+        # reporting, not something to quietly clean up.
+        if columns is not None:
+            if (
+                "partition_column" not in self._properties
+                and partition_column not in column_names
+            ):
+                return
+            if (
+                "partition_mapped_column" not in self._properties
+                and partition_mapped_column
+                and partition_mapped_column not in column_names
+            ):
+                partition_mapped_column = None
+
+        database = self._properties.get("database") or self._model.database
+        catalog = self._properties.get("catalog", self._model.catalog)
+        schema = self._properties.get("schema", self._model.schema)
+
+        effective_mapped_column = partition_mapped_column or main_dttm_col
+        transform = self._effective_transform(columns, effective_mapped_column)
+
+        for issue in validate_partition_mapping(
+            column_names=column_names,
+            partition_column=partition_column,
+            partition_mapped_column=partition_mapped_column,
+            main_dttm_col=main_dttm_col,
+            transform=transform,
+            engine=database.backend,
+        ):
+            if issue.blocking:
+                exceptions.append(
+                    ValidationError(str(issue.message), field_name=issue.field)
+                )
+
+        # Everything except a transform that is not SQL yet. A half-typed
+        # transform is a Tier-2 issue above -- the mapping saves and stays
+        # inactive -- and this gate fails closed on anything that does not
+        # parse, so asking it would refuse the save mid-keystroke. Narrower
+        # than "parses as a single expression": a set-operation or a
+        # multi-statement transform fails that too, and has to reach this gate.
+        if transform and not is_unfinished(transform, database.backend):
+            # `stored_expression_error` rather than `validate_stored_expression`
+            # alone, which it already includes: it is the gate preview, import
+            # and the legacy save path all use, and running a narrower one here
+            # left a normal PUT the only door into this field that skipped the
+            # function denylist. A transform stored through that door is spliced
+            # into the probe as SQL and run by the engine, so it has to clear
+            # the same bar everywhere.
+            if reason := stored_expression_error(database, catalog, schema, transform):
+                exceptions.append(
+                    ValidationError(reason, field_name="partition_value_transform")
+                )
+
+    def _effective_transform(
+        self,
+        columns: list[dict[str, Any]] | None,
+        mapped_column: str | None,
+    ) -> str | None:
+        """
+        The value transform on the effective mapped column.
+
+        Reads from the payload when the request carries columns, and from the
+        persisted model otherwise -- a PUT that changes only `partition_column`
+        still has to be validated against the transform already stored.
+        """
+        if not mapped_column:
+            return None
+        if columns is not None:
+            for column in columns:
+                if column.get("column_name") == mapped_column:
+                    return column.get("partition_value_transform")
+            return None
+        model = cast(SqlaTable, self._model)
+        for existing in model.columns:
+            if existing.column_name == mapped_column:
+                return existing.partition_value_transform
+        return None
+
+    def _validate_fetch_values_predicate(
+        self,
+        predicate: str,
+        exceptions: list[ValidationError],
+    ) -> None:
+        """
+        Validate ``fetch_values_predicate`` with the same parser-based
+        validator used for stored column and metric expressions.
+        """
+        self._model = cast(SqlaTable, self._model)
+        database = self._properties.get("database") or self._model.database
+        catalog = self._properties.get("catalog", self._model.catalog)
+        schema = self._properties.get("schema", self._model.schema)
+        try:
+            validate_stored_expression(database, catalog, schema, predicate)
+        except (SupersetSecurityException, QueryClauseValidationException) as ex:
+            message = (
+                ex.error.message
+                if isinstance(ex, SupersetSecurityException)
+                else ex.message
+            )
+            exceptions.append(
+                ValidationError(
+                    [message],
+                    field_name="fetch_values_predicate",
+                )
+            )
+
+    @staticmethod
+    def _get_duplicates(data: list[dict[str, Any]], key: str) -> list[str]:
+        duplicates = [
+            name
+            for name, count in Counter([item[key] for item in data]).items()
+            if count > 1
+        ]
+        return duplicates
+
+
+def validate_folders(  # noqa: C901
+    folders: list[FolderSchema],
+    valid_uuids: set[UUID],
+) -> None:
+    """
+    Additional folder validation.
+
+    The marshmallow schema will validate the folder structure, but we still need to
+    check that UUIDs are valid, names are unique and not reserved, and that there are
+    no cycles.
+    """
+    if not is_feature_enabled("DATASET_FOLDERS"):
+        raise ValidationError("Dataset folders are not enabled")
+
+    queue: list[tuple[FolderSchema, list[UUID]]] = [(folder, []) for folder in folders]
+    seen_uuids = set()
+    seen_fqns = set()  # fully qualified folder names
+    while queue:
+        obj, path = queue.pop(0)
+        uuid, name = obj["uuid"], obj.get("name")
+
+        if uuid in path:
+            raise ValidationError(f"Cycle detected: {uuid} appears in its ancestry")
+
+        if uuid in seen_uuids:
+            raise ValidationError(f"Duplicate UUID in folder structure: {uuid}")
+        seen_uuids.add(uuid)
+
+        # folders can have duplicate name as long as they're not siblings
+        if name:
+            fqn = tuple(path + [name])
+            if name and fqn in seen_fqns:
+                raise ValidationError(f"Duplicate folder name: {name}")
+            seen_fqns.add(fqn)
+
+            # Allow default folders (by UUID) to use reserved names
+            if (
+                name.lower() in {"metrics", "columns"}
+                and str(uuid) not in DEFAULT_FOLDER_UUIDS
+            ):
+                raise ValidationError(f"Folder cannot have name '{name}'")
+
+        # check if metric/column UUID exists (skip default folders)
+        elif (
+            not name
+            and uuid not in valid_uuids
+            and str(uuid) not in DEFAULT_FOLDER_UUIDS
+        ):
+            raise ValidationError(f"Invalid UUID: {uuid}")
+
+        # traverse children
+        if children := obj.get("children"):
+            path.append(uuid)
+            queue.extend((folder, path) for folder in children)

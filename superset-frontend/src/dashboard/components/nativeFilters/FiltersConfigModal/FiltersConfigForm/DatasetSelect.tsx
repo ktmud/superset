@@ -16,80 +16,167 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React, { useCallback, useMemo } from 'react';
-import rison from 'rison';
-import { t, SupersetClient } from '@superset-ui/core';
-import { Select } from 'src/components';
-import { cacheWrapper } from 'src/utils/cacheWrapper';
+import { useCallback, useMemo, ReactNode } from 'react';
+import { t } from '@apache-superset/core/translation';
 import {
-  ClientErrorObject,
+  isFeatureEnabled,
+  FeatureFlag,
   getClientErrorObject,
-} from 'src/utils/getClientErrorObject';
-import { datasetToSelectOption } from './utils';
-
-const localCache = new Map<string, any>();
-
-const cachedSupersetGet = cacheWrapper(
-  SupersetClient.get,
-  localCache,
-  ({ endpoint }) => endpoint || '',
-);
+  selectClientErrorMessage,
+} from '@superset-ui/core';
+import { AsyncSelect } from '@superset-ui/core/components';
+import { cachedSupersetGet } from 'src/utils/cachedSupersetGet';
+import {
+  Dataset,
+  DatasetSelectLabel,
+} from 'src/features/datasets/DatasetSelectLabel';
+import { fetchDatasourceList } from 'src/features/datasets/fetchDatasourceList';
+import {
+  datasetLabel,
+  datasetLabelLower,
+  datasetsLabelLower,
+} from 'src/features/semanticLayers/label';
 
 interface DatasetSelectProps {
-  onChange: (value: { label: string; value: number }) => void;
-  value?: { label: string; value: number };
+  onChange: (value: {
+    label: string | ReactNode;
+    value: number;
+    kind?: string;
+  }) => void;
+  value?: { label: string | ReactNode; value: number; kind?: string };
+  excludeDatasetIds?: number[];
 }
 
-const DatasetSelect = ({ onChange, value }: DatasetSelectProps) => {
-  const getErrorMessage = useCallback(
-    ({ error, message }: ClientErrorObject) => {
-      let errorText = message || error || t('An error has occurred');
-      if (message === 'Forbidden') {
-        errorText = t('You do not have permission to edit this dashboard');
-      }
-      return errorText;
-    },
-    [],
+/**
+ * Builds a unique select-option value for the combined datasource endpoint.
+ * Datasets and semantic views have independent integer ID sequences, so we
+ * prefix with a type tag to avoid collisions in AsyncSelect's dedup logic.
+ */
+const toCompositeValue = (id: number, kind?: string): string =>
+  kind === 'semantic_view' ? `sv:${id}` : `ds:${id}`;
+
+/** Extracts the numeric ID from a composite "sv:123" / "ds:456" string. */
+const fromCompositeValue = (compositeValue: string | number): number => {
+  if (typeof compositeValue !== 'string') return compositeValue;
+  const parts = compositeValue.split(':');
+  return parts.length === 2
+    ? parseInt(parts[1], 10)
+    : parseInt(compositeValue, 10);
+};
+
+/** Derives the `kind` value from a composite string prefix. */
+const kindFromComposite = (compositeValue: string): string | undefined =>
+  compositeValue.startsWith('sv:') ? 'semantic_view' : undefined;
+
+const isExcludedDatasource = (
+  item: Dataset,
+  excludeDatasetIds: number[],
+): boolean => {
+  if (!excludeDatasetIds.includes(item.id)) {
+    return false;
+  }
+
+  return item.kind !== 'semantic_view';
+};
+
+export const loadDatasetOptions = async (
+  search: string,
+  page: number,
+  pageSize: number,
+  excludeDatasetIds: number[] = [],
+) => {
+  const useSemanticLayers = isFeatureEnabled(FeatureFlag.SemanticLayers);
+  return fetchDatasourceList(search, page, pageSize, { get: cachedSupersetGet })
+    .then(({ result, count }) => {
+      const filteredResult = result.filter(
+        item => !isExcludedDatasource(item, excludeDatasetIds),
+      );
+
+      const list: {
+        label: string | ReactNode;
+        value: string | number;
+        table_name: string;
+        kind?: string;
+      }[] = filteredResult.map(item => ({
+        ...item,
+        label: DatasetSelectLabel(item),
+        value: useSemanticLayers
+          ? toCompositeValue(item.id, item.kind)
+          : item.id,
+        table_name: item.table_name,
+        kind: item.kind,
+      }));
+      return {
+        data: list,
+        totalCount: count,
+      };
+    })
+    .catch(async error => {
+      const errorMessage = selectClientErrorMessage(
+        await getClientErrorObject(error),
+        t('An error has occurred'),
+        { 403: t('You do not have permission to edit this dashboard') },
+      );
+      throw new Error(errorMessage);
+    });
+};
+
+const DatasetSelect = ({
+  onChange,
+  value,
+  excludeDatasetIds = [],
+}: DatasetSelectProps) => {
+  const useSemanticLayers = isFeatureEnabled(FeatureFlag.SemanticLayers);
+
+  const loadDatasetOptionsCallback = useCallback(
+    (search: string, page: number, pageSize: number) =>
+      loadDatasetOptions(search, page, pageSize, excludeDatasetIds),
+    [excludeDatasetIds],
   );
 
-  const loadDatasetOptions = async (
-    search: string,
-    page: number,
-    pageSize: number,
-  ) => {
-    const searchColumn = 'table_name';
-    const query = rison.encode({
-      filters: [{ col: searchColumn, opr: 'ct', value: search }],
-      page,
-      page_size: pageSize,
-      order_column: searchColumn,
-      order_direction: 'asc',
-    });
-    return cachedSupersetGet({
-      endpoint: `/api/v1/dataset/?q=${query}`,
-    })
-      .then(response => {
-        const data: {
-          label: string;
-          value: string | number;
-        }[] = response.json.result.map(datasetToSelectOption);
-        return {
-          data,
-          totalCount: response.json.count,
-        };
-      })
-      .catch(async error => {
-        const errorMessage = getErrorMessage(await getClientErrorObject(error));
-        throw new Error(errorMessage);
-      });
-  };
+  // Convert the external numeric value to the composite string format that
+  // AsyncSelect needs for matching against the loaded options.
+  const selectValue = useMemo(() => {
+    if (!value || !useSemanticLayers) return value;
+    return {
+      ...value,
+      value: toCompositeValue(value.value, value.kind),
+    };
+  }, [value, useSemanticLayers]);
+
+  // Convert the composite string value from the selected option back to a
+  // numeric ID before passing it to the external onChange handler.
+  // AsyncSelect's first argument is a LabeledValue ({key, label, value}) and
+  // does NOT include custom option fields like `kind`.  We derive `kind` from
+  // the composite value prefix so consumers can distinguish datasource types.
+  const handleChange = useCallback(
+    (selected: {
+      label: string | ReactNode;
+      value: number | string;
+      kind?: string;
+    }) => {
+      if (typeof selected.value === 'string') {
+        onChange({
+          ...selected,
+          value: fromCompositeValue(selected.value),
+          kind: kindFromComposite(selected.value),
+        });
+      } else {
+        onChange(selected as Parameters<typeof onChange>[0]);
+      }
+    },
+    [onChange],
+  );
 
   return (
-    <Select
-      ariaLabel={t('Dataset')}
-      value={value}
-      options={loadDatasetOptions}
-      onChange={onChange}
+    <AsyncSelect
+      ariaLabel={datasetLabel()}
+      value={selectValue}
+      options={loadDatasetOptionsCallback}
+      onChange={useSemanticLayers ? handleChange : onChange}
+      optionFilterProps={['table_name']}
+      notFoundContent={t('No compatible %s found', datasetsLabelLower())}
+      placeholder={t('Select a %s', datasetLabelLower())}
     />
   );
 };

@@ -16,46 +16,81 @@
 # under the License.
 # isort:skip_file
 """Unit tests for Superset"""
-from typing import Dict, Any
 
-from tests.integration_tests.test_app import app  # noqa
+from typing import Any
+from unittest.mock import patch
+
+import pytest
 
 from superset.extensions import cache_manager, db
 from superset.models.cache import CacheKey
+from superset.utils.core import get_example_default_schema
 from tests.integration_tests.base_tests import (
     SupersetTestCase,
     post_assert_metric,
-    test_client,
-    logged_in_admin,
-)  # noqa
+)
+from tests.integration_tests.fixtures.birth_names_dashboard import (
+    load_birth_names_dashboard_with_slices,  # noqa: F401
+    load_birth_names_data,  # noqa: F401
+)
 
 
-def invalidate(params: Dict[str, Any]):
-    return post_assert_metric(
-        test_client, "api/v1/cachekey/invalidate", params, "invalidate"
-    )
+@pytest.fixture
+def invalidate(test_client, login_as_admin):
+    def _invalidate(params: dict[str, Any]):
+        return post_assert_metric(
+            test_client, "api/v1/cachekey/invalidate", params, "invalidate"
+        )
+
+    return _invalidate
 
 
-def test_invalidate_cache(logged_in_admin):
+def test_invalidate_cache(invalidate):
     rv = invalidate({"datasource_uids": ["3__table"]})
     assert rv.status_code == 201
 
 
-def test_invalidate_existing_cache(logged_in_admin):
+def test_invalidate_existing_cache(invalidate):
     db.session.add(CacheKey(cache_key="cache_key", datasource_uid="3__table"))
     db.session.commit()
-    cache_manager.cache.set("cache_key", "value")
+    cache_manager.data_cache.set("cache_key", "value")
 
     rv = invalidate({"datasource_uids": ["3__table"]})
 
     assert rv.status_code == 201
-    assert cache_manager.cache.get("cache_key") == None
+    assert cache_manager.data_cache.get("cache_key") is None  # noqa: E711
     assert (
         not db.session.query(CacheKey).filter(CacheKey.cache_key == "cache_key").first()
     )
 
 
-def test_invalidate_cache_empty_input(logged_in_admin):
+def test_invalidate_uses_data_cache_not_default_cache(invalidate):
+    """Regression test for #40489.
+
+    Chart query results are written through ``cache_manager.data_cache``
+    (``DATA_CACHE_CONFIG``). When ``CACHE_CONFIG`` and ``DATA_CACHE_CONFIG``
+    use distinct ``CACHE_KEY_PREFIX`` values, deleting via the default
+    ``cache_manager.cache`` silently misses the underlying Redis keys
+    because flask-caching prepends the wrong prefix to the DEL call.
+    """
+    db.session.add(CacheKey(cache_key="cache_key", datasource_uid="3__table"))
+    db.session.commit()
+
+    with (
+        patch.object(cache_manager.data_cache, "delete_many") as data_delete,
+        patch.object(cache_manager.cache, "delete_many") as default_delete,
+    ):
+        data_delete.return_value = True
+        rv = invalidate({"datasource_uids": ["3__table"]})
+
+    assert rv.status_code == 201
+    # Chart-data cache backend (the one that wrote the keys) must be hit.
+    data_delete.assert_called_once_with("cache_key")
+    # The default cache must NOT be touched — that's the #40489 regression.
+    default_delete.assert_not_called()
+
+
+def test_invalidate_cache_empty_input(invalidate):
     rv = invalidate({"datasource_uids": []})
     assert rv.status_code == 201
 
@@ -66,7 +101,7 @@ def test_invalidate_cache_empty_input(logged_in_admin):
     assert rv.status_code == 201
 
 
-def test_invalidate_cache_bad_request(logged_in_admin):
+def test_invalidate_cache_bad_request(invalidate):
     rv = invalidate(
         {
             "datasource_uids": [],
@@ -92,7 +127,9 @@ def test_invalidate_cache_bad_request(logged_in_admin):
     assert rv.status_code == 400
 
 
-def test_invalidate_existing_caches(logged_in_admin):
+@pytest.mark.usefixtures("load_birth_names_dashboard_with_slices")
+def test_invalidate_existing_caches(invalidate):
+    schema = get_example_default_schema() or ""
     bn = SupersetTestCase.get_birth_names_dataset()
 
     db.session.add(CacheKey(cache_key="cache_key1", datasource_uid="3__druid"))
@@ -101,10 +138,10 @@ def test_invalidate_existing_caches(logged_in_admin):
     db.session.add(CacheKey(cache_key="cache_keyX", datasource_uid="X__table"))
     db.session.commit()
 
-    cache_manager.cache.set("cache_key1", "value")
-    cache_manager.cache.set("cache_key2", "value")
-    cache_manager.cache.set("cache_key4", "value")
-    cache_manager.cache.set("cache_keyX", "value")
+    cache_manager.data_cache.set("cache_key1", "value")
+    cache_manager.data_cache.set("cache_key2", "value")
+    cache_manager.data_cache.set("cache_key4", "value")
+    cache_manager.data_cache.set("cache_keyX", "value")
 
     rv = invalidate(
         {
@@ -113,25 +150,25 @@ def test_invalidate_existing_caches(logged_in_admin):
                 {
                     "datasource_name": "birth_names",
                     "database_name": "examples",
-                    "schema": "",
+                    "schema": schema,
                     "datasource_type": "table",
                 },
                 {  # table exists, no cache to invalidate
                     "datasource_name": "energy_usage",
                     "database_name": "examples",
-                    "schema": "",
+                    "schema": schema,
                     "datasource_type": "table",
                 },
                 {  # table doesn't exist
                     "datasource_name": "does_not_exist",
                     "database_name": "examples",
-                    "schema": "",
+                    "schema": schema,
                     "datasource_type": "table",
                 },
                 {  # database doesn't exist
                     "datasource_name": "birth_names",
                     "database_name": "does_not_exist",
-                    "schema": "",
+                    "schema": schema,
                     "datasource_type": "table",
                 },
                 {  # database doesn't exist
@@ -145,10 +182,10 @@ def test_invalidate_existing_caches(logged_in_admin):
     )
 
     assert rv.status_code == 201
-    assert cache_manager.cache.get("cache_key1") is None
-    assert cache_manager.cache.get("cache_key2") is None
-    assert cache_manager.cache.get("cache_key4") is None
-    assert cache_manager.cache.get("cache_keyX") == "value"
+    assert cache_manager.data_cache.get("cache_key1") is None
+    assert cache_manager.data_cache.get("cache_key2") is None
+    assert cache_manager.data_cache.get("cache_key4") is None
+    assert cache_manager.data_cache.get("cache_keyX") == "value"
     assert (
         not db.session.query(CacheKey)
         .filter(CacheKey.cache_key.in_({"cache_key1", "cache_key2", "cache_key4"}))

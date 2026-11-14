@@ -16,9 +16,9 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React, { FC } from 'react';
-import Button, { OnClickHandler } from 'src/components/Button';
-import { t } from '@superset-ui/core';
+import { FC } from 'react';
+import { Button, type OnClickHandler } from '@superset-ui/core/components';
+import { t } from '@apache-superset/core/translation';
 import { CancelConfirmationAlert } from './CancelConfirmationAlert';
 
 type FooterProps = {
@@ -46,7 +46,7 @@ const Footer: FC<FooterProps> = ({
         onConfirm={onConfirmCancel}
         onDismiss={onDismiss}
       >
-        {t(`Are you sure you want to cancel?`)}
+        {t('Are you sure you want to cancel?')}
       </CancelConfirmationAlert>
     );
   }

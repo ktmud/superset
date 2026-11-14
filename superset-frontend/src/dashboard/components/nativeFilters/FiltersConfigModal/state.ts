@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
+import { NativeFilterType, usePrevious } from '@superset-ui/core';
 import { FilterRemoval } from './types';
-import { usePrevious } from '../../../../common/hooks/usePrevious';
 
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
@@ -24,27 +24,27 @@ import { usePrevious } from '../../../../common/hooks/usePrevious';
 export const useRemoveCurrentFilter = (
   removedFilters: Record<string, FilterRemoval>,
   currentFilterId: string,
-  orderedFilters: string[][],
-  setCurrentFilterId: Function,
+  orderedFilters: string[],
+  setCurrentFilterId: (id: string) => void,
 ) => {
   useEffect(() => {
     // if the currently viewed filter is fully removed, change to another tab
     const currentFilterRemoved = removedFilters[currentFilterId];
     if (currentFilterRemoved && !currentFilterRemoved.isPending) {
-      const nextFilterId = orderedFilters
-        .flat()
-        .find(
-          filterId => !removedFilters[filterId] && filterId !== currentFilterId,
-        );
+      const nextFilterId = orderedFilters.find(
+        filterId => !removedFilters[filterId] && filterId !== currentFilterId,
+      );
 
-      if (nextFilterId) setCurrentFilterId(nextFilterId);
+      if (nextFilterId) {
+        setCurrentFilterId(nextFilterId);
+      }
     }
   }, [currentFilterId, removedFilters, orderedFilters, setCurrentFilterId]);
 };
 
 export const useOpenModal = (
   isOpen: boolean,
-  addFilter: Function,
+  addFilter: (type: NativeFilterType) => void,
   createNewOnOpen?: boolean,
 ) => {
   const wasOpen = usePrevious(isOpen);
@@ -52,7 +52,7 @@ export const useOpenModal = (
   // add a filter on modal open
   useEffect(() => {
     if (createNewOnOpen && isOpen && !wasOpen) {
-      addFilter();
+      addFilter(NativeFilterType.NativeFilter);
     }
   }, [createNewOnOpen, isOpen, wasOpen, addFilter]);
 };

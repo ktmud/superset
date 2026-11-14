@@ -16,22 +16,53 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React, { FC, useMemo } from 'react';
-import { styled, t } from '@superset-ui/core';
-import { Tooltip } from 'src/components/Tooltip';
-import { useDispatch, useSelector } from 'react-redux';
-import EditableTitle from 'src/components/EditableTitle';
-import SliceHeaderControls, {
-  SliceHeaderControlsProps,
-} from 'src/dashboard/components/SliceHeaderControls';
-import FiltersBadge from 'src/dashboard/components/FiltersBadge';
-import Icons from 'src/components/Icons';
+import {
+  forwardRef,
+  ReactNode,
+  RefObject,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from 'react';
+import { t } from '@apache-superset/core/translation';
+import {
+  getExtensionsRegistry,
+  handleKeyboardActivation,
+  JsonObject,
+  QueryData,
+  VizType,
+} from '@superset-ui/core';
+import {
+  css,
+  styled,
+  SupersetTheme,
+  useTheme,
+} from '@apache-superset/core/theme';
+import { useUiConfig } from 'src/components/UiConfigContext';
+import { isEmbedded } from 'src/dashboard/util/isEmbedded';
+import {
+  Tooltip,
+  EditableTitle,
+  Icons,
+  Popover,
+} from '@superset-ui/core/components';
+import { useSelector } from 'react-redux';
+import SliceHeaderControls from 'src/dashboard/components/SliceHeaderControls';
+import { useIsMobile } from 'src/hooks/useIsMobile';
+import { SliceHeaderControlsProps } from 'src/dashboard/components/SliceHeaderControls/types';
+import MemoizedFiltersBadge from 'src/dashboard/components/FiltersBadge';
+import MemoizedCustomizationsBadge from 'src/dashboard/components/CustomizationsBadge';
 import { RootState } from 'src/dashboard/types';
-import FilterIndicator from 'src/dashboard/components/FiltersBadge/FilterIndicator';
-import { clearDataMask } from 'src/dataMask/actions';
+import { getSliceHeaderTooltip } from 'src/dashboard/util/getSliceHeaderTooltip';
+import { DashboardPageIdContext } from 'src/dashboard/containers/DashboardPage';
+import RowCountLabel from 'src/components/RowCountLabel';
+import { Link } from 'react-router-dom';
+import SliceInfo from './SliceInfo';
+
+const extensionsRegistry = getExtensionsRegistry();
 
 type SliceHeaderProps = SliceHeaderControlsProps & {
-  innerRef?: string;
   updateSliceName?: (arg0: string) => void;
   editMode?: boolean;
   annotationQuery?: object;
@@ -40,154 +71,371 @@ type SliceHeaderProps = SliceHeaderControlsProps & {
   filters: object;
   handleToggleFullSize: () => void;
   formData: object;
+  ownState?: JsonObject;
+  width: number;
+  height: number;
+  queriedDttm?: string | null;
+  exportPivotExcel?: (arg0: string) => void;
+  chartHolderRef?: RefObject<HTMLDivElement>;
 };
 
 const annotationsLoading = t('Annotation layers are still loading.');
-const annotationsError = t('One ore more annotation layers failed loading.');
-
-const CrossFilterIcon = styled(Icons.CursorTarget)`
-  cursor: pointer;
-  color: ${({ theme }) => theme.colors.primary.base};
-  height: 22px;
-  width: 22px;
+const annotationsError = t('One or more annotation layers failed loading.');
+const CrossFilterIcon = styled(Icons.ApartmentOutlined)`
+  ${({ theme }) => `
+    cursor: default;
+    color: ${theme.colorPrimary};
+    line-height: 1.8;
+  `}
 `;
 
-const SliceHeader: FC<SliceHeaderProps> = ({
-  innerRef = null,
-  forceRefresh = () => ({}),
-  updateSliceName = () => ({}),
-  toggleExpandSlice = () => ({}),
-  logExploreChart = () => ({}),
-  exploreUrl = '#',
-  exportCSV = () => ({}),
-  editMode = false,
-  annotationQuery = {},
-  annotationError = {},
-  cachedDttm = null,
-  updatedDttm = null,
-  isCached = [],
-  isExpanded = false,
-  sliceName = '',
-  supersetCanExplore = false,
-  supersetCanShare = false,
-  supersetCanCSV = false,
-  sliceCanEdit = false,
-  exportFullCSV,
-  slice,
-  componentId,
-  dashboardId,
-  addSuccessToast,
-  addDangerToast,
-  handleToggleFullSize,
-  isFullSize,
-  chartStatus,
-  formData,
-}) => {
-  const dispatch = useDispatch();
-  // TODO: change to indicator field after it will be implemented
-  const crossFilterValue = useSelector<RootState, any>(
-    state => state.dataMask[slice?.slice_id]?.filterState?.value,
-  );
+const ChartHeaderStyles = styled.div`
+  ${({ theme }) => css`
+    font-size: ${theme.fontSizeLG}px;
+    font-weight: ${theme.fontWeightStrong};
+    margin-bottom: ${theme.sizeUnit}px;
+    display: flex;
+    max-width: 100%;
+    align-items: flex-start;
+    min-height: 0;
 
-  const indicator = useMemo(
-    () => ({
-      value: crossFilterValue,
-      name: t('Emitted values'),
-    }),
-    [crossFilterValue],
-  );
+    & > .header-title {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: calc(100% - ${theme.sizeUnit * 4}px);
+      flex-grow: 1;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
 
-  return (
-    <div className="chart-header" data-test="slice-header" ref={innerRef}>
-      <div className="header-title">
-        <EditableTitle
-          title={
-            sliceName ||
-            (editMode
-              ? '---' // this makes an empty title clickable
-              : '')
+      & > span.ant-tooltip-open {
+        display: inline;
+      }
+    }
+
+    & > .header-controls {
+      display: flex;
+      align-items: center;
+      height: 24px;
+    }
+
+    .dropdown.btn-group {
+      pointer-events: none;
+      vertical-align: top;
+      & > * {
+        pointer-events: auto;
+      }
+    }
+
+    .dropdown-toggle.btn.btn-default {
+      background: none;
+      border: none;
+      box-shadow: none;
+    }
+
+    .dropdown-menu.dropdown-menu-right {
+      top: ${theme.sizeUnit * 5}px;
+    }
+
+    .divider {
+      margin: ${theme.sizeUnit}px 0;
+    }
+
+    .refresh-tooltip {
+      display: block;
+      height: ${theme.sizeUnit * 4}px;
+      margin: ${theme.sizeUnit}px 0;
+      color: ${theme.colorTextLabel};
+    }
+  `}
+`;
+
+const SliceHeader = forwardRef<HTMLDivElement, SliceHeaderProps>(
+  (
+    {
+      forceRefresh = () => ({}),
+      updateSliceName = () => ({}),
+      toggleExpandSlice = () => ({}),
+      logExploreChart = () => ({}),
+      logEvent,
+      exportCSV = () => ({}),
+      exportXLSX = () => ({}),
+      editMode = false,
+      annotationQuery = {},
+      annotationError = {},
+      cachedDttm = null,
+      queriedDttm = null,
+      updatedDttm = null,
+      isCached = [],
+      isExpanded = false,
+      sliceName = '',
+      supersetCanExplore = false,
+      supersetCanShare = false,
+      supersetCanDownload = false,
+      exportPivotCSV,
+      exportFullCSV,
+      exportFullXLSX,
+      slice,
+      componentId,
+      dashboardId,
+      addSuccessToast,
+      addDangerToast,
+      addWarningToast,
+      handleToggleFullSize,
+      isFullSize,
+      chartStatus,
+      formData,
+      width,
+      height,
+      exportPivotExcel = () => ({}),
+      chartHolderRef,
+      ownState,
+    },
+    ref,
+  ) => {
+    const SliceHeaderExtension = extensionsRegistry.get(
+      'dashboard.slice.header',
+    );
+    const uiConfig = useUiConfig();
+    const shouldShowRowLimitWarning =
+      !isEmbedded() || uiConfig.showRowLimitWarning;
+    const dashboardPageId = useContext(DashboardPageIdContext);
+    const [headerTooltip, setHeaderTooltip] = useState<ReactNode | null>(null);
+    const headerRef = useRef<HTMLDivElement>(null);
+    // TODO: change to indicator field after it will be implemented
+    const crossFilterValue = useSelector<RootState, any>(
+      state => state.dataMask[slice?.slice_id]?.filterState?.value,
+    );
+    const isCrossFiltersEnabled = useSelector<RootState, boolean>(
+      ({ dashboardInfo }) => dashboardInfo.crossFiltersEnabled,
+    );
+
+    const firstQueryResponse = useSelector<RootState, QueryData | undefined>(
+      state => state.charts[slice.slice_id].queriesResponse?.[0],
+    );
+
+    const secondQueryResponse = useSelector<RootState, QueryData | undefined>(
+      state => state.charts[slice.slice_id].queriesResponse?.[1],
+    );
+
+    const [isDescriptionOpen, setIsDescriptionOpen] = useState(false);
+
+    const theme = useTheme();
+
+    const rowLimit = Number(formData.row_limit ?? 0);
+
+    const isTableChart =
+      formData.viz_type === VizType.Table ||
+      formData.viz_type === VizType.TableAgGrid;
+    const countFromSecondQuery = isTableChart
+      ? secondQueryResponse?.data?.[0]?.rowcount
+      : undefined;
+
+    const sqlRowCount =
+      countFromSecondQuery != null
+        ? countFromSecondQuery
+        : Number(
+            firstQueryResponse?.sql_rowcount ??
+              firstQueryResponse?.rowcount ??
+              0,
+          );
+
+    // Consumption-only mobile mode: no explore link, no chart controls
+    const isMobile = useIsMobile();
+    const canExplore = !editMode && supersetCanExplore && !isMobile;
+    const showRowLimitWarning =
+      shouldShowRowLimitWarning && sqlRowCount >= rowLimit && rowLimit > 0;
+
+    useEffect(() => {
+      const headerElement = headerRef.current;
+      if (canExplore) {
+        setHeaderTooltip(getSliceHeaderTooltip(sliceName));
+      } else if (
+        headerElement &&
+        (headerElement.scrollWidth > headerElement.offsetWidth ||
+          headerElement.scrollHeight > headerElement.offsetHeight)
+      ) {
+        setHeaderTooltip(sliceName ?? null);
+      } else {
+        setHeaderTooltip(null);
+      }
+    }, [sliceName, width, height, canExplore]);
+
+    const exploreUrl = `/explore/?dashboard_page_id=${dashboardPageId}&slice_id=${slice.slice_id}`;
+
+    const renderExploreLink = (title: string) => (
+      <Link
+        to={exploreUrl}
+        css={(theme: SupersetTheme) => css`
+          color: ${theme.colorText};
+          text-decoration: none;
+          :hover {
+            text-decoration: underline;
           }
-          canEdit={editMode}
-          emptyText=""
-          onSaveTitle={updateSliceName}
-          showTooltip={false}
-        />
-        {!!Object.values(annotationQuery).length && (
-          <Tooltip
-            id="annotations-loading-tooltip"
-            placement="top"
-            title={annotationsLoading}
-          >
-            <i
-              role="img"
-              aria-label={annotationsLoading}
-              className="fa fa-refresh warning"
-            />
-          </Tooltip>
-        )}
-        {!!Object.values(annotationError).length && (
-          <Tooltip
-            id="annoation-errors-tooltip"
-            placement="top"
-            title={annotationsError}
-          >
-            <i
-              role="img"
-              aria-label={annotationsError}
-              className="fa fa-exclamation-circle danger"
-            />
-          </Tooltip>
-        )}
-      </div>
-      <div className="header-controls">
-        {!editMode && (
-          <>
-            {crossFilterValue && (
-              <Tooltip
-                placement="top"
+          display: inline-block;
+        `}
+      >
+        {title}
+      </Link>
+    );
+
+    return (
+      <ChartHeaderStyles
+        className="slice-header"
+        data-test="slice-header"
+        ref={ref}
+      >
+        <div className="header-title" ref={headerRef}>
+          <Tooltip title={headerTooltip}>
+            {/* this div ensures the hover event triggers correctly and prevents flickering */}
+            <div>
+              <EditableTitle
                 title={
-                  <FilterIndicator
-                    indicator={indicator}
-                    text={t('Click to clear emitted filters')}
-                  />
+                  sliceName ||
+                  (editMode
+                    ? '---' // this makes an empty title clickable
+                    : '')
                 }
-              >
-                <CrossFilterIcon
-                  onClick={() => dispatch(clearDataMask(slice?.slice_id))}
+                canEdit={editMode}
+                onSaveTitle={updateSliceName}
+                showTooltip={false}
+                renderLink={
+                  canExplore && exploreUrl ? renderExploreLink : undefined
+                }
+              />
+            </div>
+          </Tooltip>
+          {!!Object.values(annotationQuery).length && (
+            <Tooltip
+              id="annotations-loading-tooltip"
+              placement="top"
+              title={annotationsLoading}
+            >
+              <Icons.ReloadOutlined
+                className="warning"
+                aria-label={annotationsLoading}
+              />
+            </Tooltip>
+          )}
+          {!!Object.values(annotationError).length && (
+            <Tooltip
+              id="annotation-errors-tooltip"
+              placement="top"
+              title={annotationsError}
+            >
+              <Icons.ExclamationCircleOutlined
+                className="danger"
+                aria-label={annotationsError}
+              />
+            </Tooltip>
+          )}
+        </div>
+        <div className="header-controls">
+          {!editMode && (
+            <>
+              {SliceHeaderExtension && (
+                <SliceHeaderExtension
+                  sliceId={slice.slice_id}
+                  dashboardId={dashboardId}
                 />
-              </Tooltip>
-            )}
-            <FiltersBadge chartId={slice.slice_id} />
-            <SliceHeaderControls
-              slice={slice}
-              isCached={isCached}
-              isExpanded={isExpanded}
-              cachedDttm={cachedDttm}
-              updatedDttm={updatedDttm}
-              toggleExpandSlice={toggleExpandSlice}
-              forceRefresh={forceRefresh}
-              logExploreChart={logExploreChart}
-              exploreUrl={exploreUrl}
-              exportCSV={exportCSV}
-              exportFullCSV={exportFullCSV}
-              supersetCanExplore={supersetCanExplore}
-              supersetCanShare={supersetCanShare}
-              supersetCanCSV={supersetCanCSV}
-              sliceCanEdit={sliceCanEdit}
-              componentId={componentId}
-              dashboardId={dashboardId}
-              addSuccessToast={addSuccessToast}
-              addDangerToast={addDangerToast}
-              handleToggleFullSize={handleToggleFullSize}
-              isFullSize={isFullSize}
-              chartStatus={chartStatus}
-              formData={formData}
-            />
-          </>
-        )}
-      </div>
-    </div>
-  );
-};
+              )}
+              {crossFilterValue && (
+                <Tooltip
+                  placement="top"
+                  title={t(
+                    'This chart applies cross-filters to charts whose datasets contain columns with the same name.',
+                  )}
+                >
+                  <CrossFilterIcon iconSize="m" />
+                </Tooltip>
+              )}
+              {slice.description && !isExpanded && (
+                <Popover
+                  trigger={['hover', 'click']}
+                  content={<SliceInfo slice={slice} />}
+                  placement="leftBottom"
+                  open={isDescriptionOpen}
+                  onOpenChange={setIsDescriptionOpen}
+                >
+                  <Icons.InfoCircleOutlined
+                    iconSize="m"
+                    // eslint-disable-next-line jsx-a11y/prefer-tag-over-role
+                    role="button"
+                    tabIndex={0}
+                    aria-label={t('Chart description')}
+                    data-test="chart-description-info-icon"
+                    onKeyDown={handleKeyboardActivation(() =>
+                      setIsDescriptionOpen(open => !open),
+                    )}
+                  />
+                </Popover>
+              )}
+              {!uiConfig.hideChartControls && (
+                <MemoizedCustomizationsBadge chartId={slice.slice_id} />
+              )}
+
+              {!uiConfig.hideChartControls && (
+                <MemoizedFiltersBadge chartId={slice.slice_id} />
+              )}
+
+              {showRowLimitWarning && (
+                <RowCountLabel
+                  rowcount={sqlRowCount}
+                  limit={rowLimit}
+                  label={
+                    <Icons.WarningOutlined
+                      iconSize="l"
+                      iconColor={theme.colorWarning}
+                      css={theme => css`
+                        padding: ${theme.sizeUnit}px;
+                      `}
+                    />
+                  }
+                />
+              )}
+              {!uiConfig.hideChartControls && !isMobile && (
+                <SliceHeaderControls
+                  slice={slice}
+                  isCached={isCached}
+                  isExpanded={isExpanded}
+                  cachedDttm={cachedDttm}
+                  queriedDttm={queriedDttm}
+                  updatedDttm={updatedDttm}
+                  toggleExpandSlice={toggleExpandSlice}
+                  forceRefresh={forceRefresh}
+                  logExploreChart={logExploreChart}
+                  logEvent={logEvent}
+                  exportCSV={exportCSV}
+                  exportPivotCSV={exportPivotCSV}
+                  exportFullCSV={exportFullCSV}
+                  exportXLSX={exportXLSX}
+                  exportFullXLSX={exportFullXLSX}
+                  supersetCanExplore={supersetCanExplore}
+                  supersetCanShare={supersetCanShare}
+                  supersetCanDownload={supersetCanDownload}
+                  componentId={componentId}
+                  dashboardId={dashboardId}
+                  addSuccessToast={addSuccessToast}
+                  addDangerToast={addDangerToast}
+                  addWarningToast={addWarningToast}
+                  handleToggleFullSize={handleToggleFullSize}
+                  isFullSize={isFullSize}
+                  isDescriptionExpanded={isExpanded}
+                  chartStatus={chartStatus}
+                  formData={formData}
+                  exploreUrl={exploreUrl}
+                  crossFiltersEnabled={isCrossFiltersEnabled}
+                  exportPivotExcel={exportPivotExcel}
+                  chartHolderRef={chartHolderRef}
+                  ownState={ownState}
+                />
+              )}
+            </>
+          )}
+        </div>
+      </ChartHeaderStyles>
+    );
+  },
+);
 
 export default SliceHeader;

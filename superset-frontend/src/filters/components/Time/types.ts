@@ -16,6 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+import { RefObject } from 'react';
 import {
   Behavior,
   DataRecord,
@@ -26,6 +27,7 @@ import { PluginFilterHooks, PluginFilterStylesProps } from '../types';
 
 interface PluginFilterTimeCustomizeProps {
   defaultValue?: string | null;
+  displayFormat?: string;
 }
 
 export type PluginFilterSelectQueryFormData = QueryFormData &
@@ -37,6 +39,8 @@ export type PluginFilterTimeProps = PluginFilterStylesProps & {
   data: DataRecord[];
   formData: PluginFilterSelectQueryFormData;
   filterState: FilterState;
+  inputRef: RefObject<HTMLInputElement>;
+  isOverflowingFilterBar?: boolean;
 } & PluginFilterHooks;
 
 export const DEFAULT_FORM_DATA: PluginFilterTimeCustomizeProps = {

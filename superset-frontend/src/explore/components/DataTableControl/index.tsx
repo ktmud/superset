@@ -16,86 +16,160 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React, { useMemo } from 'react';
-import { styled, t } from '@superset-ui/core';
-import { Column } from 'react-table';
-import debounce from 'lodash/debounce';
-import { Input } from 'src/common/components';
+import { useMemo, useState, useEffect, useRef, RefObject } from 'react';
+import { t } from '@apache-superset/core/translation';
+import { css, styled, useTheme } from '@apache-superset/core/theme';
+
+import { debounce } from 'lodash-es';
+import { Constants, Button, Icons, Input } from '@superset-ui/core/components';
+import { CopyToClipboard } from 'src/components';
 import {
-  BOOL_FALSE_DISPLAY,
-  BOOL_TRUE_DISPLAY,
-  SLOW_DEBOUNCE,
-} from 'src/constants';
-import Button from 'src/components/Button';
-import { prepareCopyToClipboardTabularData } from 'src/utils/common';
-import CopyToClipboard from 'src/components/CopyToClipboard';
-import RowCountLabel from 'src/explore/components/RowCountLabel';
+  prepareCopyToClipboardTabularData,
+  TabularDataRow,
+} from 'src/utils/common';
+
+export const CellNull = styled('span')`
+  color: ${({ theme }) => theme.colorTextTertiary};
+`;
 
 export const CopyButton = styled(Button)`
-  font-size: ${({ theme }) => theme.typography.sizes.s}px;
+  font-size: ${({ theme }) => theme.fontSizeSM}px;
 
-  // needed to override button's first-of-type margin: 0
+  /* needed to override button's first-of-type margin: 0 */
   && {
-    margin: 0 ${({ theme }) => theme.gridUnit * 2}px;
+    margin: 0 ${({ theme }) => theme.sizeUnit * 2}px;
   }
 
   i {
-    padding: 0 ${({ theme }) => theme.gridUnit}px;
+    padding: 0 ${({ theme }) => theme.sizeUnit}px;
   }
 `;
-
-const CopyNode = (
-  <CopyButton buttonSize="xsmall" aria-label={t('Copy')}>
-    <i className="fa fa-clipboard" />
-  </CopyButton>
-);
 
 export const CopyToClipboardButton = ({
   data,
   columns,
+  disabled = false,
 }: {
-  data?: Record<string, any>;
+  data?: TabularDataRow[];
   columns?: string[];
-}) => (
-  <CopyToClipboard
-    text={
-      data && columns ? prepareCopyToClipboardTabularData(data, columns) : ''
-    }
-    wrapped={false}
-    copyNode={CopyNode}
-  />
-);
-
-export const FilterInput = ({
-  onChangeHandler,
-}: {
-  onChangeHandler(filterText: string): void;
+  disabled?: boolean;
 }) => {
-  const debouncedChangeHandler = debounce(onChangeHandler, SLOW_DEBOUNCE);
+  const theme = useTheme();
   return (
-    <Input
-      placeholder={t('Search')}
-      onChange={(event: any) => {
-        const filterText = event.target.value;
-        debouncedChangeHandler(filterText);
-      }}
+    <CopyToClipboard
+      text={
+        !disabled && data && columns
+          ? prepareCopyToClipboardTabularData(data, columns)
+          : ''
+      }
+      disabled={disabled}
+      wrapped={false}
+      copyNode={
+        <button
+          type="button"
+          aria-label={t('Copy')}
+          aria-disabled={disabled}
+          tabIndex={disabled ? -1 : 0}
+          css={css`
+            appearance: none;
+            border: none;
+            background: none;
+            padding: 0;
+            font: inherit;
+            display: inline-flex;
+            align-items: center;
+          `}
+        >
+          <Icons.CopyOutlined
+            iconColor={theme.colorIcon}
+            iconSize="l"
+            css={css`
+              opacity: ${disabled ? 0.3 : 1};
+              cursor: ${disabled ? 'not-allowed' : 'pointer'};
+              &.anticon > * {
+                line-height: 0;
+              }
+            `}
+          />
+        </button>
+      }
     />
   );
 };
 
-export const RowCount = ({
-  data,
-  loading,
+export const FilterInput = ({
+  onChangeHandler,
+  shouldFocus = false,
+  value: externalValue = '',
 }: {
-  data?: Record<string, any>[];
-  loading: boolean;
-}) => (
-  <RowCountLabel
-    rowcount={data?.length ?? 0}
-    loading={loading}
-    suffix={t('rows retrieved')}
-  />
-);
+  onChangeHandler(filterText: string): void;
+  shouldFocus?: boolean;
+  value?: string;
+}) => {
+  const inputRef: RefObject<any> = useRef(null);
+  const [internalValue, setInternalValue] = useState(externalValue);
+  const lastEmittedValue = useRef(externalValue);
+  const onChangeRef = useRef(onChangeHandler);
+  onChangeRef.current = onChangeHandler;
+
+  useEffect(() => {
+    if (externalValue !== lastEmittedValue.current) {
+      setInternalValue(externalValue);
+    }
+    lastEmittedValue.current = externalValue;
+  }, [externalValue]);
+
+  useEffect(() => {
+    if (inputRef.current && shouldFocus) {
+      // Skip auto-focus only when an editable element already has focus (e.g.
+      // user is typing in a form control when this pane remounts after a data
+      // refresh). Non-editable focused elements like tabs/buttons still allow
+      // auto-focus so the search box focuses on first open.
+      const activeEl = document.activeElement;
+      const editableFocused =
+        activeEl instanceof HTMLElement &&
+        (activeEl.tagName === 'INPUT' ||
+          activeEl.tagName === 'TEXTAREA' ||
+          activeEl.isContentEditable);
+      if (!editableFocused) {
+        inputRef.current.focus();
+      }
+    }
+  }, []);
+
+  const theme = useTheme();
+  const debouncedChangeHandler = useMemo(
+    () =>
+      debounce((value: string) => {
+        lastEmittedValue.current = value;
+        onChangeRef.current(value);
+      }, Constants.SLOW_DEBOUNCE),
+    [],
+  );
+
+  useEffect(
+    () => () => debouncedChangeHandler.flush(),
+    [debouncedChangeHandler],
+  );
+
+  return (
+    <Input
+      prefix={<Icons.SearchOutlined iconSize="l" />}
+      placeholder={t('Search')}
+      value={internalValue}
+      onChange={(event: any) => {
+        const filterText = event.target.value;
+        setInternalValue(filterText);
+        debouncedChangeHandler(filterText);
+      }}
+      css={css`
+        width: 200px;
+        margin-right: ${theme.sizeUnit * 2}px;
+      `}
+      ref={inputRef}
+    />
+  );
+};
 
 export const useFilteredTableData = (
   filterText: string,
@@ -104,7 +178,9 @@ export const useFilteredTableData = (
   const rowsAsStrings = useMemo(
     () =>
       data?.map((row: Record<string, any>) =>
-        Object.values(row).map(value => value?.toString().toLowerCase()),
+        Object.values(row).map(value =>
+          value ? value.toString().toLowerCase() : t('N/A'),
+        ),
       ) ?? [],
     [data],
   );
@@ -120,35 +196,3 @@ export const useFilteredTableData = (
     );
   }, [data, filterText, rowsAsStrings]);
 };
-
-export const useTableColumns = (
-  colnames?: string[],
-  data?: Record<string, any>[],
-  moreConfigs?: { [key: string]: Partial<Column> },
-) =>
-  useMemo(
-    () =>
-      colnames && data?.length
-        ? colnames
-            .filter((column: string) => Object.keys(data[0]).includes(column))
-            .map(
-              key =>
-                ({
-                  accessor: row => row[key],
-                  // When the key is empty, have to give a string of length greater than 0
-                  Header: key || ' ',
-                  Cell: ({ value }) => {
-                    if (value === true) {
-                      return BOOL_TRUE_DISPLAY;
-                    }
-                    if (value === false) {
-                      return BOOL_FALSE_DISPLAY;
-                    }
-                    return String(value);
-                  },
-                  ...moreConfigs?.[key],
-                } as Column),
-            )
-        : [],
-    [data, moreConfigs],
-  );

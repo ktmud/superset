@@ -1,0 +1,567 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import {
+  ControlPanelConfig,
+  D3_TIME_FORMAT_OPTIONS,
+  Dataset,
+  getStandardizedControls,
+  sharedControls,
+} from '@superset-ui/chart-controls';
+import { t } from '@apache-superset/core/translation';
+import {
+  ensureIsArray,
+  isAdhocColumn,
+  isPhysicalColumn,
+  QueryFormMetric,
+  SMART_DATE_ID,
+  validateNonEmpty,
+  QueryFormColumn,
+} from '@superset-ui/core';
+import { MetricsLayoutEnum, ShowValuesAsEnum } from '../types';
+import {
+  getResultAggregation,
+  METRIC_DEFINITION_AGGREGATION,
+  RESULT_AGGREGATIONS,
+  RESULT_AGGREGATION_LABELS,
+} from './resultAggregation';
+
+const config: ControlPanelConfig = {
+  controlPanelSections: [
+    {
+      label: t('Query'),
+      expanded: true,
+      controlSetRows: [
+        [
+          {
+            name: 'groupbyColumns',
+            config: {
+              ...sharedControls.groupby,
+              label: t('Columns'),
+              description: t('Columns to group by on the columns'),
+            },
+          },
+        ],
+        [
+          {
+            name: 'groupbyRows',
+            config: {
+              ...sharedControls.groupby,
+              label: t('Rows'),
+              description: t('Columns to group by on the rows'),
+            },
+          },
+        ],
+        [
+          {
+            name: 'time_grain_sqla',
+            config: {
+              ...sharedControls.time_grain_sqla,
+              visibility: ({ controls }) => {
+                const dttmLookup = Object.fromEntries(
+                  ensureIsArray(controls?.groupbyColumns?.options).map(
+                    option => [option.column_name, option.is_dttm],
+                  ),
+                );
+
+                return [
+                  ...ensureIsArray(controls?.groupbyColumns.value),
+                  ...ensureIsArray(controls?.groupbyRows.value),
+                ]
+                  .map(selection => {
+                    if (isAdhocColumn(selection)) {
+                      return true;
+                    }
+                    if (isPhysicalColumn(selection)) {
+                      return !!dttmLookup[selection];
+                    }
+                    return false;
+                  })
+                  .some(Boolean);
+              },
+            },
+          },
+          'temporal_columns_lookup',
+        ],
+        [
+          {
+            name: 'metrics',
+            config: {
+              ...sharedControls.metrics,
+              validators: [validateNonEmpty],
+              rerender: ['conditional_formatting'],
+            },
+          },
+        ],
+        [
+          {
+            name: 'metricsLayout',
+            config: {
+              type: 'RadioButtonControl',
+              // Not a renderTrigger: the axis the metrics land on decides which
+              // collapsed rollup level the totals/subtotals options need (see
+              // `buildGroupbyCombinations`), so changing it needs a real
+              // requery rather than a client-side-only re-render.
+              label: t('Apply metrics on'),
+              default: MetricsLayoutEnum.COLUMNS,
+              options: [
+                [MetricsLayoutEnum.COLUMNS, t('Columns')],
+                [MetricsLayoutEnum.ROWS, t('Rows')],
+              ],
+              description: t(
+                'Use metrics as a top level group for columns or for rows',
+              ),
+            },
+          },
+        ],
+        ['adhoc_filters'],
+        [
+          {
+            name: 'series_limit',
+            config: {
+              ...sharedControls.series_limit,
+              visibility: ({ form_data }) =>
+                !form_data.datasource?.endsWith('__semantic_view'),
+            },
+          },
+        ],
+        [
+          {
+            name: 'row_limit',
+            config: {
+              ...sharedControls.row_limit,
+              label: t('Cell limit'),
+              description: t(
+                'Limits the number of cells that get retrieved. Not applied when ' +
+                  'non-additive metrics (e.g. ratios, COUNT_DISTINCT, AVG, percentiles) ' +
+                  'are present, since totals and subtotals are then computed via a ' +
+                  'database rollup query that must see every row to stay correct.',
+              ),
+            },
+          },
+        ],
+        // TODO(kgabryje): add series_columns control after control panel is redesigned to avoid clutter
+        [
+          {
+            name: 'series_limit_metric',
+            config: {
+              ...sharedControls.series_limit_metric,
+              description: t(
+                'Metric used to define how the top series are sorted if a series or cell limit is present. ' +
+                  'If undefined reverts to the first metric (where appropriate).',
+              ),
+            },
+          },
+        ],
+        [
+          {
+            name: 'order_desc',
+            config: {
+              type: 'CheckboxControl',
+              label: t('Sort Descending'),
+              default: true,
+              description: t('Whether to sort descending or ascending'),
+            },
+          },
+        ],
+      ],
+    },
+    {
+      label: t('Options'),
+      expanded: true,
+      tabOverride: 'data',
+      controlSetRows: [
+        [
+          {
+            name: 'rowTotals',
+            config: {
+              type: 'CheckboxControl',
+              // The displayed value may be a result aggregation (Median,
+              // Average, ...) rather than a plain total once `aggregateFunction`
+              // is set below, so "summary" rather than "total".
+              label: t('Show row summaries'),
+              default: false,
+              // Not a renderTrigger: for non-additive metrics, the totals and
+              // subtotals are rollup levels fetched by the query (see
+              // `buildGroupbyCombinations`), so toggling this needs a real
+              // requery rather than a client-side-only re-render.
+              description: t('Display row level total'),
+            },
+          },
+        ],
+        [
+          {
+            name: 'rowSubTotals',
+            config: {
+              type: 'CheckboxControl',
+              label: t('Show rows subtotal'),
+              default: false,
+              description: t('Display row level subtotal'),
+            },
+          },
+        ],
+        [
+          {
+            name: 'collapseRows',
+            config: {
+              type: 'CheckboxControl',
+              label: t('Collapse rows by default'),
+              default: false,
+              renderTrigger: true,
+              description: t(
+                'Start with row groups collapsed when row subtotals are shown. ' +
+                  'Each group can still be expanded with its arrow.',
+              ),
+              visibility: ({ controls }) =>
+                Boolean(controls?.rowSubTotals?.value),
+            },
+          },
+        ],
+        [
+          {
+            name: 'colTotals',
+            config: {
+              type: 'CheckboxControl',
+              label: t('Show column summaries'),
+              default: false,
+              description: t('Display column level total'),
+            },
+          },
+        ],
+        [
+          {
+            name: 'colSubTotals',
+            config: {
+              type: 'CheckboxControl',
+              label: t('Show columns subtotal'),
+              default: false,
+              description: t('Display column level subtotal'),
+            },
+          },
+        ],
+        [
+          {
+            name: 'transposePivot',
+            config: {
+              type: 'CheckboxControl',
+              label: t('Transpose pivot'),
+              default: false,
+              // Not a renderTrigger: swapping rows and columns changes which
+              // dimensions form the rollup levels the totals/subtotals options
+              // need (see `buildGroupbyCombinations`), so it needs a real
+              // requery rather than a client-side-only re-render.
+              description: t('Swap rows and columns'),
+            },
+          },
+        ],
+        [
+          {
+            name: 'combineMetric',
+            config: {
+              type: 'CheckboxControl',
+              label: t('Combine metrics'),
+              default: false,
+              // Not a renderTrigger: combining metrics removes the per-metric
+              // subtotal level and the metric-axis rollup levels (see
+              // `buildGroupbyCombinations`), so changing it needs a real
+              // requery rather than a client-side-only re-render.
+              description: t(
+                'Display metrics side by side within each column, as ' +
+                  'opposed to each column being displayed side by side for each metric.',
+              ),
+            },
+          },
+        ],
+        [
+          {
+            name: 'aggregateFunction',
+            config: {
+              type: 'SelectControl',
+              label: t('Aggregation function'),
+              default: METRIC_DEFINITION_AGGREGATION,
+              clearable: false,
+              // Not a renderTrigger: switching in or out of a result
+              // aggregation changes whether the query uses GROUPING SETS at
+              // all (see buildQuery.ts), so it needs a real requery.
+              choices: [
+                [METRIC_DEFINITION_AGGREGATION, t('Use metric definition')],
+                ...RESULT_AGGREGATIONS.map(
+                  name =>
+                    [name, RESULT_AGGREGATION_LABELS[name]] as [string, string],
+                ),
+              ],
+              description: t(
+                'Use each metric’s own definition for cells and ' +
+                  'summaries (the default since SIP-216), or aggregate a ' +
+                  'second time over the metric’s own grouped results — ' +
+                  'e.g. the median of a set of per-store averages. Query ' +
+                  'limits apply before a result aggregation runs.',
+              ),
+            },
+          },
+        ],
+        [
+          {
+            name: 'showValuesAs',
+            config: {
+              type: 'SelectControl',
+              label: t('Show values as'),
+              default: ShowValuesAsEnum.ACTUAL,
+              // Not a renderTrigger: for non-additive metrics, a percent choice
+              // here can require a rollup level (see `buildGroupbyCombinations`)
+              // that a prior query never fetched, so switching it needs a real
+              // requery rather than a client-side-only re-render.
+              choices: [
+                [ShowValuesAsEnum.ACTUAL, t('Actual values')],
+                [ShowValuesAsEnum.PERCENT_OF_ROW, t('% of row total')],
+                [ShowValuesAsEnum.PERCENT_OF_COLUMN, t('% of column total')],
+                [ShowValuesAsEnum.PERCENT_OF_TOTAL, t('% of grand total')],
+              ],
+              description: t(
+                'Display each cell as a percentage of its row, column, or ' +
+                  'grand total, instead of its actual value. Totals and ' +
+                  'subtotals are still computed correctly first; this only ' +
+                  'changes how they are displayed.',
+              ),
+              // A result aggregation (anything but "Use metric definition")
+              // has its own "... as Fraction of ..." choices built in, and
+              // takes over the cell/summary computation entirely -- this
+              // control's percent transform would otherwise be silently
+              // ignored rather than applied on top of it. Route through
+              // `getResultAggregation` rather than comparing the raw value,
+              // so an unrecognized/stale `aggregateFunction` falls back to
+              // "Use metric definition" the same way the renderer does,
+              // instead of hiding this control for a value that doesn't
+              // actually select a result aggregation.
+              visibility: ({ controls }) =>
+                getResultAggregation(controls?.aggregateFunction?.value) ===
+                undefined,
+            },
+          },
+        ],
+      ],
+    },
+    {
+      label: t('Options'),
+      expanded: true,
+      controlSetRows: [
+        [
+          {
+            name: 'valueFormat',
+            config: {
+              ...sharedControls.y_axis_format,
+              label: t('Value format'),
+            },
+          },
+        ],
+        ['currency_format'],
+        [
+          {
+            name: 'date_format',
+            config: {
+              type: 'SelectControl',
+              freeForm: true,
+              label: t('Date format'),
+              default: SMART_DATE_ID,
+              renderTrigger: true,
+              choices: D3_TIME_FORMAT_OPTIONS,
+              description: t('D3 time format for datetime columns'),
+            },
+          },
+        ],
+        [
+          {
+            name: 'rowOrder',
+            config: {
+              type: 'SelectControl',
+              label: t('Sort rows by'),
+              default: 'key_a_to_z',
+              choices: [
+                // [value, label]
+                ['key_a_to_z', t('key a-z')],
+                ['key_z_to_a', t('key z-a')],
+                ['value_a_to_z', t('value ascending')],
+                ['value_z_to_a', t('value descending')],
+              ],
+              renderTrigger: true,
+              description: (
+                <>
+                  <div>{t('Change order of rows.')}</div>
+                  <div>{t('Available sorting modes:')}</div>
+                  <ul>
+                    <li>{t('By key: use row names as sorting key')}</li>
+                    <li>{t('By value: use metric values as sorting key')}</li>
+                  </ul>
+                </>
+              ),
+            },
+          },
+        ],
+        [
+          {
+            name: 'colOrder',
+            config: {
+              type: 'SelectControl',
+              label: t('Sort columns by'),
+              default: 'key_a_to_z',
+              choices: [
+                // [value, label]
+                ['key_a_to_z', t('key a-z')],
+                ['key_z_to_a', t('key z-a')],
+                ['value_a_to_z', t('value ascending')],
+                ['value_z_to_a', t('value descending')],
+              ],
+              renderTrigger: true,
+              description: (
+                <>
+                  <div>{t('Change order of columns.')}</div>
+                  <div>{t('Available sorting modes:')}</div>
+                  <ul>
+                    <li>{t('By key: use column names as sorting key')}</li>
+                    <li>{t('By value: use metric values as sorting key')}</li>
+                  </ul>
+                </>
+              ),
+            },
+          },
+        ],
+        [
+          {
+            name: 'rowSubtotalPosition',
+            config: {
+              type: 'SelectControl',
+              label: t('Rows subtotal position'),
+              default: false,
+              choices: [
+                // [value, label]
+                [true, t('Top')],
+                [false, t('Bottom')],
+              ],
+              renderTrigger: true,
+              description: t('Position of row level subtotal'),
+            },
+          },
+        ],
+        [
+          {
+            name: 'colSubtotalPosition',
+            config: {
+              type: 'SelectControl',
+              label: t('Columns subtotal position'),
+              default: false,
+              choices: [
+                // [value, label]
+                [true, t('Left')],
+                [false, t('Right')],
+              ],
+              renderTrigger: true,
+              description: t('Position of column level subtotal'),
+            },
+          },
+        ],
+        [
+          {
+            name: 'conditional_formatting',
+            config: {
+              type: 'ConditionalFormattingControl',
+              renderTrigger: true,
+              label: t('Conditional formatting'),
+              description: t('Apply conditional color formatting to metrics'),
+              shouldMapStateToProps() {
+                return true;
+              },
+              mapStateToProps(explore, _, chart) {
+                const metrics =
+                  (explore?.controls?.metrics?.value as QueryFormMetric[]) ??
+                  [];
+                const columns =
+                  (explore?.controls?.groupbyColumns
+                    ?.value as QueryFormColumn[]) ?? [];
+                const rows =
+                  (explore?.controls?.groupbyRows
+                    ?.value as QueryFormColumn[]) ?? [];
+                const values = [...new Set([...metrics, ...columns, ...rows])];
+
+                const verboseMap = explore?.datasource?.hasOwnProperty(
+                  'verbose_map',
+                )
+                  ? (explore?.datasource as Dataset)?.verbose_map
+                  : (explore?.datasource?.columns ?? {});
+                const chartStatus = chart?.chartStatus;
+                const { colnames, coltypes } =
+                  chart?.queriesResponse?.[0] ?? {};
+                const metricColumn = values.map(value => {
+                  if (typeof value === 'string') {
+                    return {
+                      value,
+                      label: Array.isArray(verboseMap)
+                        ? value
+                        : verboseMap[value],
+                      dataType: colnames && coltypes[colnames?.indexOf(value)],
+                    };
+                  }
+                  return {
+                    value: value.label,
+                    label: value.label,
+                    dataType:
+                      colnames && coltypes[colnames?.indexOf(value.label)],
+                  };
+                });
+                return {
+                  removeIrrelevantConditions: chartStatus === 'success',
+                  columnOptions: metricColumn,
+                  verboseMap,
+                };
+              },
+            },
+          },
+        ],
+        [
+          {
+            name: 'allow_render_html',
+            config: {
+              type: 'CheckboxControl',
+              label: t('Render columns in HTML format'),
+              renderTrigger: true,
+              default: true,
+              description: t(
+                'Renders table cells as HTML when applicable. For example, HTML <a> tags will be rendered as hyperlinks.',
+              ),
+            },
+          },
+        ],
+      ],
+    },
+  ],
+  formDataOverrides: formData => {
+    const groupbyColumns = getStandardizedControls().controls.columns.filter(
+      col => !ensureIsArray(formData.groupbyRows).includes(col),
+    );
+    getStandardizedControls().controls.columns =
+      getStandardizedControls().controls.columns.filter(
+        col => !groupbyColumns.includes(col),
+      );
+    return {
+      ...formData,
+      metrics: getStandardizedControls().popAllMetrics(),
+      groupbyColumns,
+    };
+  },
+};
+
+export default config;

@@ -17,16 +17,24 @@
  * under the License.
  */
 
-export const cacheWrapper = <T extends Array<any>, U>(
-  fn: (...args: T) => U,
-  cache: Map<string, any>,
-  keyFn: (...args: T) => string = (...args: T) => JSON.stringify([...args]),
-) => (...args: T): U => {
-  const key = keyFn(...args);
-  if (cache.has(key)) {
-    return cache.get(key);
-  }
-  const result = fn(...args);
-  cache.set(key, result);
-  return result;
-};
+export const cacheWrapper =
+  <T extends Array<any>, U>(
+    fn: (...args: T) => U,
+    cache: Map<string, any>,
+    keyFn: (...args: T) => string = (...args: T) => JSON.stringify([...args]),
+  ) =>
+  (...args: T): U => {
+    const key = keyFn(...args);
+    if (cache.has(key)) {
+      return cache.get(key);
+    }
+    const result = fn(...args);
+    cache.set(key, result);
+    Promise.resolve(result).catch(() => {
+      // A newer request may have replaced this entry while the first was pending.
+      if (cache.get(key) === result) {
+        cache.delete(key);
+      }
+    });
+    return result;
+  };

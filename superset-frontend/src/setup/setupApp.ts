@@ -18,11 +18,12 @@
  */
 /* eslint global-require: 0 */
 import $ from 'jquery';
-import { SupersetClient } from '@superset-ui/core';
 import {
+  SupersetClient,
   getClientErrorObject,
   ClientErrorObject,
-} from 'src/utils/getClientErrorObject';
+  sanitizeHtml,
+} from '@superset-ui/core';
 import setupErrorMessages from 'src/setup/setupErrorMessages';
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -41,7 +42,7 @@ function showApiMessage(resp: ClientErrorObject) {
   const severity = resp.severity || 'info';
   $(template)
     .addClass(`alert-${severity}`)
-    .append(resp.message || '')
+    .append(sanitizeHtml(resp.message || ''))
     .appendTo($('#alert-container'));
 }
 
@@ -52,7 +53,7 @@ function toggleCheckbox(apiUrlPrefix: string, selector: string) {
     .then(() => undefined)
     .catch(response =>
       getClientErrorObject(response).then(parsedResp => {
-        if (parsedResp && parsedResp.message) {
+        if (parsedResp?.message) {
           showApiMessage(parsedResp);
         }
       }),
@@ -71,12 +72,12 @@ export default function setupApp() {
     });
 
     // for language picker dropdown
-    $('#language-picker a').click(function (
+    $<HTMLAnchorElement>('#language-picker a').click(function (
       ev: JQuery.ClickEvent<
-        HTMLLinkElement,
+        HTMLAnchorElement,
         null,
-        HTMLLinkElement,
-        HTMLLinkElement
+        HTMLAnchorElement,
+        HTMLAnchorElement
       >,
     ) {
       ev.preventDefault();
@@ -93,8 +94,7 @@ export default function setupApp() {
   // this allows for the server side generated menus to function
   window.$ = $;
   window.jQuery = $;
-  require('bootstrap');
 
-  // setup appwide custom error messages
+  // set up app wide custom error messages
   setupErrorMessages();
 }

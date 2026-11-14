@@ -15,26 +15,26 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from typing import Optional, Type
+from typing import Optional
 
 from flask_babel import lazy_gettext as _
 from marshmallow import ValidationError
-from sqlalchemy.engine.url import make_url
-from sqlalchemy.exc import ArgumentError
 
 from superset import security_manager
+from superset.commands.database.exceptions import DatabaseInvalidError
+from superset.databases.utils import make_url_safe
 from superset.models.core import Database
 
 
 def sqlalchemy_uri_validator(
-    uri: str, exception: Type[ValidationError] = ValidationError
+    uri: str, exception: type[ValidationError] = ValidationError
 ) -> None:
     """
     Check if a user has submitted a valid SQLAlchemy URI
     """
     try:
-        make_url(uri.strip())
-    except (ArgumentError, AttributeError) as ex:
+        make_url_safe(uri.strip())
+    except DatabaseInvalidError as ex:
         raise exception(
             [
                 _(
@@ -48,10 +48,29 @@ def sqlalchemy_uri_validator(
         ) from ex
 
 
-def schema_allows_file_upload(database: Database, schema: Optional[str]) -> bool:
+def schema_allows_file_upload(
+    database: Database,
+    schema: Optional[str],
+    *,
+    engine_resolved: bool = False,
+) -> bool:
     if not database.allow_file_upload:
         return False
-    schemas = database.get_schema_access_for_file_upload()
-    if schemas:
+    if schemas := database.get_schema_access_for_file_upload():
+        if schema is None:
+            return False
+        if engine_resolved:
+            # The engine may report its default schema in a different case
+            # than the manually-inputted allow-list (e.g. ``PUBLIC`` vs
+            # ``public``) — mirroring the ``upload_allowed`` filtering of the
+            # database schemas endpoint. This is safe only because the write
+            # then uses the engine-reported name itself, so the case-fold
+            # cannot steer the upload to a different physical schema.
+            return schema.lower() in {allowed.lower() for allowed in schemas}
+        # User-supplied schemas match the allow-list exactly: on engines with
+        # quoted, case-sensitive identifiers (e.g. PostgreSQL), ``PUBLIC`` and
+        # ``public`` are distinct physical schemas, and case-folding here
+        # would let an allow-list entry authorize uploads into its
+        # case-variant sibling.
         return schema in schemas
     return security_manager.can_access_database(database)

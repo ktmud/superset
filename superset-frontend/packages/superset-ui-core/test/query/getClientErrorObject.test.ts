@@ -1,0 +1,482 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import {
+  COMMON_ERR_MESSAGES,
+  getClientErrorMessage,
+  getClientErrorObject,
+  getErrorText,
+  selectClientErrorMessage,
+  parseErrorJson,
+  ErrorTypeEnum,
+} from '@superset-ui/core';
+
+test('Returns a Promise', () => {
+  const response = getClientErrorObject('error');
+  expect(response instanceof Promise).toBe(true);
+});
+
+test('Returns a Promise that resolves to an object with an error key', async () => {
+  const error = 'error';
+
+  const errorObj = await getClientErrorObject(error);
+  expect(errorObj).toMatchObject({ error });
+});
+
+test('should handle HTML response with "500" or "server error"', async () => {
+  const htmlString500 = '<div>500: Internal Server Error</div>';
+  const clientErrorObject500 = await getClientErrorObject(htmlString500);
+  expect(clientErrorObject500).toEqual({ error: 'Server error' });
+
+  const htmlStringServerError = '<div>Server error message</div>';
+  const clientErrorObjectServerError = await getClientErrorObject(
+    htmlStringServerError,
+  );
+  expect(clientErrorObjectServerError).toEqual({
+    error: 'Server error',
+  });
+});
+
+test('should handle HTML response with "404" or "not found"', async () => {
+  const htmlString404 = '<div>404: Page not found</div>';
+  const clientErrorObject404 = await getClientErrorObject(htmlString404);
+  expect(clientErrorObject404).toEqual({ error: 'Not found' });
+
+  const htmlStringNotFoundError = '<div>Not found message</div>';
+  const clientErrorObjectNotFoundError = await getClientErrorObject(
+    htmlStringNotFoundError,
+  );
+  expect(clientErrorObjectNotFoundError).toEqual({
+    error: 'Not found',
+  });
+});
+
+test('should handle HTML response without common error code', async () => {
+  const htmlString = '<!doctype html><div>Foo bar Lorem Ipsum</div>';
+  const clientErrorObject = await getClientErrorObject(htmlString);
+  expect(clientErrorObject).toEqual({ error: 'Unknown error' });
+
+  const htmlString2 = '<div><p>An error occurred</p></div>';
+  const clientErrorObject2 = await getClientErrorObject(htmlString2);
+  expect(clientErrorObject2).toEqual({
+    error: 'Unknown error',
+  });
+});
+
+test('Handles Response that can be parsed as json', async () => {
+  const jsonError = { something: 'something', error: 'Error message' };
+  const jsonErrorString = JSON.stringify(jsonError);
+
+  const errorObj = await getClientErrorObject(new Response(jsonErrorString));
+  expect(errorObj).toMatchObject(jsonError);
+});
+
+test('Handles backwards compatibility between old error messages and the new SIP-40 errors format', async () => {
+  const jsonError = {
+    errors: [
+      {
+        error_type: ErrorTypeEnum.GENERIC_DB_ENGINE_ERROR,
+        extra: { engine: 'presto', link: 'https://www.google.com' },
+        level: 'error',
+        message: 'presto error: test error',
+      },
+    ],
+  };
+  const jsonErrorString = JSON.stringify(jsonError);
+
+  const errorObj = await getClientErrorObject(new Response(jsonErrorString));
+  expect(errorObj.error).toEqual(jsonError.errors[0].message);
+  expect(errorObj.link).toEqual(jsonError.errors[0].extra.link);
+});
+
+test('Handles Response that can be parsed as text', async () => {
+  const textError = 'Hello I am a text error';
+
+  const errorObj = await getClientErrorObject(
+    new Response(textError, { status: 403, statusText: 'Forbidden' }),
+  );
+  expect(errorObj).toMatchObject({
+    error: 'Forbidden',
+    status: 403,
+    statusText: 'Forbidden',
+  });
+});
+
+test('Handles Response that contains raw html be parsed as text', async () => {
+  const textError = 'Hello I am a text error';
+
+  const errorObj = await getClientErrorObject(new Response(textError));
+  expect(errorObj).toMatchObject({ error: textError });
+});
+
+test('Handles TypeError Response', async () => {
+  const error = new TypeError('Failed to fetch');
+
+  // @ts-expect-error
+  const errorObj = await getClientErrorObject(error);
+  expect(errorObj).toMatchObject({ error: 'Network error' });
+});
+
+test('Handles timeout error', async () => {
+  const errorObj = await getClientErrorObject({
+    timeout: 1000,
+    statusText: 'timeout',
+  });
+  expect(errorObj).toMatchObject({
+    timeout: 1000,
+    statusText: 'timeout',
+    error: 'Request timed out',
+    errors: [
+      {
+        error_type: ErrorTypeEnum.FRONTEND_TIMEOUT_ERROR,
+        extra: {
+          timeout: 1,
+          issue_codes: [
+            {
+              code: 1000,
+              message: 'Issue 1000 - The dataset is too large to query.',
+            },
+            {
+              code: 1001,
+              message: 'Issue 1001 - The database is under an unusual load.',
+            },
+          ],
+        },
+        level: 'error',
+        message: 'Request timed out',
+      },
+    ],
+  });
+});
+
+test('Handles plain text as input', async () => {
+  const error = 'error';
+
+  const errorObj = await getClientErrorObject(error);
+  expect(errorObj).toMatchObject({ error });
+});
+
+test('Handles error with status code', async () => {
+  const status500 = new Response(null, { status: 500 });
+  const status404 = new Response(null, { status: 404 });
+  const status502 = new Response(null, { status: 502 });
+
+  expect(await getClientErrorObject(status500)).toMatchObject({
+    error: 'Server error',
+  });
+  expect(await getClientErrorObject(status404)).toMatchObject({
+    error: 'Not found',
+  });
+  expect(await getClientErrorObject(status502)).toMatchObject({
+    error: 'Bad gateway',
+  });
+});
+
+test('Handles error with status text and message', async () => {
+  const statusText = 'status';
+  const message = 'message';
+
+  // @ts-expect-error
+  expect(await getClientErrorObject({ statusText, message })).toMatchObject({
+    error: statusText,
+  });
+  // @ts-expect-error
+  expect(await getClientErrorObject({ message })).toMatchObject({
+    error: message,
+  });
+  // @ts-expect-error
+  expect(await getClientErrorObject({})).toMatchObject({
+    error: 'An error occurred',
+  });
+});
+
+test('getClientErrorMessage', () => {
+  expect(getClientErrorMessage('error')).toEqual('error');
+  expect(
+    getClientErrorMessage('error', {
+      error: 'client error',
+      message: 'client error message',
+    }),
+  ).toEqual('error:\nclient error message');
+  expect(
+    getClientErrorMessage('error', {
+      error: 'client error',
+    }),
+  ).toEqual('error:\nclient error');
+});
+
+test('parseErrorJson with message', () => {
+  expect(parseErrorJson({ message: 'error message' })).toEqual({
+    message: 'error message',
+    error: 'error message',
+  });
+
+  expect(
+    parseErrorJson({
+      message: {
+        key1: ['error message1', 'error message2'],
+        key2: ['error message3', 'error message4'],
+      },
+    }),
+  ).toEqual({
+    message: {
+      key1: ['error message1', 'error message2'],
+      key2: ['error message3', 'error message4'],
+    },
+    error: 'error message1',
+  });
+
+  expect(
+    parseErrorJson({
+      message: {},
+    }),
+  ).toEqual({
+    message: {},
+    error: 'Invalid input',
+  });
+});
+
+test('parseErrorJson preserves string-valued validation messages', () => {
+  const calculatedColumnError =
+    'Custom SQL fields cannot be parsed as a single SQL statement.';
+
+  expect(
+    parseErrorJson({
+      message: {
+        'columns.0.expression': calculatedColumnError,
+      },
+    }),
+  ).toEqual({
+    message: {
+      'columns.0.expression': calculatedColumnError,
+    },
+    error: calculatedColumnError,
+  });
+});
+
+test('parseErrorJson with HTML message', () => {
+  expect(
+    parseErrorJson({
+      message: '<div>error message</div>',
+    }),
+  ).toEqual({
+    message: '<div>error message</div>',
+    error: 'Unknown error',
+  });
+  expect(
+    parseErrorJson({
+      message: '<div>Server error</div>',
+    }),
+  ).toEqual({
+    message: '<div>Server error</div>',
+    error: 'Server error',
+  });
+});
+
+test('parseErrorJson with HTML message and status code', () => {
+  expect(
+    parseErrorJson({
+      status: 502,
+      message: '<div>error message</div>',
+    }),
+  ).toEqual({
+    status: 502,
+    message: '<div>error message</div>',
+    error: 'Bad gateway',
+  });
+  expect(
+    parseErrorJson({
+      status: 999,
+      message: '<div>Server error</div>',
+    }),
+  ).toEqual({
+    status: 999,
+    message: '<div>Server error</div>',
+    error: 'Server error',
+  });
+});
+
+test('parseErrorJson keeps a server message that only quotes an HTML tag', () => {
+  // A database driver echoes the offending fragment back in its syntax error.
+  // The message is prose, not an HTML error page, so it must survive intact
+  // instead of collapsing into the status-code message.
+  const message =
+    'Error: HTTPDriver received ClickHouse error code 62. DB::Exception: ' +
+    "Syntax error: failed at position 37 ('<') (line 1, col 37): <a> AS " +
+    '`My column_b77020` FROM (select number from numbers(10)) AS ' +
+    '`virtual_table` LIMIT 1000 FORMAT Native.';
+
+  expect(parseErrorJson({ status: 400, message })).toEqual({
+    status: 400,
+    message,
+    error: message,
+  });
+
+  // An actual error page still collapses, even when the server pads it with
+  // leading whitespace.
+  const page = '\n  <!doctype html><title>502 Bad Gateway</title>';
+  expect(parseErrorJson({ status: 502, message: page })).toEqual({
+    status: 502,
+    message: page,
+    error: 'Bad gateway',
+  });
+});
+
+test('parseErrorJson keeps a server message that opens with an unclosed HTML tag', () => {
+  // The tag itself is never closed anywhere in the string, unlike a real
+  // fragment such as `<div>...</div>`, so this isn't an HTML error page —
+  // just a message that happens to start by quoting the offending markup.
+  const message = '<a> is not valid syntax';
+
+  expect(parseErrorJson({ status: 400, message })).toEqual({
+    status: 400,
+    message,
+    error: message,
+  });
+});
+
+test('parseErrorJson keeps a message that starts with < but is not a tag', () => {
+  // No leading tag name to match at all, so this never reaches the
+  // closing-tag check; it must still be treated as plain prose.
+  const message = '<3 is not an HTML tag';
+
+  expect(parseErrorJson({ status: 400, message })).toEqual({
+    status: 400,
+    message,
+    error: message,
+  });
+});
+
+test('parseErrorJson keeps a message that itself parses as JSON', () => {
+  // isJsonString() short-circuits checkForHtml before the tag checks ever
+  // run: a message that happens to parse as JSON on its own is never
+  // treated as an HTML error page, whatever text it contains — otherwise
+  // isProbablyHTML()'s full-string scan would flag the embedded tag below
+  // and incorrectly collapse this into a generic status message.
+  const message = '{"detail": "<div>not actually markup</div>"}';
+
+  expect(parseErrorJson({ status: 400, message })).toEqual({
+    status: 400,
+    message,
+    error: message,
+  });
+});
+
+test('parseErrorJson with stacktrace', () => {
+  expect(
+    parseErrorJson({ error: 'error message', stack: 'stacktrace' }),
+  ).toEqual({
+    error: 'Unexpected error: (no description, click to see stack trace)',
+    stacktrace: 'stacktrace',
+    stack: 'stacktrace',
+  });
+
+  expect(
+    parseErrorJson({
+      error: 'error message',
+      description: 'error description',
+      stack: 'stacktrace',
+    }),
+  ).toEqual({
+    error: 'Unexpected error: error description',
+    stacktrace: 'stacktrace',
+    description: 'error description',
+    stack: 'stacktrace',
+  });
+});
+
+test('parseErrorJson with CSRF', () => {
+  expect(
+    parseErrorJson({
+      responseText: 'CSRF',
+    }),
+  ).toEqual({
+    error: COMMON_ERR_MESSAGES.SESSION_TIMED_OUT,
+    responseText: 'CSRF',
+  });
+});
+
+test('getErrorText', async () => {
+  expect(await getErrorText('error', 'dashboard')).toEqual(
+    'Sorry, there was an error saving this dashboard: error',
+  );
+
+  const error = JSON.stringify({ message: 'Forbidden' });
+  expect(await getErrorText(new Response(error), 'dashboard')).toEqual(
+    'Sorry, there was an error saving this dashboard: Forbidden',
+  );
+  expect(
+    await getErrorText(
+      new Response(JSON.stringify({ status: 'error' })),
+      'dashboard',
+    ),
+  ).toEqual('Sorry, an unknown error occurred.');
+});
+
+test('getErrorText for a non-JSON 403 response', async () => {
+  // A 403 originating outside Superset (reverse proxy, WAF, SSO gateway)
+  // carries an HTML or plain-text body instead of the API's JSON
+  // `{"message": "Forbidden"}`. The HTTP status remains authoritative.
+  const proxyForbidden = new Response(
+    '<html><head><title>403 Forbidden</title></head><body>Forbidden</body></html>',
+    {
+      status: 403,
+      statusText: 'Forbidden',
+      headers: { 'Content-Type': 'text/html' },
+    },
+  );
+  expect(await getErrorText(proxyForbidden, 'dashboard')).toEqual(
+    'You do not have permission to edit this dashboard',
+  );
+
+  const supersetForbidden = new Response(
+    JSON.stringify({ message: 'Forbidden' }),
+    { status: 403, statusText: 'FORBIDDEN' },
+  );
+  expect(await getErrorText(supersetForbidden, 'dashboard')).toEqual(
+    'You do not have permission to edit this dashboard',
+  );
+
+  const specificForbidden = new Response(
+    JSON.stringify({ message: "You don't have the rights to create a chart" }),
+    { status: 403, statusText: 'FORBIDDEN' },
+  );
+  expect(await getErrorText(specificForbidden, 'chart')).toEqual(
+    "Sorry, there was an error saving this chart: You don't have the rights to create a chart",
+  );
+});
+
+test('selectClientErrorMessage applies consistent precedence', () => {
+  expect(
+    selectClientErrorMessage({ error: 'Forbidden', status: 403 }, 'Fallback', {
+      403: 'Permission denied',
+    }),
+  ).toBe('Permission denied');
+  expect(selectClientErrorMessage({ error: 'Server detail' }, 'Fallback')).toBe(
+    'Server detail',
+  );
+  expect(
+    selectClientErrorMessage(
+      parseErrorJson({
+        message: { field: ['Normalized validation detail'] },
+      }),
+      'Fallback',
+    ),
+  ).toBe('Normalized validation detail');
+  expect(selectClientErrorMessage({ error: '' }, 'Fallback')).toBe('Fallback');
+});

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -15,154 +14,135 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-import json
 import logging
-from io import IOBase
-from typing import Optional, Union
 
-import backoff
-from flask_babel import gettext as __
-from slack import WebClient
-from slack.errors import SlackApiError, SlackClientError
+from flask import g
+from slack_sdk import WebClient
+from slack_sdk.errors import (
+    BotUserAccessError,
+    SlackClientConfigurationError,
+    SlackClientError,
+    SlackObjectFormationError,
+    SlackRequestError,
+    SlackTokenRotationError,
+)
 
-from superset import app
-from superset.models.reports import ReportRecipientType
+from superset import feature_flag_manager
+from superset.reports.models import ReportRecipientType
 from superset.reports.notifications.base import BaseNotification
-from superset.reports.notifications.exceptions import NotificationError
+from superset.reports.notifications.exceptions import (
+    NotificationAuthorizationException,
+    NotificationMalformedException,
+    NotificationParamException,
+    NotificationUnprocessableException,
+    SlackV1NotificationError,
+)
+from superset.reports.notifications.slack_mixin import SlackMixin
+from superset.reports.notifications.slack_transport import (
+    send_slack_text,
+    send_to_slack_channels,
+)
+from superset.utils.decorators import statsd_gauge
+from superset.utils.slack import (
+    get_slack_client,
+    NO_SLACK_RECIPIENTS_MESSAGE,
+    should_use_v2_api,
+)
 
 logger = logging.getLogger(__name__)
 
-# Slack only allows Markdown messages up to 4k chars
-MAXIMUM_MESSAGE_SIZE = 4000
+SLACK_V1_FILE_UPLOAD_MESSAGE = (
+    "Slack v1 file uploads are no longer supported because Slack retired "
+    "`files.upload`. Enable `ALERT_REPORT_SLACK_V2` and grant the Slack bot "
+    "both the `channels:read` and `groups:read` scopes so the recipient can "
+    "be upgraded to Slack v2."
+)
 
 
-class SlackNotification(BaseNotification):  # pylint: disable=too-few-public-methods
+# Deprecated: Slack v1 will be removed in the next major release. The Slack
+# `files.upload` endpoint was retired in 2025, so file-bearing sends already
+# fail before attempting the retired v1 upload; only text-only
+# `chat_postMessage` sends still work here. When the Slack bot has the
+# `channels:read` and `groups:read` scopes, existing v1 recipients are
+# auto-upgraded to SlackV2 on their first eligible send.
+class SlackNotification(SlackMixin, BaseNotification):  # pylint: disable=too-few-public-methods
     """
     Sends a slack notification for a report recipient
     """
 
     type = ReportRecipientType.SLACK
 
-    def _get_channel(self) -> str:
-        return json.loads(self._recipient.recipient_config_json)["target"]
-
-    def _message_template(self, table: str = "") -> str:
-        return __(
-            """*%(name)s*
-
-%(description)s
-
-<%(url)s|Explore in Superset>
-
-%(table)s
-""",
-            name=self._content.name,
-            description=self._content.description or "",
-            url=self._content.url,
-            table=table,
-        )
-
     @staticmethod
-    def _error_template(name: str, description: str, text: str) -> str:
-        return __(
-            """*%(name)s*
-
-%(description)s
-
-Error: %(text)s
-""",
-            name=name,
-            description=description,
-            text=text,
+    def _send_text(
+        client: WebClient,
+        channels: list[str],
+        body: str,
+        retry_deadline: float | None = None,
+    ) -> None:
+        """Send a text notification once to each configured channel."""
+        if not channels:
+            raise NotificationParamException(NO_SLACK_RECIPIENTS_MESSAGE)
+        send_to_slack_channels(
+            channels,
+            lambda target, retry_deadline: send_slack_text(
+                client,
+                target,
+                body,
+                retry_deadline=retry_deadline,
+            ),
+            retry_deadline=retry_deadline,
         )
 
-    def _get_body(self) -> str:
-        if self._content.text:
-            return self._error_template(
-                self._content.name, self._content.description or "", self._content.text
-            )
+    def _send_legacy_text(self) -> None:
+        if self._content.has_attachments:
+            raise NotificationParamException(SLACK_V1_FILE_UPLOAD_MESSAGE)
 
-        if self._content.embedded_data is None:
-            return self._message_template()
-
-        # Embed data in the message
-        df = self._content.embedded_data
-
-        # Flatten columns/index so they show up nicely in the table
-        df.columns = [
-            " ".join(str(name) for name in column).strip()
-            if isinstance(column, tuple)
-            else column
-            for column in df.columns
-        ]
-        df.index = [
-            " ".join(str(name) for name in index).strip()
-            if isinstance(index, tuple)
-            else index
-            for index in df.index
-        ]
-
-        # Slack Markdown only works on messages shorter than 4k chars, so we might
-        # need to truncate the data
-        for i in range(len(df) - 1):
-            truncated_df = df[: i + 1].fillna("")
-            truncated_df = truncated_df.append(
-                {k: "..." for k in df.columns}, ignore_index=True
-            )
-            tabulated = df.to_markdown()
-            table = f"```\n{tabulated}\n```\n\n(table was truncated)"
-            message = self._message_template(table)
-            if len(message) > MAXIMUM_MESSAGE_SIZE:
-                # Decrement i and build a message that is under the limit
-                truncated_df = df[:i].fillna("")
-                truncated_df = truncated_df.append(
-                    {k: "..." for k in df.columns}, ignore_index=True
-                )
-                tabulated = df.to_markdown()
-                table = (
-                    f"```\n{tabulated}\n```\n\n(table was truncated)"
-                    if len(truncated_df) > 0
-                    else ""
-                )
-                break
-
-        # Send full data
-        else:
-            tabulated = df.to_markdown()
-            table = f"```\n{tabulated}\n```"
-
-        return self._message_template(table)
-
-    def _get_inline_file(self) -> Optional[Union[str, IOBase, bytes]]:
-        if self._content.csv:
-            return self._content.csv
-        if self._content.screenshot:
-            return self._content.screenshot
-        return None
-
-    @backoff.on_exception(backoff.expo, SlackApiError, factor=10, base=2, max_tries=5)
-    def send(self) -> None:
-        file = self._get_inline_file()
-        title = self._content.name
-        channel = self._get_channel()
-        body = self._get_body()
-        file_type = "csv" if self._content.csv else "png"
+        body = self._get_body(content=self._content)
+        global_logs_context = getattr(g, "logs_context", {}) or {}
         try:
-            token = app.config["SLACK_API_TOKEN"]
-            if callable(token):
-                token = token()
-            client = WebClient(token=token, proxy=app.config["SLACK_PROXY"])
-            # files_upload returns SlackResponse as we run it in sync mode.
-            if file:
-                client.files_upload(
-                    channels=channel,
-                    file=file,
-                    initial_comment=body,
-                    title=title,
-                    filetype=file_type,
-                )
-            else:
-                client.chat_postMessage(channel=channel, text=body)
-            logger.info("Report sent to slack")
+            client = get_slack_client(for_delivery=True)
+            channels = self._get_channels()
+            self._send_text(
+                client,
+                channels,
+                body,
+                retry_deadline=self._content.slack_retry_deadline,
+            )
+            logger.info(
+                "Report sent to slack",
+                extra={
+                    "execution_id": global_logs_context.get("execution_id"),
+                },
+            )
+        except (
+            BotUserAccessError,
+            SlackRequestError,
+            SlackClientConfigurationError,
+        ) as ex:
+            raise NotificationParamException(str(ex)) from ex
+        except SlackObjectFormationError as ex:
+            raise NotificationMalformedException(str(ex)) from ex
+        except SlackTokenRotationError as ex:
+            raise NotificationAuthorizationException(str(ex)) from ex
         except SlackClientError as ex:
-            raise NotificationError(ex) from ex
+            # SlackClientError is the base class; keep it last so subclasses
+            # retain their more specific notification classification.
+            raise NotificationUnprocessableException(str(ex)) from ex
+
+    @statsd_gauge("reports.slack.send")
+    def send_legacy_text(self) -> None:
+        """Send through Slack v1 without repeating the v2 availability probe."""
+        self._send_legacy_text()
+
+    @statsd_gauge(
+        "reports.slack.send",
+        ignored_exceptions=(SlackV1NotificationError,),
+    )
+    def send(self) -> None:
+        if should_use_v2_api(raise_on_error=self._content.has_attachments):
+            raise SlackV1NotificationError
+        if feature_flag_manager.is_feature_enabled("ALERT_REPORT_SLACK_V2"):
+            # A text-only probe can fail transiently. Still enter the coordinator
+            # so a successful legacy fallback records its warning and metric.
+            raise SlackV1NotificationError
+        self._send_legacy_text()

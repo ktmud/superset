@@ -16,70 +16,108 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { useSelector } from 'react-redux';
-import { FeatureFlag, isFeatureEnabled } from 'src/featureFlags';
-import { useCallback, useEffect, useState } from 'react';
+import { useSelector, useDispatch } from 'react-redux';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { URL_PARAMS } from 'src/constants';
 import { getUrlParam } from 'src/utils/urlUtils';
 import { RootState } from 'src/dashboard/types';
+import { isFeatureEnabled, FeatureFlag } from '@superset-ui/core';
 import {
   useFilters,
   useNativeFiltersDataMask,
 } from '../nativeFilters/FilterBar/state';
-import { Filter } from '../nativeFilters/types';
+import { useChartCustomizationFromRedux } from '../nativeFilters/state';
+import { toggleNativeFiltersBar } from '../../actions/dashboardState';
 
-// eslint-disable-next-line import/prefer-default-export
-export const useNativeFilters = () => {
+export interface UseNativeFiltersResult {
+  showDashboard: boolean;
+  missingInitialFilters: string[];
+  dashboardFiltersOpen: boolean;
+  toggleDashboardFiltersOpen: (visible?: boolean) => void;
+  nativeFiltersEnabled: boolean;
+  hasFilters: boolean;
+}
+
+export const useNativeFilters = (): UseNativeFiltersResult => {
+  const dispatch = useDispatch();
+
   const [isInitialized, setIsInitialized] = useState(false);
-  const [dashboardFiltersOpen, setDashboardFiltersOpen] = useState(
-    getUrlParam(URL_PARAMS.showFilters) ?? true,
-  );
+
   const showNativeFilters = useSelector<RootState, boolean>(
-    state => state.dashboardInfo.metadata?.show_native_filters,
+    () => getUrlParam(URL_PARAMS.showFilters) ?? true,
   );
   const canEdit = useSelector<RootState, boolean>(
     ({ dashboardInfo }) => dashboardInfo.dash_edit_perm,
   );
+  const dashboardFiltersOpen = useSelector<RootState, boolean>(
+    state => state.dashboardState.nativeFiltersBarOpen ?? false,
+  );
 
   const filters = useFilters();
-  const filterValues = Object.values<Filter>(filters);
+  const filterValues = useMemo(() => Object.values(filters), [filters]);
+  const expandFilters = getUrlParam(URL_PARAMS.expandFilters);
+  const chartCustomizations = useChartCustomizationFromRedux();
 
   const nativeFiltersEnabled =
     showNativeFilters &&
-    isFeatureEnabled(FeatureFlag.DASHBOARD_NATIVE_FILTERS) &&
-    (canEdit || (!canEdit && filterValues.length !== 0));
+    (canEdit ||
+      (!canEdit &&
+        (filterValues.length !== 0 || chartCustomizations.length !== 0)));
 
-  const requiredFirstFilter = filterValues.filter(
-    filter => filter.requiredFirst,
+  const requiredFirstFilter = useMemo(
+    () =>
+      filterValues.filter(
+        filter =>
+          'requiredFirst' in filter &&
+          filter.requiredFirst === true &&
+          filter.filterType !== 'filter_time',
+      ),
+    [filterValues],
   );
   const dataMask = useNativeFiltersDataMask();
+
+  const missingInitialFilters = useMemo(
+    () =>
+      requiredFirstFilter
+        .filter(({ id }) => dataMask[id]?.filterState?.value === undefined)
+        .map(({ name }) => name)
+        .filter((name): name is string => name !== undefined),
+    [requiredFirstFilter, dataMask],
+  );
+
   const showDashboard =
     isInitialized ||
     !nativeFiltersEnabled ||
-    !(
-      nativeFiltersEnabled &&
-      requiredFirstFilter.length &&
-      requiredFirstFilter.find(
-        ({ id }) => dataMask[id]?.filterState?.value === undefined,
-      )
-    );
+    missingInitialFilters.length === 0;
 
   const toggleDashboardFiltersOpen = useCallback(
     (visible?: boolean) => {
-      setDashboardFiltersOpen(visible ?? !dashboardFiltersOpen);
+      const newState = visible ?? !dashboardFiltersOpen;
+      dispatch(toggleNativeFiltersBar(newState));
     },
-    [dashboardFiltersOpen],
+    [dispatch, dashboardFiltersOpen],
   );
 
   useEffect(() => {
     if (
-      filterValues.length === 0 &&
-      dashboardFiltersOpen &&
-      nativeFiltersEnabled
+      (isFeatureEnabled(FeatureFlag.FilterBarClosedByDefault) &&
+        expandFilters === null) ||
+      expandFilters === false ||
+      (filterValues.length === 0 &&
+        chartCustomizations.length === 0 &&
+        nativeFiltersEnabled)
     ) {
-      toggleDashboardFiltersOpen(false);
+      dispatch(toggleNativeFiltersBar(false));
+    } else {
+      dispatch(toggleNativeFiltersBar(true));
     }
-  }, [filterValues.length]);
+  }, [
+    dispatch,
+    filterValues.length,
+    chartCustomizations.length,
+    expandFilters,
+    nativeFiltersEnabled,
+  ]);
 
   useEffect(() => {
     if (showDashboard) {
@@ -89,8 +127,10 @@ export const useNativeFilters = () => {
 
   return {
     showDashboard,
+    missingInitialFilters,
     dashboardFiltersOpen,
     toggleDashboardFiltersOpen,
     nativeFiltersEnabled,
+    hasFilters: filterValues.length > 0 || chartCustomizations.length > 0,
   };
 };

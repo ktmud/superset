@@ -1,6 +1,6 @@
-/* eslint-disable import/prefer-default-export */
-import { DatasourceType } from '@superset-ui/core';
+import { DatasourceType, NativeFilterScope } from '@superset-ui/core';
 import { Datasource } from 'src/dashboard/types';
+import { DASHBOARD_ROOT_ID } from './util/constants';
 /**
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
@@ -28,8 +28,45 @@ export const PLACEHOLDER_DATASOURCE: Datasource = {
   columns: [],
   column_types: [],
   metrics: [],
-  column_format: {},
+  column_formats: {},
   verbose_map: {},
   main_dttm_col: '',
   description: '',
 };
+
+export const MAIN_HEADER_HEIGHT = 53;
+export const CLOSED_FILTER_BAR_WIDTH = 32;
+export const OPEN_FILTER_BAR_WIDTH = 260;
+export const OPEN_FILTER_BAR_MAX_WIDTH = 550;
+export const FILTER_BAR_HEADER_HEIGHT = 80;
+export const FILTER_BAR_TABS_HEIGHT = 46;
+export const BUILDER_SIDEPANEL_WIDTH = 374;
+export const OVERWRITE_INSPECT_FIELDS = ['css', 'json_metadata.filter_scopes'];
+export const EMPTY_CONTAINER_Z_INDEX = 10;
+// A grid component's hover menu floats outside the component's own box, so it
+// must paint above the drop targets it overlaps.
+export const HOVER_MENU_Z_INDEX = EMPTY_CONTAINER_Z_INDEX + 1;
+// A hover menu rendered above a column overlaps the bottom edge of whatever
+// sits above it, so resize handles have to win hit testing against it.
+export const RESIZE_HANDLE_Z_INDEX = HOVER_MENU_Z_INDEX + 1;
+
+export const DEFAULT_CROSS_FILTER_SCOPING: NativeFilterScope = {
+  rootPath: [DASHBOARD_ROOT_ID],
+  excluded: [],
+};
+
+export const CHART_WIDTH = 4;
+export const CHART_HEIGHT = 50;
+
+/**
+ * Window events used to coordinate dashboard virtualization when capturing the
+ * dashboard for a client-side export (Download as Image/PDF).
+ *
+ * When DASHBOARD_VIRTUALIZATION is enabled, charts more than a viewport away
+ * are unmounted, so a naive DOM capture records loading spinners instead of the
+ * charts. The export utilities dispatch FORCE_IN_VIEW_EVENT to make every Row
+ * render its content, wait for the charts to finish loading, capture, then
+ * dispatch RESTORE_VIRTUALIZATION_EVENT to re-enable lazy loading.
+ */
+export const FORCE_IN_VIEW_EVENT = 'superset-force-all-in-view';
+export const RESTORE_VIRTUALIZATION_EVENT = 'superset-restore-virtualization';

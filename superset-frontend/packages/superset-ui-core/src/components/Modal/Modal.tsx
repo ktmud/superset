@@ -1,0 +1,515 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import {
+  isValidElement,
+  cloneElement,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentType,
+  FC,
+} from 'react';
+import { isNil } from 'lodash-es';
+import { t } from '@apache-superset/core/translation';
+import { css, styled, useTheme } from '@apache-superset/core/theme';
+import { Modal as AntdModal, ModalProps as AntdModalProps } from 'antd';
+import { Resizable } from 're-resizable';
+import RawDraggable, {
+  DraggableBounds,
+  DraggableData,
+  DraggableEvent,
+  DraggableProps,
+} from 'react-draggable';
+import { Icons } from '../Icons';
+import { Button } from '../Button';
+import type { ModalProps, StyledModalProps } from './types';
+
+// react-draggable 4.6.0 ships generated types that mark every Draggable prop as
+// required (its LibraryManagedAttributes no longer honors defaultProps), even
+// though the component accepts a Partial<DraggableProps> at runtime. Re-type the
+// component so optional props stay optional, preserving the prior behavior.
+const Draggable = RawDraggable as ComponentType<Partial<DraggableProps>>;
+
+const MODAL_HEADER_HEIGHT = 55;
+const MODAL_MIN_CONTENT_HEIGHT = 54;
+const MODAL_FOOTER_HEIGHT = 65;
+
+const RESIZABLE_MIN_HEIGHT = MODAL_HEADER_HEIGHT + MODAL_MIN_CONTENT_HEIGHT;
+const RESIZABLE_MIN_WIDTH = '380px';
+const RESIZABLE_MAX_HEIGHT = '100vh';
+const RESIZABLE_MAX_WIDTH = '100vw';
+
+export const BaseModal = (props: AntdModalProps) => (
+  // Removes mask animation. Fixed in 4.6.0.
+  // https://github.com/ant-design/ant-design/issues/27192
+  <AntdModal {...props} maskTransitionName="" />
+);
+
+export const StyledModal = styled(BaseModal)<StyledModalProps>`
+  ${({
+    theme,
+    responsive,
+    maxWidth,
+    resizable,
+    height,
+    draggable,
+    hideFooter,
+  }) => {
+    const closeButtonWidth = theme.sizeUnit * 14;
+
+    return css`
+      ${
+        responsive &&
+        css`
+          max-width: ${maxWidth ?? '900px'};
+          padding-left: ${theme.sizeUnit * 3}px;
+          padding-right: ${theme.sizeUnit * 3}px;
+          padding-bottom: 0;
+          top: 0;
+        `
+      }
+
+      .ant-modal-container {
+        background-color: ${theme.colorBgContainer};
+        display: flex;
+        flex-direction: column;
+        max-height: calc(100vh - ${theme.sizeUnit * 8}px);
+        margin-bottom: ${theme.sizeUnit * 4}px;
+        margin-top: ${theme.sizeUnit * 4}px;
+        padding: 0;
+      }
+
+      .ant-modal-header {
+        flex: 0 0 auto;
+        border-radius: ${theme.borderRadius}px ${theme.borderRadius}px 0 0;
+        padding: ${theme.sizeUnit * 4}px ${closeButtonWidth}px
+          ${theme.sizeUnit * 4}px ${theme.sizeUnit * 4}px;
+
+        .ant-modal-title {
+          font-weight: ${theme.fontWeightStrong};
+        }
+
+        .ant-modal-title h4 {
+          display: flex;
+          margin: 0;
+          align-items: center;
+        }
+      }
+
+      .ant-modal-close {
+        width: ${closeButtonWidth}px;
+        height: ${theme.sizeUnit * 14}px;
+        padding: ${theme.sizeUnit * 6}px ${theme.sizeUnit * 4}px
+          ${theme.sizeUnit * 4}px;
+        top: 0;
+        right: 0;
+        display: flex;
+        justify-content: center;
+        /* Keep the close button clickable when modal body content uses */
+        /* position: sticky with elevated z-index (e.g. DatabaseModal header). */
+        z-index: ${theme.zIndexPopupBase + 1};
+      }
+
+      .ant-modal-close:hover {
+        background: transparent;
+      }
+
+      .ant-modal-close-x {
+        display: flex;
+        align-items: center;
+        [data-test='close-modal-btn'] {
+          justify-content: center;
+        }
+        .close {
+          flex: 1 1 auto;
+          margin-bottom: ${theme.sizeUnit}px;
+          color: ${theme.colorPrimaryText};
+          font-weight: ${theme.fontWeightLight};
+        }
+      }
+
+      .ant-modal-body {
+        flex: 0 1 auto;
+        padding: ${theme.sizeUnit * 4}px ${theme.sizeUnit * 6}px;
+
+        overflow: auto;
+        ${!resizable && height && `height: ${height};`}
+      }
+
+      .ant-modal-footer {
+        flex: 0 0 1;
+        border-top: ${theme.sizeUnit / 4}px solid ${theme.colorSplit};
+        padding: ${theme.sizeUnit * 4}px;
+        margin-top: 0;
+
+        .btn {
+          font-size: 12px;
+        }
+
+        .btn + .btn {
+          margin-left: ${theme.sizeUnit * 2}px;
+        }
+      }
+
+      &.no-content-padding .ant-modal-body {
+        padding: 0;
+      }
+
+      ${
+        draggable &&
+        css`
+          .ant-modal-header {
+            padding: 0;
+
+            .draggable-trigger {
+              cursor: move;
+              padding: ${theme.sizeUnit * 4}px ${closeButtonWidth}px
+                ${theme.sizeUnit * 4}px ${theme.sizeUnit * 4}px;
+              width: 100%;
+            }
+          }
+        `
+      }
+
+      ${
+        resizable &&
+        css`
+          .resizable {
+            pointer-events: all;
+
+            .resizable-wrapper {
+              height: 100%;
+            }
+
+            .ant-modal-container {
+              height: 100%;
+
+              .ant-modal-body {
+                height: ${
+                  hideFooter
+                    ? `calc(100% - ${MODAL_HEADER_HEIGHT}px)`
+                    : `calc(100% - ${MODAL_HEADER_HEIGHT}px - ${MODAL_FOOTER_HEIGHT}px)`
+                };
+              }
+            }
+          }
+        `
+      }
+    `;
+  }}
+`;
+
+const defaultResizableConfig = (hideFooter: boolean | undefined) => ({
+  maxHeight: RESIZABLE_MAX_HEIGHT,
+  maxWidth: RESIZABLE_MAX_WIDTH,
+  minHeight: hideFooter
+    ? RESIZABLE_MIN_HEIGHT
+    : RESIZABLE_MIN_HEIGHT + MODAL_FOOTER_HEIGHT,
+  minWidth: RESIZABLE_MIN_WIDTH,
+  enable: {
+    bottom: true,
+    bottomLeft: false,
+    bottomRight: true,
+    left: false,
+    top: false,
+    topLeft: false,
+    topRight: false,
+    right: true,
+  },
+});
+
+/** Merge caller overrides without dropping default resize-handle guards. */
+export function mergeResizableConfig(
+  hideFooter: boolean | undefined,
+  overrides: ModalProps['resizableConfig'] = {},
+): NonNullable<ModalProps['resizableConfig']> {
+  const defaults = defaultResizableConfig(hideFooter);
+  if (!overrides || Object.keys(overrides).length === 0) {
+    return defaults;
+  }
+  const { enable: enableOverride, ...restOverrides } = overrides;
+  return {
+    ...defaults,
+    ...restOverrides,
+    enable:
+      enableOverride === false
+        ? false
+        : {
+            ...defaults.enable,
+            ...(typeof enableOverride === 'object' ? enableOverride : {}),
+          },
+  };
+}
+
+const CustomModal = ({
+  children,
+  disablePrimaryButton = false,
+  primaryTooltipMessage,
+  primaryButtonLoading = false,
+  onHide,
+  onHandledPrimaryAction,
+  primaryButtonName = t('OK'),
+  primaryButtonStyle = 'primary',
+  show,
+  name,
+  title,
+  width,
+  maxWidth,
+  responsive = false,
+  centered,
+  footer,
+  hideFooter,
+  wrapProps,
+  draggable = false,
+  resizable = false,
+  resizableConfig = defaultResizableConfig(hideFooter),
+  draggableConfig,
+  destroyOnHidden,
+  openerRef,
+  bodyStyle,
+  styles: stylesProp,
+  ...rest
+}: ModalProps) => {
+  // Convert deprecated bodyStyle to styles.body
+  const styles = useMemo(
+    () => (bodyStyle ? { ...stylesProp, body: bodyStyle } : stylesProp),
+    [bodyStyle, stylesProp],
+  );
+  const draggableRef = useRef<HTMLDivElement>(null);
+  // Modal position at the start of a resize gesture; see onResize below.
+  const resizeBasePositionRef = useRef<{ x: number; y: number } | null>(null);
+  // Viewport bounds captured at resize start; see onResize below.
+  const resizeBoundsRef = useRef<DraggableBounds>({});
+  const [bounds, setBounds] = useState<DraggableBounds>({});
+  // Controlled position for react-draggable. Keeping Draggable in controlled
+  // mode lets us sync position with re-resizable's onResize so that resizing
+  // from top/left edges correctly repositions the modal (anchoring the
+  // opposite corner) instead of fighting over position.
+  const [position, setPosition] = useState({ x: 0, y: 0 });
+
+  // Reset drag position when modal closes so it doesn't retain the
+  // previous offset on next open.
+  useEffect(() => {
+    if (!show) {
+      setPosition({ x: 0, y: 0 });
+    }
+  }, [show]);
+
+  const theme = useTheme();
+
+  const handleOnHide = () => {
+    openerRef?.current?.focus();
+    onHide();
+  };
+
+  let FooterComponent;
+
+  // This safely avoids injecting "closeModal" into native elements like <div> or <span>
+  if (isValidElement(footer) && typeof footer.type === 'function')
+    // If a footer component is provided inject a closeModal function
+    // so the footer can provide a "close" button if desired
+    FooterComponent = cloneElement(footer, {
+      closeModal: handleOnHide,
+    } as Partial<unknown>);
+  else FooterComponent = footer;
+
+  const modalFooter = isNil(FooterComponent)
+    ? [
+        <Button
+          key="back"
+          cta
+          data-test="modal-cancel-button"
+          buttonStyle="secondary"
+          onClick={handleOnHide}
+        >
+          {t('Cancel')}
+        </Button>,
+        <Button
+          key="submit"
+          buttonStyle={primaryButtonStyle}
+          disabled={disablePrimaryButton}
+          tooltip={primaryTooltipMessage}
+          loading={primaryButtonLoading}
+          onClick={onHandledPrimaryAction}
+          cta
+          data-test="modal-confirm-button"
+        >
+          {primaryButtonName}
+        </Button>,
+      ]
+    : FooterComponent;
+
+  const modalWidth = width || (responsive ? '100vw' : '600px');
+  const shouldShowMask = !(resizable || draggable);
+
+  // Computes DraggableBounds confining the modal to the viewport, expressed
+  // relative to the wrapper's current position (x, y). Shared by drag and
+  // resize so both gestures respect the same on-screen limits.
+  const getViewportBounds = (x: number, y: number): DraggableBounds => {
+    const { clientWidth, clientHeight } = document.documentElement;
+    const targetRect = draggableRef?.current?.getBoundingClientRect();
+
+    if (!targetRect) {
+      return {};
+    }
+
+    return {
+      left: -targetRect.left + x,
+      right: clientWidth - (targetRect.right - x),
+      top: -targetRect.top + y,
+      bottom: clientHeight - (targetRect.bottom - y),
+    };
+  };
+
+  const onDragStart = (_: DraggableEvent, uiData: DraggableData) => {
+    setBounds(getViewportBounds(uiData?.x ?? 0, uiData?.y ?? 0));
+  };
+
+  const getResizableConfig = useMemo(
+    () => mergeResizableConfig(hideFooter, resizableConfig),
+    [hideFooter, resizableConfig],
+  );
+
+  const ModalTitle = () =>
+    draggable ? <div className="draggable-trigger">{title}</div> : <>{title}</>;
+
+  return (
+    <StyledModal
+      centered={!!centered}
+      onOk={onHandledPrimaryAction}
+      onCancel={handleOnHide}
+      width={modalWidth}
+      maxWidth={maxWidth}
+      responsive={responsive}
+      open={show}
+      title={<ModalTitle />}
+      closeIcon={
+        <Icons.CloseOutlined
+          iconColor={theme.colorText}
+          iconSize="l"
+          data-test="close-modal-btn"
+          className="close"
+          aria-hidden="true"
+        />
+      }
+      footer={!hideFooter ? modalFooter : null}
+      hideFooter={hideFooter}
+      wrapProps={{ 'data-test': `${name || 'antd'}-modal`, ...wrapProps }}
+      modalRender={modal =>
+        resizable || draggable ? (
+          <Draggable
+            bounds={bounds ?? false}
+            onStart={(event, uiData) => onDragStart(event, uiData)}
+            {...draggableConfig}
+            // `disabled` and `handle` are applied after the spread so callers
+            // can't use `draggableConfig` to re-enable dragging on a
+            // non-draggable modal or move the drag handle off the title bar.
+            // A caller opting a draggable modal out via
+            // `draggableConfig.disabled` is still honored.
+            disabled={!draggable || !!draggableConfig?.disabled}
+            handle={draggable ? '.draggable-trigger' : undefined}
+            // Controlled position and its drag sync are applied after the
+            // spread too: the resize anchoring below depends on owning both.
+            position={position}
+            onDrag={(_, data) => setPosition({ x: data.x, y: data.y })}
+            // Pass nodeRef so react-draggable does not fall back to
+            // ReactDOM.findDOMNode (deprecated in React 18+ Strict Mode).
+            nodeRef={draggableRef}
+          >
+            {resizable ? (
+              <Resizable
+                className="resizable"
+                {...getResizableConfig}
+                onResizeStart={() => {
+                  resizeBasePositionRef.current = position;
+                  // Capture bounds here: react-draggable only clamps during
+                  // drag gestures, so onResize must clamp its own setPosition
+                  // calls or a large resize from the top/left could push the
+                  // modal off-screen with no way to drag it back (e.g. on a
+                  // resizable modal with draggable disabled).
+                  resizeBoundsRef.current = getViewportBounds(
+                    position.x,
+                    position.y,
+                  );
+                }}
+                onResize={(_e, direction, _ref, delta) => {
+                  // When resizing from the top or left, the opposite corner
+                  // should stay anchored. re-resizable adjusts size but
+                  // cannot move the Draggable wrapper, so we sync position.
+                  // delta is cumulative from gesture start, so the target
+                  // position must be derived from the position captured at
+                  // resize start, not accumulated per event. Direction
+                  // strings are camelCase ("topLeft"), so match
+                  // case-insensitively.
+                  const base = resizeBasePositionRef.current ?? position;
+                  const dir = direction.toLowerCase();
+                  const {
+                    left = -Infinity,
+                    right = Infinity,
+                    top = -Infinity,
+                    bottom = Infinity,
+                  } = resizeBoundsRef.current;
+                  setPosition(prev => ({
+                    // Only the axis matching the resized edge moves; clamp it
+                    // so the modal cannot be pushed outside the viewport.
+                    x: dir.includes('left')
+                      ? Math.min(Math.max(base.x - delta.width, left), right)
+                      : prev.x,
+                    y: dir.includes('top')
+                      ? Math.min(Math.max(base.y - delta.height, top), bottom)
+                      : prev.y,
+                  }));
+                }}
+              >
+                <div className="resizable-wrapper" ref={draggableRef}>
+                  {modal}
+                </div>
+              </Resizable>
+            ) : (
+              <div ref={draggableRef}>{modal}</div>
+            )}
+          </Draggable>
+        ) : (
+          modal
+        )
+      }
+      mask={shouldShowMask}
+      draggable={draggable}
+      resizable={resizable}
+      destroyOnHidden={destroyOnHidden}
+      styles={styles}
+      {...rest}
+    >
+      {children}
+    </StyledModal>
+  );
+};
+CustomModal.displayName = 'Modal';
+
+// The explicit type keeps the non-exported CustomModal out of the package's
+// declaration output, which TypeScript 7 rejects (TS4082).
+export const Modal: FC<ModalProps> &
+  Pick<typeof AntdModal, 'error' | 'warning' | 'confirm' | 'useModal'> =
+  Object.assign(CustomModal, {
+    error: AntdModal.error,
+    warning: AntdModal.warning,
+    confirm: AntdModal.confirm,
+    useModal: AntdModal.useModal,
+  });

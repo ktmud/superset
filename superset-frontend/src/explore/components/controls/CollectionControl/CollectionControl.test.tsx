@@ -16,13 +16,11 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import userEvent from '@testing-library/user-event';
-import React from 'react';
-import { render, screen } from 'spec/helpers/testing-library';
+import { render, screen, userEvent } from 'spec/helpers/testing-library';
 import CollectionControl from '.';
 
 jest.mock('@superset-ui/chart-controls', () => ({
-  InfoTooltipWithTrigger: (props: any) => (
+  InfoTooltip: (props: any) => (
     <button
       onClick={props.onClick}
       type="button"
@@ -85,50 +83,73 @@ const createProps = () => ({
   value: [{ key: 'hrYAZ5iBH' }],
 });
 
-test('Should render', () => {
+test('Should render', async () => {
   const props = createProps();
   render(<CollectionControl {...props} />);
-  expect(screen.getByTestId('CollectionControl')).toBeInTheDocument();
+  expect(await screen.findByTestId('CollectionControl')).toBeInTheDocument();
 });
 
-test('Should show the button with the label', () => {
+test('Should show the noninteractive label as plain text', async () => {
   const props = createProps();
   render(<CollectionControl {...props} />);
-  expect(screen.getByRole('button', { name: props.label })).toBeInTheDocument();
-  expect(screen.getByRole('button', { name: props.label })).toHaveTextContent(
-    props.label,
-  );
+  const label = await screen.findByText(props.label);
+  expect(label).toBeVisible();
+  expect(label).not.toHaveAttribute('role');
+  expect(label).not.toHaveAttribute('tabindex');
+  expect(label).not.toHaveAttribute('aria-disabled');
+  expect(
+    screen.queryByRole('button', { name: props.label }),
+  ).not.toBeInTheDocument();
 });
 
-test('Should have add button', () => {
+test('Should have add button', async () => {
   const props = createProps();
   render(<CollectionControl {...props} />);
 
-  expect(props.onChange).toBeCalledTimes(0);
-  userEvent.click(screen.getByRole('button', { name: 'plus-large' }));
-  expect(props.onChange).toBeCalledWith([{ key: 'hrYAZ5iBH' }, undefined]);
+  expect(
+    await screen.findByRole('button', { name: 'plus' }),
+  ).toBeInTheDocument();
+  expect(props.onChange).toHaveBeenCalledTimes(0);
+  await userEvent.click(screen.getByRole('button', { name: 'plus' }));
+  expect(props.onChange).toHaveBeenCalledWith([
+    { key: 'hrYAZ5iBH' },
+    undefined,
+  ]);
 });
 
-test('Should have remove button', () => {
+test('Should have remove button', async () => {
   const props = createProps();
   render(<CollectionControl {...props} />);
 
-  expect(props.onChange).toBeCalledTimes(0);
-  userEvent.click(screen.getByRole('button', { name: 'remove-item' }));
-  expect(props.onChange).toBeCalledWith([]);
+  const removeButton = await screen.findByRole('img', { name: 'close' });
+  expect(removeButton).toBeInTheDocument();
+  expect(props.onChange).toHaveBeenCalledTimes(0);
+  const buttonElement = removeButton.closest('button');
+  expect(buttonElement).not.toBeNull();
+  await userEvent.click(buttonElement!);
+  expect(props.onChange).toHaveBeenCalledWith([]);
 });
 
-test('Should have SortableDragger icon', () => {
+test('Should have SortableDragger icon', async () => {
   const props = createProps();
   render(<CollectionControl {...props} />);
-  expect(screen.getByLabelText('drag')).toBeVisible();
+  expect(await screen.findByLabelText('Drag to reorder')).toBeVisible();
 });
 
-test('Should call Control component', () => {
+test('Drag activator exposes aria-label="Drag to reorder"', async () => {
+  const props = createProps();
+  render(<CollectionControl {...props} />);
+  const dragActivator = await screen.findByLabelText('Drag to reorder');
+  expect(dragActivator).toHaveAttribute('aria-label', 'Drag to reorder');
+  expect(dragActivator.tagName).toBe('BUTTON');
+});
+
+test('Should call Control component', async () => {
   const props = createProps();
   render(<CollectionControl {...props} />);
 
-  expect(props.onChange).toBeCalledTimes(0);
-  userEvent.click(screen.getByTestId('TestControl'));
-  expect(props.onChange).toBeCalledWith([{ key: 'hrYAZ5iBH' }]);
+  expect(await screen.findByTestId('TestControl')).toBeInTheDocument();
+  expect(props.onChange).toHaveBeenCalledTimes(0);
+  await userEvent.click(screen.getByTestId('TestControl'));
+  expect(props.onChange).toHaveBeenCalledWith([{ key: 'hrYAZ5iBH' }]);
 });

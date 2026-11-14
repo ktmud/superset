@@ -17,20 +17,22 @@
  * under the License.
  */
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { nanoid } from 'nanoid';
+import { t, tn } from '@apache-superset/core/translation';
 import {
   ensureIsArray,
-  FeatureFlag,
-  GenericDataType,
-  isFeatureEnabled,
+  isAdhocMetricSimple,
+  isSavedMetric,
   Metric,
   QueryFormMetric,
-  tn,
 } from '@superset-ui/core';
+import { GenericDataType } from '@apache-superset/core/common';
+import { arrayMove } from '@dnd-kit/sortable';
 import { ColumnMeta } from '@superset-ui/chart-controls';
-import { isEqual } from 'lodash';
-import { usePrevious } from 'src/common/hooks/usePrevious';
-import AdhocMetric from 'src/explore/components/controls/MetricControl/AdhocMetric';
+import AdhocMetric, {
+  dedupeAdhocMetricOptionName,
+} from 'src/explore/components/controls/MetricControl/AdhocMetric';
 import AdhocMetricPopoverTrigger from 'src/explore/components/controls/MetricControl/AdhocMetricPopoverTrigger';
 import MetricDefinitionValue from 'src/explore/components/controls/MetricControl/MetricDefinitionValue';
 import {
@@ -41,28 +43,123 @@ import { DndItemType } from 'src/explore/components/DndItemType';
 import DndSelectLabel from 'src/explore/components/controls/DndColumnSelectControl/DndSelectLabel';
 import { savedMetricType } from 'src/explore/components/controls/MetricControl/types';
 import { AGGREGATES } from 'src/explore/constants';
+import { datasetLabelLower } from 'src/features/semanticLayers/label';
 
 const EMPTY_OBJECT = {};
-const DND_ACCEPTED_TYPES = [DndItemType.Column, DndItemType.Metric];
+const DND_ACCEPTED_TYPES = [
+  DndItemType.Column,
+  DndItemType.Metric,
+  DndItemType.Folder,
+];
 
-const isDictionaryForAdhocMetric = (value: any) =>
-  value && !(value instanceof AdhocMetric) && value.expressionType;
+// Types that get a sensible default aggregation. MultiValue and unknown/
+// untyped columns are deliberately excluded.
+const COUNT_DISTINCT_ELIGIBLE_TYPES = [
+  GenericDataType.String,
+  GenericDataType.Boolean,
+  GenericDataType.Temporal,
+];
 
-const coerceAdhocMetrics = (value: any) => {
-  if (!value) {
+export const isColumnSupportedForMetricAggregation = (
+  column: ColumnMeta,
+): boolean =>
+  column.type_generic === GenericDataType.Numeric ||
+  COUNT_DISTINCT_ELIGIBLE_TYPES.includes(
+    column.type_generic as GenericDataType,
+  );
+
+/**
+ * Build an adhoc metric from a dropped column, picking a sensible default
+ * aggregation from the column's data type: SUM for numeric columns,
+ * COUNT_DISTINCT for string/boolean/temporal ones. Columns outside these
+ * explicit supported types (e.g. MultiValue, untyped) are left without a
+ * default aggregate.
+ */
+export const createAdhocMetricFromColumn = (
+  column: ColumnMeta,
+): AdhocMetric => {
+  // Cast config to handle ColumnMeta/ColumnType mismatch
+  const config = {
+    column,
+  } as Partial<AdhocMetric>;
+  if (column.type_generic === GenericDataType.Numeric) {
+    config.aggregate = AGGREGATES.SUM;
+  } else if (
+    COUNT_DISTINCT_ELIGIBLE_TYPES.includes(
+      column.type_generic as GenericDataType,
+    )
+  ) {
+    config.aggregate = AGGREGATES.COUNT_DISTINCT;
+  }
+  return new AdhocMetric(config);
+};
+
+const isDictionaryForAdhocMetric = (value: QueryFormMetric) =>
+  value &&
+  !(value instanceof AdhocMetric) &&
+  typeof value !== 'string' &&
+  value.expressionType;
+
+export const coerceMetrics = (
+  addedMetrics: QueryFormMetric | QueryFormMetric[] | undefined | null,
+  savedMetrics: Metric[],
+  columns: ColumnMeta[],
+) => {
+  if (!addedMetrics) {
     return [];
   }
-  if (!Array.isArray(value)) {
-    if (isDictionaryForAdhocMetric(value)) {
-      return [new AdhocMetric(value)];
+  const metricsCompatibleWithDataset = ensureIsArray(addedMetrics).filter(
+    metric => {
+      if (isAdhocMetricSimple(metric)) {
+        return columns.some(
+          column => column.column_name === metric.column.column_name,
+        );
+      }
+      return true;
+    },
+  );
+
+  // Metrics are identified by optionName when editing; regenerate any that
+  // collide so each keeps a unique identity (see dedupeAdhocMetricOptionName).
+  const seenOptionNames = new Set<string>();
+
+  return metricsCompatibleWithDataset.map(metric => {
+    if (
+      isSavedMetric(metric) &&
+      !savedMetrics.some(savedMetric => savedMetric.metric_name === metric)
+    ) {
+      return {
+        metric_name: metric,
+        error_text: t(
+          'This metric might be incompatible with current %s',
+          datasetLabelLower(),
+        ),
+        uuid: nanoid(),
+      };
     }
-    return [value];
-  }
-  return value.map(val => {
-    if (isDictionaryForAdhocMetric(val)) {
-      return new AdhocMetric(val);
+    if (!isDictionaryForAdhocMetric(metric)) {
+      return metric;
     }
-    return val;
+    if (isAdhocMetricSimple(metric)) {
+      const column = columns.find(
+        col => col.column_name === metric.column.column_name,
+      );
+      if (column) {
+        // Cast entire config object to handle type mismatch between @superset-ui/core and local types
+        return dedupeAdhocMetricOptionName(
+          new AdhocMetric({
+            ...(metric as unknown as Record<string, unknown>),
+            column,
+          } as Record<string, unknown>),
+          seenOptionNames,
+        );
+      }
+    }
+    // Cast to unknown first to handle type mismatch between @superset-ui/core and local AdhocMetric
+    return dedupeAdhocMetricOptionName(
+      new AdhocMetric(metric as unknown as Record<string, unknown>),
+      seenOptionNames,
+    );
   });
 };
 
@@ -80,55 +177,51 @@ const getOptionsForSavedMetrics = (
 
 type ValueType = Metric | AdhocMetric | QueryFormMetric;
 
-// TODO: use typeguards to distinguish saved metrics from adhoc metrics
-const getMetricsMatchingCurrentDataset = (
-  values: ValueType[],
-  columns: ColumnMeta[],
-  savedMetrics: (savedMetricType | Metric)[],
-  prevColumns: ColumnMeta[],
-  prevSavedMetrics: (savedMetricType | Metric)[],
-) => {
-  const areSavedMetricsEqual =
-    !prevSavedMetrics || isEqual(prevSavedMetrics, savedMetrics);
-  const areColsEqual = !prevColumns || isEqual(prevColumns, columns);
+const DndMetricSelect = (props: any) => {
+  const { onChange, multi, datasource, savedMetrics } = props;
 
-  if (areColsEqual && areSavedMetricsEqual) {
-    return values;
-  }
-  return values.reduce((acc: ValueType[], metric) => {
-    if (
-      (typeof metric === 'string' || (metric as Metric).metric_name) &&
-      (areSavedMetricsEqual ||
-        savedMetrics?.some(
-          savedMetric =>
-            savedMetric.metric_name === metric ||
-            savedMetric.metric_name === (metric as Metric).metric_name,
-        ))
-    ) {
-      acc.push(metric);
-      return acc;
+  const extra = useMemo<{ disallow_adhoc_metrics?: boolean }>(() => {
+    let extra = {};
+    if (datasource?.extra) {
+      try {
+        extra = JSON.parse(datasource.extra);
+      } catch {} // eslint-disable-line no-empty
     }
+    return extra;
+  }, [datasource?.extra]);
 
-    if (!areColsEqual) {
-      const newCol = columns?.find(
-        column =>
-          (metric as AdhocMetric).column?.column_name === column.column_name,
-      );
-      if (newCol) {
-        acc.push({ ...(metric as AdhocMetric), column: newCol });
-      }
-    } else {
-      acc.push(metric);
+  // Semantic views do not support arbitrary SQL expressions as metrics.
+  const disallowAdhocMetrics =
+    extra.disallow_adhoc_metrics || datasource?.type === 'semantic_view';
+
+  // AdhocMetricEditPopover reads `datasource.extra.disallow_adhoc_metrics`
+  // directly, so we need to inject the flag there too — not just in canDrop.
+  const datasourceForPopover = useMemo(() => {
+    if (!disallowAdhocMetrics || !datasource) return datasource;
+    let parsedExtra: Record<string, unknown> = {};
+    if (datasource.extra) {
+      try {
+        parsedExtra = JSON.parse(datasource.extra as string);
+      } catch {} // eslint-disable-line no-empty
     }
-    return acc;
-  }, []);
-};
+    return {
+      ...datasource,
+      extra: JSON.stringify({ ...parsedExtra, disallow_adhoc_metrics: true }),
+    };
+  }, [disallowAdhocMetrics, datasource]);
 
-export const DndMetricSelect = (props: any) => {
-  const { onChange, multi, columns, savedMetrics } = props;
+  const savedMetricSet = useMemo(
+    () =>
+      new Set(
+        (savedMetrics as savedMetricType[]).map(
+          ({ metric_name }) => metric_name,
+        ),
+      ),
+    [savedMetrics],
+  );
 
   const handleChange = useCallback(
-    opts => {
+    (opts: ValueType | ValueType[] | null) => {
       // if clear out options
       if (opts === null) {
         onChange(null);
@@ -139,7 +232,11 @@ export const DndMetricSelect = (props: any) => {
       const optionValues = transformedOpts
         .map(option => {
           // pre-defined metric
-          if (option.metric_name) {
+          if (
+            typeof option === 'object' &&
+            'metric_name' in option &&
+            option.metric_name
+          ) {
             return option.metric_name;
           }
           return option;
@@ -151,47 +248,47 @@ export const DndMetricSelect = (props: any) => {
   );
 
   const [value, setValue] = useState<ValueType[]>(
-    coerceAdhocMetrics(props.value),
+    coerceMetrics(props.value, props.savedMetrics, props.columns),
   );
   const [droppedItem, setDroppedItem] = useState<
     DatasourcePanelDndItem | typeof EMPTY_OBJECT
   >({});
   const [newMetricPopoverVisible, setNewMetricPopoverVisible] = useState(false);
-  const prevColumns = usePrevious(columns);
-  const prevSavedMetrics = usePrevious(savedMetrics);
 
   useEffect(() => {
-    setValue(coerceAdhocMetrics(props.value));
-  }, [JSON.stringify(props.value)]);
-
-  useEffect(() => {
-    // Remove selected custom metrics that do not exist in the dataset anymore
-    // Remove selected adhoc metrics that use columns which do not exist in the dataset anymore
-    // Sync adhoc metrics with dataset columns when they are modified by the user
-    if (!props.value) {
-      return;
-    }
-    const propsValues = ensureIsArray(props.value);
-    const matchingMetrics = getMetricsMatchingCurrentDataset(
-      propsValues,
-      columns,
-      savedMetrics,
-      prevColumns,
-      prevSavedMetrics,
-    );
-
-    if (!isEqual(propsValues, matchingMetrics)) {
-      handleChange(matchingMetrics);
-    }
-  }, [columns, savedMetrics, handleChange]);
+    setValue(coerceMetrics(props.value, props.savedMetrics, props.columns));
+  }, [
+    JSON.stringify(props.value),
+    JSON.stringify(props.savedMetrics),
+    JSON.stringify(props.columns),
+  ]);
 
   const canDrop = useCallback(
     (item: DatasourcePanelDndItem) => {
+      if (
+        disallowAdhocMetrics &&
+        (item.type !== DndItemType.Metric ||
+          !savedMetricSet.has(item.value.metric_name))
+      ) {
+        return false;
+      }
+
       const isMetricAlreadyInValues =
-        item.type === 'metric' ? value.includes(item.value.metric_name) : false;
-      return !isMetricAlreadyInValues;
+        item.type === DndItemType.Metric
+          ? value.includes(item.value.metric_name)
+          : false;
+      const isColumnAlreadyInValues =
+        item.type === DndItemType.Column
+          ? value.some(
+              currentValue =>
+                isAdhocMetricSimple(currentValue) &&
+                currentValue.column?.column_name ===
+                  (item.value as ColumnMeta).column_name,
+            )
+          : false;
+      return !isMetricAlreadyInValues && !isColumnAlreadyInValues;
     },
-    [value],
+    [value, extra, savedMetricSet],
   );
 
   const onNewMetric = useCallback(
@@ -205,7 +302,11 @@ export const DndMetricSelect = (props: any) => {
 
   const onMetricEdit = useCallback(
     (changedMetric: Metric | AdhocMetric, oldMetric: Metric | AdhocMetric) => {
-      if (oldMetric instanceof AdhocMetric && oldMetric.equals(changedMetric)) {
+      if (
+        oldMetric instanceof AdhocMetric &&
+        changedMetric instanceof AdhocMetric &&
+        oldMetric.equals(changedMetric)
+      ) {
         return;
       }
       const newValue = value.map(value => {
@@ -236,21 +337,22 @@ export const DndMetricSelect = (props: any) => {
       const valuesCopy = [...value];
       valuesCopy.splice(index, 1);
       setValue(valuesCopy);
-      onChange(valuesCopy);
+      handleChange(valuesCopy);
     },
-    [onChange, value],
+    [handleChange, value],
   );
 
   const moveLabel = useCallback(
     (dragIndex: number, hoverIndex: number) => {
-      const newValues = [...value];
-      [newValues[hoverIndex], newValues[dragIndex]] = [
-        newValues[dragIndex],
-        newValues[hoverIndex],
-      ];
+      // @dnd-kit fires the reorder once at drag-end with the final indices, so
+      // this must be a full arrayMove, not an adjacent swap. Commit through
+      // handleChange immediately — relying on onDropLabel to persist would
+      // re-commit the stale pre-move value captured in its render closure.
+      const newValues = arrayMove(value, dragIndex, hoverIndex);
       setValue(newValues);
+      handleChange(newValues);
     },
-    [value],
+    [handleChange, value],
   );
 
   const newSavedMetricOptions = useMemo(
@@ -259,7 +361,7 @@ export const DndMetricSelect = (props: any) => {
   );
 
   const getSavedMetricOptionsForMetric = useCallback(
-    index =>
+    (index: number) =>
       getOptionsForSavedMetrics(
         props.savedMetrics,
         props.value,
@@ -268,27 +370,35 @@ export const DndMetricSelect = (props: any) => {
     [props.savedMetrics, props.value],
   );
 
-  const handleDropLabel = useCallback(
-    () => onChange(multi ? value : value[0]),
-    [multi, onChange, value],
-  );
+  // Reorder now commits through moveLabel; keep a no-op so the sortable's drop
+  // hook does not re-commit stale, pre-move values captured in this closure.
+  const handleDropLabel = useCallback(() => {}, []);
 
   const valueRenderer = useCallback(
     (option: ValueType, index: number) => (
       <MetricDefinitionValue
         key={index}
         index={index}
-        option={option}
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        option={option as any}
         onMetricEdit={onMetricEdit}
         onRemoveMetric={onRemoveMetric}
         columns={props.columns}
         savedMetrics={props.savedMetrics}
         savedMetricsOptions={getSavedMetricOptionsForMetric(index)}
-        datasourceType={props.datasourceType}
+        datasource={datasourceForPopover}
         onMoveLabel={moveLabel}
         onDropLabel={handleDropLabel}
         type={`${DndItemType.AdhocMetricOption}_${props.name}_${props.label}`}
         multi={multi}
+        datasourceWarningMessage={
+          option instanceof AdhocMetric && option.datasourceWarning
+            ? t(
+                'This metric might be incompatible with current %s',
+                datasetLabelLower(),
+              )
+            : undefined
+        }
       />
     ),
     [
@@ -299,7 +409,7 @@ export const DndMetricSelect = (props: any) => {
       onMetricEdit,
       onRemoveMetric,
       props.columns,
-      props.datasourceType,
+      props.datasource,
       props.label,
       props.name,
       props.savedMetrics,
@@ -332,6 +442,34 @@ export const DndMetricSelect = (props: any) => {
     [onNewMetric, togglePopover],
   );
 
+  const onDropFolder = useCallback(
+    (items: DatasourcePanelDndItem[]) => {
+      // Items already passed `canDrop`. Saved metrics are added as-is; columns
+      // become adhoc metrics with a default aggregation (no popover, since a
+      // folder can drop many at once). Columns without an explicit supported
+      // type (e.g. MultiValue, untyped) are skipped instead of silently
+      // committing an unsupported COUNT_DISTINCT.
+      const additions = items
+        .filter(
+          item =>
+            item.type === DndItemType.Metric ||
+            isColumnSupportedForMetricAggregation(item.value as ColumnMeta),
+        )
+        .map(item =>
+          item.type === DndItemType.Metric
+            ? (item.value as Metric)
+            : createAdhocMetricFromColumn(item.value as ColumnMeta),
+        );
+      if (additions.length === 0) {
+        return;
+      }
+      const newValue = multi ? [...value, ...additions] : [additions[0]];
+      setValue(newValue);
+      handleChange(newValue);
+    },
+    [handleChange, multi, value],
+  );
+
   const handleClickGhostButton = useCallback(() => {
     setDroppedItem({});
     togglePopover(true);
@@ -342,52 +480,33 @@ export const DndMetricSelect = (props: any) => {
       isDatasourcePanelDndItem(droppedItem) &&
       droppedItem.type === DndItemType.Column
     ) {
-      const itemValue = droppedItem.value as ColumnMeta;
-      const config: Partial<AdhocMetric> = {
-        column: itemValue,
-      };
-      if (isFeatureEnabled(FeatureFlag.UX_BETA)) {
-        if (itemValue.type_generic === GenericDataType.NUMERIC) {
-          config.aggregate = AGGREGATES.SUM;
-        } else if (
-          itemValue.type_generic === GenericDataType.STRING ||
-          itemValue.type_generic === GenericDataType.BOOLEAN ||
-          itemValue.type_generic === GenericDataType.TEMPORAL
-        ) {
-          config.aggregate = AGGREGATES.COUNT_DISTINCT;
-        }
-      }
-      return new AdhocMetric(config);
+      return createAdhocMetricFromColumn(droppedItem.value as ColumnMeta);
     }
-    return new AdhocMetric({ isNew: true });
+    return new AdhocMetric({});
   }, [droppedItem]);
 
-  const ghostButtonText = isFeatureEnabled(FeatureFlag.ENABLE_DND_WITH_CLICK_UX)
-    ? tn(
-        'Drop a column/metric here or click',
-        'Drop columns/metrics here or click',
-        multi ? 2 : 1,
-      )
-    : tn(
-        'Drop column or metric here',
-        'Drop columns or metrics here',
-        multi ? 2 : 1,
-      );
+  const ghostButtonText = tn(
+    'Drop a column/metric here or click',
+    'Drop columns/metrics here or click',
+    multi ? 2 : 1,
+  );
+
+  // Generate sortable type that matches MetricDefinitionValue's type
+  const sortableType = `${DndItemType.AdhocMetricOption}_${props.name}_${props.label}`;
 
   return (
     <div className="metrics-select">
       <DndSelectLabel
         onDrop={handleDrop}
         canDrop={canDrop}
+        onDropFolder={onDropFolder}
         valuesRenderer={valuesRenderer}
         accept={DND_ACCEPTED_TYPES}
         ghostButtonText={ghostButtonText}
         displayGhostButton={multi || value.length === 0}
-        onClickGhostButton={
-          isFeatureEnabled(FeatureFlag.ENABLE_DND_WITH_CLICK_UX)
-            ? handleClickGhostButton
-            : undefined
-        }
+        onClickGhostButton={handleClickGhostButton}
+        sortableType={sortableType}
+        itemCount={value.length}
         {...props}
       />
       <AdhocMetricPopoverTrigger
@@ -396,14 +515,17 @@ export const DndMetricSelect = (props: any) => {
         columns={props.columns}
         savedMetricsOptions={newSavedMetricOptions}
         savedMetric={EMPTY_OBJECT as savedMetricType}
-        datasourceType={props.datasourceType}
+        datasource={datasourceForPopover}
         isControlledComponent
         visible={newMetricPopoverVisible}
         togglePopover={togglePopover}
         closePopover={closePopover}
+        isNew
       >
         <div />
       </AdhocMetricPopoverTrigger>
     </div>
   );
 };
+
+export { DndMetricSelect };

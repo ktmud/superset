@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { keyBy } from 'lodash';
+import { keyBy } from 'lodash-es';
 import { DatasourcesState } from 'src/dashboard/types';
 import {
   DatasourcesActionPayload,
@@ -27,13 +27,13 @@ export default function datasourcesReducer(
   datasources: DatasourcesState | undefined,
   action: DatasourcesActionPayload,
 ) {
-  if (action.type === DatasourcesAction.SET_DATASOURCES) {
+  if (action.type === DatasourcesAction.SetDatasources) {
     return {
       ...datasources,
       ...keyBy(action.datasources, 'uid'),
     };
   }
-  if (action.type === DatasourcesAction.SET_DATASOURCE) {
+  if (action.type === DatasourcesAction.SetDatasource) {
     return {
       ...datasources,
       [action.key]: action.datasource,

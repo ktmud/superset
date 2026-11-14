@@ -16,52 +16,77 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React from 'react';
-import { styled, t } from '@superset-ui/core';
-import Icons from 'src/components/Icons';
+import { forwardRef, useCallback, useState } from 'react';
+
+import { t } from '@apache-superset/core/translation';
+import { css, styled } from '@apache-superset/core/theme';
+import { Icons } from '@superset-ui/core/components/Icons';
+import type { DragEndEvent } from '@dnd-kit/core';
+import {
+  DndContext,
+  PointerSensor,
+  useSensor,
+  closestCenter,
+} from '@dnd-kit/core';
+import {
+  verticalListSortingStrategy,
+  SortableContext,
+} from '@dnd-kit/sortable';
 import { FilterRemoval } from './types';
 import DraggableFilter from './DraggableFilter';
 
-const FilterTitle = styled.div`
+export const FilterTitle = styled.div`
   ${({ theme }) => `
       display: flex;
-      padding: ${theme.gridUnit * 2}px;
-      width: 100%;
+      align-items: center;
+      padding: ${theme.sizeUnit * 2}px;
       border-radius: ${theme.borderRadius}px;
+      cursor: pointer;
       &.active {
-        color: ${theme.colors.grayscale.dark1};
+        color: ${theme.colorPrimaryActive};
         border-radius: ${theme.borderRadius}px;
-        background-color: ${theme.colors.secondary.light4};
+        background-color: ${theme.colorPrimaryBg};
         span, .anticon {
-          color: ${theme.colors.grayscale.dark1};
+          color: ${theme.colorIcon};
         }
       }
       &:hover {
-        color: ${theme.colors.primary.light1};
+        color: ${theme.colorPrimaryHover};
         span, .anticon {
-          color: ${theme.colors.primary.light1};
+          color: ${theme.colorPrimaryHover};
         }
       }
       &.errored div, &.errored .warning {
-        color: ${theme.colors.error.base};
+        color: ${theme.colorError};
       }
   `}
 `;
 
-const StyledTrashIcon = styled(Icons.Trash)`
-  color: ${({ theme }) => theme.colors.grayscale.light3};
+const StyledFilterIcon = styled(Icons.FilterOutlined)`
+  color: ${({ theme }) => theme.colorIcon};
+  margin-right: ${({ theme }) => theme.sizeUnit * 2}px;
 `;
 
-const StyledWarning = styled(Icons.Warning)`
-  color: ${({ theme }) => theme.colors.error.base};
+const StyledDividerIcon = styled(Icons.PicCenterOutlined)`
+  color: ${({ theme }) => theme.colorIcon};
+  margin-right: ${({ theme }) => theme.sizeUnit * 2}px;
+`;
+
+const StyledWarning = styled(Icons.ExclamationCircleOutlined)`
+  color: ${({ theme }) => theme.colorErrorText};
   &.anticon {
     margin-left: auto;
   }
 `;
 
-const Container = styled.div`
+const Container = styled.div<{ isDragging: boolean }>`
   height: 100%;
   overflow-y: auto;
+  ${({ isDragging }) =>
+    isDragging &&
+    `
+    overflow: hidden;
+  `}
 `;
 
 interface Props {
@@ -71,124 +96,172 @@ interface Props {
   removedFilters: Record<string, FilterRemoval>;
   onRemove: (id: string) => void;
   restoreFilter: (id: string) => void;
-  onRearrage: (dragIndex: number, targetIndex: number) => void;
-  filterGroups: string[][];
+  onRearrange: (dragIndex: number, targetIndex: number) => void;
+  filters: string[];
   erroredFilters: string[];
 }
 
-const FilterTitleContainer: React.FC<Props> = ({
-  getFilterTitle,
-  onChange,
-  onRemove,
-  restoreFilter,
-  onRearrage,
-  currentFilterId,
-  removedFilters,
-  filterGroups,
-  erroredFilters = [],
-}) => {
-  const renderComponent = (id: string) => {
-    const isRemoved = !!removedFilters[id];
-    const isErrored = erroredFilters.includes(id);
-    const isActive = currentFilterId === id;
-    const classNames = [];
-    if (isErrored) {
-      classNames.push('errored');
-    }
-    if (isActive) {
-      classNames.push('active');
-    }
-    return (
-      <FilterTitle
-        role="tab"
-        key={`filter-title-tab-${id}`}
-        onClick={() => onChange(id)}
-        className={classNames.join(' ')}
-      >
-        <div css={{ display: 'flex', width: '100%' }}>
-          <div css={{ alignItems: 'center', display: 'flex' }}>
-            {isRemoved ? t('(Removed)') : getFilterTitle(id)}
-          </div>
-          {!removedFilters[id] && isErrored && (
-            <StyledWarning className="warning" />
-          )}
-          {isRemoved && (
-            <span
-              css={{ alignSelf: 'flex-end', marginLeft: 'auto' }}
-              role="button"
-              data-test="undo-button"
-              tabIndex={0}
-              onClick={e => {
-                e.preventDefault();
-                restoreFilter(id);
+const isFilterDivider = (id: string) => id.startsWith('NATIVE_FILTER_DIVIDER');
+
+const FilterTitleContainer = forwardRef<HTMLDivElement, Props>(
+  (
+    {
+      getFilterTitle,
+      onChange,
+      onRemove,
+      restoreFilter,
+      onRearrange,
+      currentFilterId,
+      removedFilters,
+      filters,
+      erroredFilters = [],
+    },
+    ref,
+  ) => {
+    const [isDragging, setIsDragging] = useState(false);
+
+    const sensor = useSensor(PointerSensor, {
+      activationConstraint: { distance: 10 },
+    });
+
+    const handleDragStart = useCallback(() => {
+      setIsDragging(true);
+    }, []);
+
+    const handleDragEnd = useCallback(
+      (event: DragEndEvent) => {
+        setIsDragging(false);
+        const { active, over } = event;
+
+        if (!over || active.id === over.id) {
+          return;
+        }
+
+        const activeIndex = filters.findIndex(filter => filter === active.id);
+        const overIndex = filters.findIndex(filter => filter === over.id);
+
+        if (activeIndex !== -1 && overIndex !== -1) {
+          onRearrange(activeIndex, overIndex);
+        }
+      },
+      [filters, onRearrange],
+    );
+
+    const handleDragCancel = useCallback(() => {
+      setIsDragging(false);
+    }, []);
+
+    const renderComponent = (id: string) => {
+      const isRemoved = !!removedFilters[id];
+      const isErrored = erroredFilters.includes(id);
+      const isActive = currentFilterId === id;
+      const classNames = [];
+      if (isErrored) {
+        classNames.push('errored');
+      }
+      if (isActive) {
+        classNames.push('active');
+      }
+      return (
+        <FilterTitle
+          role="tab"
+          key={`filter-title-tab-${id}`}
+          tabIndex={0}
+          onClick={() => onChange(id)}
+          className={classNames.join(' ')}
+          aria-selected={isActive}
+        >
+          <div css={{ display: 'flex', width: '100%', alignItems: 'center' }}>
+            <div
+              css={{
+                alignItems: 'center',
+                display: 'flex',
+                wordBreak: 'break-all',
               }}
             >
-              {t('Undo?')}
-            </span>
-          )}
-        </div>
-        <div css={{ alignSelf: 'flex-end', marginLeft: 'auto' }}>
-          {isRemoved ? null : (
-            <StyledTrashIcon
-              onClick={event => {
-                event.stopPropagation();
-                onRemove(id);
-              }}
-              alt="RemoveFilter"
-            />
-          )}
-        </div>
-      </FilterTitle>
-    );
-  };
-  const recursivelyRender = (
-    elementId: string,
-    nodeList: Array<{ id: string; parentId: string | null }>,
-    rendered: Array<string>,
-  ): React.ReactNode => {
-    const didAlreadyRender = rendered.indexOf(elementId) >= 0;
-    if (didAlreadyRender) {
-      return null;
-    }
-    let parent = null;
-    const element = nodeList.filter(el => el.id === elementId)[0];
-    if (!element) {
-      return null;
-    }
-
-    rendered.push(elementId);
-    if (element.parentId) {
-      parent = recursivelyRender(element.parentId, nodeList, rendered);
-    }
-    const children = nodeList
-      .filter(item => item.parentId === elementId)
-      .map(item => recursivelyRender(item.id, nodeList, rendered));
-    return (
-      <>
-        {parent}
-        {renderComponent(elementId)}
-        {children}
-      </>
-    );
-  };
-
-  const renderFilterGroups = () => {
-    const items: React.ReactNode[] = [];
-    filterGroups.forEach((item, index) => {
-      items.push(
-        <DraggableFilter
-          key={index}
-          onRearrage={onRearrage}
-          index={index}
-          filterIds={item}
-        >
-          {item.map(filter => renderComponent(filter))}
-        </DraggableFilter>,
+              {isFilterDivider(id) ? (
+                <StyledDividerIcon iconSize="m" />
+              ) : (
+                <StyledFilterIcon iconSize="m" />
+              )}
+              {isRemoved ? t('(Removed)') : getFilterTitle(id)}
+            </div>
+            {!removedFilters[id] && isErrored && (
+              <StyledWarning className="warning" iconSize="s" />
+            )}
+            {isRemoved && (
+              <button
+                type="button"
+                css={css`
+                  appearance: none;
+                  border: none;
+                  background: none;
+                  padding: 0;
+                  font: inherit;
+                  align-self: flex-end;
+                  margin-left: auto;
+                `}
+                data-test="undo-button"
+                onClick={e => {
+                  e.preventDefault();
+                  restoreFilter(id);
+                }}
+              >
+                {t('Undo?')}
+              </button>
+            )}
+          </div>
+          <div css={{ alignSelf: 'flex-start', marginLeft: 'auto' }}>
+            {isRemoved ? null : (
+              <Icons.DeleteOutlined
+                iconSize="l"
+                onClick={(event: React.MouseEvent<HTMLElement>) => {
+                  event.stopPropagation();
+                  onRemove(id);
+                }}
+                aria-label={t('Remove filter')}
+                data-test="filter-remove-button"
+              />
+            )}
+          </div>
+        </FilterTitle>
       );
-    });
-    return items;
-  };
-  return <Container>{renderFilterGroups()}</Container>;
-};
+    };
+
+    return (
+      <Container
+        data-test="filter-title-container"
+        ref={ref}
+        isDragging={isDragging}
+      >
+        <DndContext
+          sensors={[sensor]}
+          collisionDetection={closestCenter}
+          onDragStart={handleDragStart}
+          onDragEnd={handleDragEnd}
+          onDragCancel={handleDragCancel}
+        >
+          <SortableContext
+            items={filters}
+            strategy={verticalListSortingStrategy}
+          >
+            {filters.map((item, index) => (
+              <DraggableFilter
+                key={item}
+                id={item}
+                index={index}
+                filterIds={[item]}
+              >
+                {renderComponent(item)}
+              </DraggableFilter>
+            ))}
+          </SortableContext>
+        </DndContext>
+      </Container>
+    );
+  },
+);
+
+FilterTitleContainer.displayName = 'FilterTitleContainer';
 
 export default FilterTitleContainer;

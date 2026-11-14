@@ -16,17 +16,65 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React from 'react';
-import { render, screen } from 'spec/helpers/testing-library';
-import { DndMetricSelect } from 'src/explore/components/controls/DndColumnSelectControl/DndMetricSelect';
+import { useState } from 'react';
+import {
+  fireEvent,
+  render,
+  screen,
+  selectOption,
+  userEvent,
+  waitFor,
+  within,
+} from 'spec/helpers/testing-library';
+import { Metric } from '@superset-ui/core';
+import { GenericDataType } from '@apache-superset/core/common';
+import { useDroppable } from '@dnd-kit/core';
+import { useSortable } from '@dnd-kit/sortable';
+import {
+  DndMetricSelect,
+  coerceMetrics,
+} from 'src/explore/components/controls/DndColumnSelectControl/DndMetricSelect';
 import { AGGREGATES } from 'src/explore/constants';
-import { EXPRESSION_TYPES } from '../MetricControl/AdhocMetric';
+import AdhocMetric, { EXPRESSION_TYPES } from '../MetricControl/AdhocMetric';
+import { DndItemType } from '../../DndItemType';
+import {
+  CapturedDroppable,
+  CapturedSortables,
+  captureDroppableData,
+  captureSortableData,
+  simulateDrop,
+  simulateFolderDrop,
+  simulateReorder,
+} from './dndTestUtils';
+
+const captured: CapturedDroppable = { current: undefined };
+const sortables: CapturedSortables = { items: [] };
+
+jest.mock('@dnd-kit/core', () => ({
+  ...jest.requireActual('@dnd-kit/core'),
+  useDroppable: jest.fn(),
+}));
+
+jest.mock('@dnd-kit/sortable', () => ({
+  ...jest.requireActual('@dnd-kit/sortable'),
+  useSortable: jest.fn(),
+}));
+
+beforeEach(() => {
+  captured.current = undefined;
+  sortables.items = [];
+  (useDroppable as jest.Mock).mockImplementation(
+    captureDroppableData(captured),
+  );
+  (useSortable as jest.Mock).mockImplementation(captureSortableData(sortables));
+});
 
 const defaultProps = {
   savedMetrics: [
     {
       metric_name: 'metric_a',
       expression: 'expression_a',
+      verbose_name: 'metric_a',
     },
     {
       metric_name: 'metric_b',
@@ -59,33 +107,108 @@ const adhocMetricB = {
   optionName: 'def',
 };
 
+test('coerceMetrics regenerates duplicate optionNames so each metric stays unique', () => {
+  // A saved chart can carry two adhoc metrics with the same optionName (e.g.
+  // born from a duplicated metric). Since edits are matched by optionName, the
+  // duplicates must be split apart on load or editing one overwrites the other.
+  const dup = 'shared_option';
+  const result = coerceMetrics(
+    [
+      {
+        expressionType: EXPRESSION_TYPES.SIMPLE,
+        column: defaultProps.columns[0],
+        aggregate: AGGREGATES.SUM,
+        optionName: dup,
+      },
+      {
+        expressionType: EXPRESSION_TYPES.SIMPLE,
+        column: defaultProps.columns[1],
+        aggregate: AGGREGATES.AVG,
+        optionName: dup,
+      },
+    ] as any,
+    defaultProps.savedMetrics as unknown as Metric[],
+    defaultProps.columns,
+  ) as AdhocMetric[];
+
+  expect(result).toHaveLength(2);
+  // First keeps the optionName, second is regenerated to avoid the collision.
+  expect(result[0].optionName).toBe(dup);
+  expect(result[1].optionName).not.toBe(dup);
+  // Each metric definition is otherwise preserved.
+  expect(result[0].aggregate).toBe(AGGREGATES.SUM);
+  expect(result[1].aggregate).toBe(AGGREGATES.AVG);
+});
+
+test('coerceMetrics regenerates duplicate optionNames for SQL adhoc metrics too', () => {
+  // The same collision can happen with custom SQL metrics, which take a
+  // different code path than column-backed metrics but must dedupe the same way.
+  const dup = 'shared_option';
+  const result = coerceMetrics(
+    [
+      {
+        expressionType: EXPRESSION_TYPES.SQL,
+        sqlExpression: 'COUNT(*)',
+        label: 'count',
+        optionName: dup,
+      },
+      {
+        expressionType: EXPRESSION_TYPES.SQL,
+        sqlExpression: 'SUM(value)',
+        label: 'total',
+        optionName: dup,
+      },
+    ] as any,
+    defaultProps.savedMetrics as unknown as Metric[],
+    defaultProps.columns,
+  ) as AdhocMetric[];
+
+  expect(result).toHaveLength(2);
+  expect(result[0].optionName).toBe(dup);
+  expect(result[1].optionName).not.toBe(dup);
+  // Each metric definition is otherwise preserved.
+  expect(result[0].sqlExpression).toBe('COUNT(*)');
+  expect(result[1].sqlExpression).toBe('SUM(value)');
+});
+
 test('renders with default props', () => {
-  render(<DndMetricSelect {...defaultProps} />, { useDnd: true });
-  expect(screen.getByText('Drop column or metric here')).toBeInTheDocument();
+  render(<DndMetricSelect {...defaultProps} />, {
+    useDndKit: true,
+    useRedux: true,
+  });
+  expect(
+    screen.getByText('Drop a column/metric here or click'),
+  ).toBeInTheDocument();
 });
 
 test('renders with default props and multi = true', () => {
-  render(<DndMetricSelect {...defaultProps} multi />, { useDnd: true });
-  expect(screen.getByText('Drop columns or metrics here')).toBeInTheDocument();
+  render(<DndMetricSelect {...defaultProps} multi />, {
+    useDndKit: true,
+    useRedux: true,
+  });
+  expect(
+    screen.getByText('Drop columns/metrics here or click'),
+  ).toBeInTheDocument();
 });
 
 test('render selected metrics correctly', () => {
   const metricValues = ['metric_a', 'metric_b', adhocMetricB];
   render(<DndMetricSelect {...defaultProps} value={metricValues} multi />, {
-    useDnd: true,
+    useDndKit: true,
+    useRedux: true,
   });
   expect(screen.getByText('metric_a')).toBeVisible();
   expect(screen.getByText('Metric B')).toBeVisible();
   expect(screen.getByText('SUM(Column B)')).toBeVisible();
 });
 
-test('remove selected custom metric when metric gets removed from dataset', () => {
+test('warn selected custom metric when metric gets removed from dataset', async () => {
   let metricValues = ['metric_a', 'metric_b', adhocMetricA, adhocMetricB];
   const onChange = (val: any[]) => {
     metricValues = val;
   };
 
-  const { rerender } = render(
+  const { rerender, container } = render(
     <DndMetricSelect
       {...defaultProps}
       value={metricValues}
@@ -93,7 +216,8 @@ test('remove selected custom metric when metric gets removed from dataset', () =
       multi
     />,
     {
-      useDnd: true,
+      useDndKit: true,
+      useRedux: true,
     },
   );
 
@@ -116,8 +240,78 @@ test('remove selected custom metric when metric gets removed from dataset', () =
   );
   expect(screen.getByText('metric_a')).toBeVisible();
   expect(screen.queryByText('Metric B')).not.toBeInTheDocument();
+  expect(screen.queryByText('metric_b')).toBeInTheDocument();
+  const warningIcon = within(
+    screen.getByText('metric_b').parentElement ?? container,
+  ).getByRole('button');
+  expect(warningIcon).toBeInTheDocument();
+  await userEvent.hover(warningIcon);
+  const warningTooltip = await screen.findByText(
+    'This metric might be incompatible with current dataset',
+  );
+  expect(warningTooltip).toBeInTheDocument();
   expect(screen.getByText('SUM(column_a)')).toBeVisible();
   expect(screen.getByText('SUM(Column B)')).toBeVisible();
+});
+
+test('warn selected custom metric when metric gets removed from dataset for single-select metric control', async () => {
+  let metricValue = 'metric_b';
+
+  const onChange = (val: any) => {
+    metricValue = val;
+  };
+
+  const { rerender, container } = render(
+    <DndMetricSelect
+      {...defaultProps}
+      value={metricValue}
+      onChange={onChange}
+      multi={false}
+    />,
+    {
+      useDndKit: true,
+      useRedux: true,
+    },
+  );
+
+  expect(screen.getByText('Metric B')).toBeVisible();
+  expect(
+    screen.queryByText('Drop a column/metric here or click'),
+  ).not.toBeInTheDocument();
+
+  const newPropsWithRemovedMetric = {
+    ...defaultProps,
+    savedMetrics: [
+      {
+        metric_name: 'metric_a',
+        expression: 'expression_a',
+      },
+    ],
+  };
+
+  rerender(
+    <DndMetricSelect
+      {...newPropsWithRemovedMetric}
+      value={metricValue}
+      onChange={onChange}
+      multi={false}
+    />,
+  );
+
+  expect(screen.queryByText('Metric B')).not.toBeInTheDocument();
+  expect(
+    screen.queryByText('Drop a column/metric here or click'),
+  ).not.toBeInTheDocument();
+  expect(screen.queryByText('metric_b')).toBeInTheDocument();
+  const warningIcon = within(
+    screen.getByText('metric_b').parentElement ?? container,
+  ).getByRole('button');
+  expect(warningIcon).toBeInTheDocument();
+  await userEvent.hover(warningIcon);
+  const warningTooltip = await screen.findByText(
+    'This metric might be incompatible with current dataset',
+  );
+  expect(warningTooltip).toBeInTheDocument();
 });
 
 test('remove selected adhoc metric when column gets removed from dataset', async () => {
@@ -134,7 +328,8 @@ test('remove selected adhoc metric when column gets removed from dataset', async
       multi
     />,
     {
-      useDnd: true,
+      useDndKit: true,
+      useRedux: true,
     },
   );
 
@@ -147,15 +342,6 @@ test('remove selected adhoc metric when column gets removed from dataset', async
     ],
   };
 
-  // rerender twice - first to update columns, second to update value
-  rerender(
-    <DndMetricSelect
-      {...newPropsWithRemovedColumn}
-      value={metricValues}
-      onChange={onChange}
-      multi
-    />,
-  );
   rerender(
     <DndMetricSelect
       {...newPropsWithRemovedColumn}
@@ -185,7 +371,8 @@ test('update adhoc metric name when column label in dataset changes', () => {
       multi
     />,
     {
-      useDnd: true,
+      useDndKit: true,
+      useRedux: true,
     },
   );
 
@@ -225,4 +412,459 @@ test('update adhoc metric name when column label in dataset changes', () => {
   expect(screen.getByText('Metric B')).toBeVisible();
   expect(screen.getByText('SUM(new col A name)')).toBeVisible();
   expect(screen.getByText('SUM(new col B name)')).toBeVisible();
+});
+
+// Drop behavior is exercised through `resolveDragEnd` (the production drag-end
+// dispatcher) because @dnd-kit's PointerSensor needs real layout that jsdom
+// cannot provide. See ./dndTestUtils and ExploreDndContext.test.tsx.
+
+test('can drag metrics (reorder dispatches through the reorder + drop path)', () => {
+  const onChange = jest.fn();
+  render(
+    <DndMetricSelect
+      {...defaultProps}
+      value={['metric_a', 'metric_b', adhocMetricB]}
+      onChange={onChange}
+      multi
+    />,
+    { useDndKit: true, useRedux: true },
+  );
+
+  // DndMetricSelect reorders via moveLabel, which arrayMoves the metrics and
+  // commits the new order itself through onChange (onDropLabel no longer
+  // persists anything). Verify the reorder callback is registered and that a
+  // non-adjacent drag (0 -> 2) commits the fully moved order, not a swap.
+  expect(sortables.items.length).toBeGreaterThanOrEqual(3);
+  expect(typeof sortables.items[0].onMoveLabel).toBe('function');
+
+  simulateReorder(sortables, 0, 2);
+  expect(onChange).toHaveBeenCalledTimes(1);
+  const committed = onChange.mock.calls[0][0];
+  // arrayMove(['metric_a','metric_b',adhoc], 0, 2) => ['metric_b',adhoc,'metric_a']
+  expect(committed[0]).toBe('metric_b');
+  expect(committed[committed.length - 1]).toBe('metric_a');
+});
+
+test('cannot drop a duplicated item', () => {
+  const onChange = jest.fn();
+  render(
+    <DndMetricSelect
+      {...defaultProps}
+      value={['metric_a']}
+      onChange={onChange}
+      multi
+    />,
+    { useDndKit: true, useRedux: true },
+  );
+
+  simulateDrop(captured, {
+    type: DndItemType.Metric,
+    value: { metric_name: 'metric_a' } as any,
+  });
+
+  expect(onChange).not.toHaveBeenCalled();
+});
+
+test('can drop a saved metric when disallow_adhoc_metrics', () => {
+  const onChange = jest.fn();
+  render(
+    <DndMetricSelect
+      {...defaultProps}
+      value={['metric_b']}
+      onChange={onChange}
+      multi
+      datasource={{ extra: '{ "disallow_adhoc_metrics": true }' } as any}
+    />,
+    { useDndKit: true, useRedux: true },
+  );
+
+  simulateDrop(captured, {
+    type: DndItemType.Metric,
+    value: { metric_name: 'metric_a' } as any,
+  });
+
+  expect(onChange).toHaveBeenLastCalledWith(['metric_b', 'metric_a']);
+});
+
+test('cannot drop non-saved metrics when disallow_adhoc_metrics', () => {
+  const onChange = jest.fn();
+  render(
+    <DndMetricSelect
+      {...defaultProps}
+      value={['metric_b']}
+      onChange={onChange}
+      multi
+      datasource={{ extra: '{ "disallow_adhoc_metrics": true }' } as any}
+    />,
+    { useDndKit: true, useRedux: true },
+  );
+
+  // Non-saved metric -> rejected.
+  simulateDrop(captured, {
+    type: DndItemType.Metric,
+    value: { metric_name: 'metric_c' } as any,
+  });
+  expect(onChange).not.toHaveBeenCalled();
+
+  // Column type -> rejected when adhoc metrics are disallowed.
+  simulateDrop(captured, {
+    type: DndItemType.Column,
+    value: { column_name: 'column_a' } as any,
+  });
+  expect(onChange).not.toHaveBeenCalled();
+
+  // Saved metric -> accepted.
+  simulateDrop(captured, {
+    type: DndItemType.Metric,
+    value: { metric_name: 'metric_a' } as any,
+  });
+  expect(onChange).toHaveBeenLastCalledWith(['metric_b', 'metric_a']);
+});
+
+test('title changes on custom SQL text change', async () => {
+  let metricValues = [adhocMetricA, 'metric_b'];
+  const onChange = (val: any[]) => {
+    metricValues = [...val];
+  };
+
+  const { rerender } = render(
+    <DndMetricSelect
+      {...defaultProps}
+      value={metricValues}
+      onChange={onChange}
+      multi
+    />,
+    {
+      useDndKit: true,
+      useRedux: true,
+    },
+  );
+
+  expect(screen.getByText('SUM(column_a)')).toBeVisible();
+
+  metricValues = [adhocMetricA, 'metric_b', 'metric_a'];
+  rerender(
+    <DndMetricSelect
+      {...defaultProps}
+      value={metricValues}
+      onChange={onChange}
+      multi
+    />,
+  );
+
+  expect(screen.getByText('SUM(column_a)')).toBeVisible();
+  expect(screen.getByText('metric_a')).toBeVisible();
+
+  fireEvent.click(screen.getByText('metric_a'));
+  expect(await screen.findByText('Custom SQL')).toBeInTheDocument();
+
+  fireEvent.click(screen.getByText('Custom SQL'));
+  expect(screen.getByText('Custom SQL').parentElement).toHaveClass(
+    'ant-tabs-tab-active',
+  );
+
+  // Wait for the editor to render after tab switch
+  const textArea = (await screen.findByRole('textbox')) as HTMLTextAreaElement;
+
+  expect(screen.getByTestId('AdhocMetricEditTitle#trigger')).toHaveTextContent(
+    'metric_a',
+  );
+
+  // Changing the ACE editor via pasting, since the component
+  // handles the textarea value internally, and changing it doesn't
+  // trigger the onChange
+  await userEvent.click(textArea);
+  await userEvent.paste('New metric');
+
+  await waitFor(() => {
+    expect(
+      screen.getByTestId('AdhocMetricEditTitle#trigger'),
+    ).toHaveTextContent('New metric');
+  });
+
+  // Ensure the title does not reset on mouse over
+  fireEvent.mouseEnter(screen.getByTestId('AdhocMetricEditTitle#trigger'));
+  fireEvent.mouseOut(screen.getByTestId('AdhocMetricEditTitle#trigger'));
+
+  expect(screen.getByTestId('AdhocMetricEditTitle#trigger')).toHaveTextContent(
+    'New metric',
+  );
+});
+
+// Mirrors the parent control, which feeds committed values back in as `value`.
+const ControlledDndMetricSelect = ({
+  onChange,
+}: {
+  onChange: (val: unknown) => void;
+}) => {
+  const [value, setValue] = useState<unknown>(undefined);
+  return (
+    <DndMetricSelect
+      {...defaultProps}
+      value={value}
+      onChange={(val: unknown) => {
+        setValue(val);
+        onChange(val);
+      }}
+      multi
+    />
+  );
+};
+
+test('saves a new simple adhoc metric with a custom title from an empty drop zone', async () => {
+  const onChange = jest.fn();
+  render(<ControlledDndMetricSelect onChange={onChange} />, {
+    useDndKit: true,
+    useRedux: true,
+  });
+
+  await userEvent.click(screen.getByText('Drop columns/metrics here or click'));
+  await userEvent.click(await screen.findByRole('tab', { name: 'Simple' }));
+
+  await userEvent.click(screen.getByTestId('AdhocMetricEditTitle#trigger'));
+  const titleInput = await screen.findByTestId('AdhocMetricEditTitle#input');
+  await userEvent.clear(titleInput);
+  await userEvent.type(titleInput, 'Total revenue');
+  await userEvent.keyboard('{Enter}');
+
+  await selectOption('column_a', 'Select column');
+  // selectOption reads the first dropdown in the document, which stays mounted
+  // after the column pick, so the aggregate is chosen by option role instead.
+  await userEvent.click(
+    screen.getByRole('combobox', { name: 'Select aggregate options' }),
+  );
+  await userEvent.click(await screen.findByRole('option', { name: 'SUM' }));
+
+  await userEvent.click(screen.getByRole('button', { name: /save/i }));
+
+  expect(onChange).toHaveBeenCalledTimes(1);
+  const [[committed]] = onChange.mock.calls;
+  expect(committed).toHaveLength(1);
+  expect(committed[0]).toEqual(
+    expect.objectContaining({
+      expressionType: EXPRESSION_TYPES.SIMPLE,
+      column: expect.objectContaining({ column_name: 'column_a' }),
+      aggregate: AGGREGATES.SUM,
+      label: 'Total revenue',
+      hasCustomLabel: true,
+    }),
+  );
+  expect(await screen.findByText('Total revenue')).toBeInTheDocument();
+});
+
+test('removes only the clicked metric when its remove control is used', async () => {
+  const onChange = jest.fn();
+  render(
+    <DndMetricSelect
+      {...defaultProps}
+      value={['metric_a', 'metric_b', adhocMetricB]}
+      onChange={onChange}
+      multi
+    />,
+    { useDndKit: true, useRedux: true },
+  );
+
+  // Remove controls render in value order: metric_a, metric_b, adhocMetricB.
+  const removeButtons = screen.getAllByTestId('remove-control-button');
+  expect(removeButtons).toHaveLength(3);
+  await userEvent.click(removeButtons[1]);
+
+  expect(onChange).toHaveBeenCalledTimes(1);
+  const [[committed]] = onChange.mock.calls;
+  expect(committed).toHaveLength(2);
+  expect(committed[0]).toBe('metric_a');
+  expect(committed[1]).toEqual(
+    expect.objectContaining({ optionName: adhocMetricB.optionName }),
+  );
+  expect(screen.queryByText('Metric B')).not.toBeInTheDocument();
+});
+
+// --- folder drops -----------------------------------------------------
+// Dragging a whole folder from the DatasourcePanel expands into its
+// columns/metrics, handled in bulk by onDropFolder: saved metrics are added
+// as-is, columns become adhoc metrics with a default aggregation (no
+// popover, since a folder can drop many at once). Driven through the
+// production `resolveDragEnd` dispatcher since jsdom cannot simulate real
+// @dnd-kit pointer drags.
+
+const numericColumn = {
+  column_name: 'numeric_col',
+  type_generic: GenericDataType.Numeric,
+};
+const stringColumn = {
+  column_name: 'string_col',
+  type_generic: GenericDataType.String,
+};
+const unknowTypeColumn = {
+  column_name: 'unknown_type_col',
+  type_generic: 'not_a_real_type',
+};
+const multiValueColumn = {
+  column_name: 'multi_value_col',
+  type_generic: GenericDataType.MultiValue,
+};
+
+test('folder drop appends a saved metric as-is and columns as adhoc metrics with default aggregation', () => {
+  const onChange = jest.fn();
+  render(
+    <DndMetricSelect
+      {...defaultProps}
+      columns={[numericColumn, stringColumn, unknowTypeColumn]}
+      value={['metric_b']}
+      onChange={onChange}
+      multi
+    />,
+    { useDndKit: true, useRedux: true },
+  );
+
+  simulateFolderDrop(captured, [
+    { type: DndItemType.Metric, value: { metric_name: 'metric_a' } as any },
+    { type: DndItemType.Column, value: numericColumn as any },
+    { type: DndItemType.Column, value: stringColumn as any },
+    { type: DndItemType.Column, value: unknowTypeColumn as any },
+  ]);
+
+  expect(onChange).toHaveBeenCalledTimes(1);
+  const committed = onChange.mock.calls[0][0];
+  expect(committed[0]).toBe('metric_b');
+  expect(committed[1]).toBe('metric_a');
+  // Numeric columns default to SUM.
+  expect(committed[2]).toBeInstanceOf(AdhocMetric);
+  expect(committed[2].column.column_name).toBe('numeric_col');
+  expect(committed[2].aggregate).toBe(AGGREGATES.SUM);
+  // Text columns default to COUNT_DISTINCT.
+  expect(committed[3]).toBeInstanceOf(AdhocMetric);
+  expect(committed[3].column.column_name).toBe('string_col');
+  expect(committed[3].aggregate).toBe(AGGREGATES.COUNT_DISTINCT);
+  // Untyped columns have no explicit supported aggregation and are skipped
+  // entirely rather than defaulting to an unsupported COUNT_DISTINCT.
+  expect(committed).toHaveLength(4);
+});
+
+test('folder drop skips MultiValue columns, which have no supported default aggregation', () => {
+  const onChange = jest.fn();
+  render(
+    <DndMetricSelect
+      {...defaultProps}
+      columns={[numericColumn, multiValueColumn]}
+      value={[]}
+      onChange={onChange}
+      multi
+    />,
+    { useDndKit: true, useRedux: true },
+  );
+
+  simulateFolderDrop(captured, [
+    { type: DndItemType.Column, value: multiValueColumn as any },
+    { type: DndItemType.Column, value: numericColumn as any },
+  ]);
+
+  expect(onChange).toHaveBeenCalledTimes(1);
+  const committed = onChange.mock.calls[0][0];
+  expect(committed).toHaveLength(1);
+  expect(committed[0]).toBeInstanceOf(AdhocMetric);
+  expect(committed[0].column.column_name).toBe('numeric_col');
+});
+
+test('folder drop is a no-op when only MultiValue/untyped columns are dropped', () => {
+  const onChange = jest.fn();
+  render(
+    <DndMetricSelect
+      {...defaultProps}
+      columns={[multiValueColumn, unknowTypeColumn]}
+      value={['metric_a']}
+      onChange={onChange}
+      multi
+    />,
+    { useDndKit: true, useRedux: true },
+  );
+
+  simulateFolderDrop(captured, [
+    { type: DndItemType.Column, value: multiValueColumn as any },
+    { type: DndItemType.Column, value: unknowTypeColumn as any },
+  ]);
+
+  expect(onChange).not.toHaveBeenCalled();
+});
+
+test('folder drop replaces (not appends) the existing value for a single-value control', () => {
+  const onChange = jest.fn();
+  render(
+    <DndMetricSelect
+      {...defaultProps}
+      columns={[numericColumn]}
+      value={['metric_a']}
+      onChange={onChange}
+      multi={false}
+    />,
+    { useDndKit: true, useRedux: true },
+  );
+
+  simulateFolderDrop(captured, [
+    { type: DndItemType.Column, value: numericColumn as any },
+  ]);
+
+  expect(onChange).toHaveBeenCalledTimes(1);
+  const committed = onChange.mock.calls[0][0];
+  expect(committed).toBeInstanceOf(AdhocMetric);
+  expect(committed.column.column_name).toBe('numeric_col');
+});
+
+test('folder drop skips columns already present as adhoc metrics, keeping new ones', () => {
+  const onChange = jest.fn();
+  const existingAdhocMetric = {
+    expressionType: EXPRESSION_TYPES.SIMPLE,
+    column: numericColumn,
+    aggregate: AGGREGATES.SUM,
+    optionName: 'existing_numeric',
+  };
+  render(
+    <DndMetricSelect
+      {...defaultProps}
+      columns={[numericColumn, stringColumn]}
+      value={[existingAdhocMetric]}
+      onChange={onChange}
+      multi
+    />,
+    { useDndKit: true, useRedux: true },
+  );
+
+  // numeric_col is already an adhoc metric in value, so re-dropping it must
+  // not add a duplicate; string_col is new and should still be appended.
+  simulateFolderDrop(captured, [
+    { type: DndItemType.Column, value: numericColumn as any },
+    { type: DndItemType.Column, value: stringColumn as any },
+  ]);
+
+  expect(onChange).toHaveBeenCalledTimes(1);
+  const committed = onChange.mock.calls[0][0];
+  expect(committed).toHaveLength(2);
+  expect(committed[0]).toBeInstanceOf(AdhocMetric);
+  expect(committed[0].column.column_name).toBe('numeric_col');
+  expect(committed[1]).toBeInstanceOf(AdhocMetric);
+  expect(committed[1].column.column_name).toBe('string_col');
+  expect(committed[1].aggregate).toBe(AGGREGATES.COUNT_DISTINCT);
+});
+
+test('folder drop is a no-op when no item is accepted', () => {
+  const onChange = jest.fn();
+  render(
+    <DndMetricSelect
+      {...defaultProps}
+      value={['metric_a']}
+      onChange={onChange}
+      multi
+      datasource={{ extra: '{ "disallow_adhoc_metrics": true }' } as any}
+    />,
+    { useDndKit: true, useRedux: true },
+  );
+
+  // Columns are rejected outright when adhoc metrics are disallowed, and
+  // metric_a is already selected.
+  simulateFolderDrop(captured, [
+    { type: DndItemType.Column, value: { column_name: 'column_a' } as any },
+    { type: DndItemType.Metric, value: { metric_name: 'metric_a' } as any },
+  ]);
+
+  expect(onChange).not.toHaveBeenCalled();
 });

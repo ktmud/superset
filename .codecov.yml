@@ -4,7 +4,6 @@ codecov:
 ignore:
   - "superset/migrations/versions/*.py"
   - "**/*.stories.tsx"
-  - "**/*.stories.jsx"
 coverage:
   status:
     project:
@@ -14,6 +13,17 @@ coverage:
         # project coverage decrease:
         target: auto
         threshold: 0%
+      core-packages-ts:
+        target: 100%
+        paths:
+          - 'superset-frontend/packages'
+          - '!superset-frontend/packages/**/*.jsx'
+          - '!superset-frontend/packages/**/*.tsx'
+      core-packages-tsx:
+        target: 50%
+        paths:
+          - 'superset-frontend/packages/**/*.jsx'
+          - 'superset-frontend/packages/**/*.tsx'
     patch:
       default:
         informational: true

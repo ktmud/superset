@@ -17,10 +17,19 @@
  * under the License.
  */
 
-import React from 'react';
+import { ErrorLevel, ErrorSource, ErrorTypeEnum } from '@superset-ui/core';
 import { render, screen } from 'spec/helpers/testing-library';
-import DatasetNotFoundErrorMessage from './DatasetNotFoundErrorMessage';
-import { ErrorLevel, ErrorSource, ErrorTypeEnum } from './types';
+import { DatasetNotFoundErrorMessage } from './DatasetNotFoundErrorMessage';
+
+jest.mock(
+  '@superset-ui/core/components/Icons/AsyncIcon',
+  () =>
+    ({ fileName }: { fileName: string }) =>
+      (
+        // eslint-disable-next-line jsx-a11y/prefer-tag-over-role -- mirrors AsyncIcon's real span+role="img" shape
+        <span role="img" aria-label={fileName.replace('_', '-')} />
+      ),
+);
 
 const mockedProps = {
   error: {

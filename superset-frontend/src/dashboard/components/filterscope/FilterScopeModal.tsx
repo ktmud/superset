@@ -16,55 +16,46 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React, { RefObject } from 'react';
-import { styled } from '@superset-ui/core';
-import ModalTrigger from 'src/components/ModalTrigger';
+import { useRef, useCallback } from 'react';
+import { styled } from '@apache-superset/core/theme';
+import {
+  ModalTrigger,
+  ModalTriggerRef,
+} from '@superset-ui/core/components/ModalTrigger';
 import FilterScope from 'src/dashboard/containers/FilterScope';
 
 type FilterScopeModalProps = {
   triggerNode: JSX.Element;
 };
 
-const FilterScopeModalBody = styled.div(({ theme: { gridUnit } }) => ({
-  padding: gridUnit * 2,
-  paddingBottom: gridUnit * 3,
+const FilterScopeModalBody = styled.div(({ theme: { sizeUnit } }) => ({
+  padding: sizeUnit * 2,
+  paddingBottom: sizeUnit * 3,
 }));
 
-export default class FilterScopeModal extends React.PureComponent<
-  FilterScopeModalProps,
-  {}
-> {
-  modal: RefObject<ModalTrigger>;
+export default function FilterScopeModal({
+  triggerNode,
+}: FilterScopeModalProps) {
+  const modalRef = useRef<ModalTriggerRef['current']>(null);
 
-  constructor(props: FilterScopeModalProps) {
-    super(props);
+  const handleCloseModal = useCallback((): void => {
+    modalRef.current?.close?.();
+  }, []);
 
-    this.modal = React.createRef();
-    this.handleCloseModal = this.handleCloseModal.bind(this);
-  }
+  const filterScopeProps = {
+    onCloseModal: handleCloseModal,
+  };
 
-  handleCloseModal(): void {
-    if (this.modal.current) {
-      this.modal.current.close();
-    }
-  }
-
-  render() {
-    const filterScopeProps = {
-      onCloseModal: this.handleCloseModal,
-    };
-
-    return (
-      <ModalTrigger
-        ref={this.modal}
-        triggerNode={this.props.triggerNode}
-        modalBody={
-          <FilterScopeModalBody>
-            <FilterScope {...filterScopeProps} />
-          </FilterScopeModalBody>
-        }
-        width="80%"
-      />
-    );
-  }
+  return (
+    <ModalTrigger
+      ref={modalRef}
+      triggerNode={triggerNode}
+      modalBody={
+        <FilterScopeModalBody>
+          <FilterScope {...filterScopeProps} />
+        </FilterScopeModalBody>
+      }
+      width="80%"
+    />
+  );
 }

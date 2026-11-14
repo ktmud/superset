@@ -16,40 +16,197 @@
 # under the License.
 import re
 from datetime import datetime
-from typing import Any, Dict, Optional, Pattern, Tuple
+from re import Pattern
+from typing import Any, Optional, TypedDict
 
-from flask_babel import gettext as __
+from apispec import APISpec
+from apispec.ext.marshmallow import MarshmallowPlugin
+from flask_babel import gettext as __, lazy_gettext as _
+from marshmallow import fields, Schema
+from sqlalchemy import types
+from sqlalchemy.engine.url import URL
 
-from superset.db_engine_specs.base import BaseEngineSpec
-from superset.errors import SupersetErrorType
-from superset.utils import core as utils
+from superset.constants import TimeGrain
+from superset.databases.utils import make_url_safe
+from superset.db_engine_specs.base import (
+    BaseEngineSpec,
+    BasicPropertiesType,
+    DatabaseCategory,
+)
+from superset.errors import ErrorLevel, SupersetError, SupersetErrorType
 
 SYNTAX_ERROR_REGEX = re.compile(
     ": mismatched input '(?P<syntax_error>.*?)'. Expecting: "
 )
 
+# Standard regional host of the PyAthena SQLAlchemy URI, e.g.
+# ``athena.us-east-1.amazonaws.com`` or ``athena.cn-north-1.amazonaws.com.cn``.
+# Mirrors the pattern PyAthena itself uses to derive ``region_name`` from the
+# host; any other host (e.g. a VPC/PrivateLink endpoint) is passed to PyAthena
+# verbatim.
+ATHENA_HOST_REGEX = re.compile(
+    r"^athena\.(?P<region_name>[a-z0-9-]+)\.amazonaws\.com(?P<china>\.cn)?$"
+)
+
+# URI query parameters exposed as their own form fields; every other query
+# parameter (``catalog_name``, ``role_arn``, ``endpoint_url``, ...) round-trips
+# through the ``query`` parameter so editing a connection never drops it.
+ATHENA_FORM_QUERY_PARAMS = ("s3_staging_dir", "work_group")
+
+
+class AthenaParametersSchema(Schema):
+    aws_access_key_id = fields.Str(
+        required=False,
+        allow_none=True,
+        metadata={"description": _("AWS access key ID")},
+    )
+    aws_secret_access_key = fields.Str(
+        required=False,
+        allow_none=True,
+        metadata={"description": _("AWS secret access key")},
+    )
+    region_name = fields.Str(
+        required=True,
+        metadata={"description": _("AWS region, e.g. us-east-1")},
+    )
+    s3_staging_dir = fields.Str(
+        required=False,
+        allow_none=True,
+        metadata={
+            "description": _(
+                "S3 location where Athena query results are stored, "
+                "e.g. s3://my-bucket/athena-results/. Can be left empty when "
+                "the work group defines a query result location or uses "
+                "managed query results."
+            )
+        },
+    )
+    schema_name = fields.Str(
+        required=False,
+        allow_none=True,
+        metadata={"description": _("Default schema (database) to connect to")},
+    )
+    work_group = fields.Str(
+        required=False,
+        allow_none=True,
+        metadata={"description": _("Athena work group to run queries against")},
+    )
+    query = fields.Dict(
+        keys=fields.Str(),
+        values=fields.Raw(),
+        required=False,
+        metadata={"description": _("Additional parameters")},
+    )
+
+
+class AthenaParametersType(TypedDict, total=False):
+    aws_access_key_id: Optional[str]
+    aws_secret_access_key: Optional[str]
+    region_name: str
+    s3_staging_dir: Optional[str]
+    schema_name: Optional[str]
+    work_group: Optional[str]
+    query: dict[str, Any]
+
 
 class AthenaEngineSpec(BaseEngineSpec):
     engine = "awsathena"
     engine_name = "Amazon Athena"
+    allows_escaped_colons = False
+    disable_ssh_tunneling = True
+    # Athena doesn't support IS true/false syntax, use = true/false instead
+    use_equality_for_boolean_filters = True
+    supports_dynamic_schema = True
+
+    # Render the dynamic connection form (individual parameters) instead of the
+    # raw SQLAlchemy URI box. Athena's URI is not a simple host/port/user/pass/db,
+    # so a custom schema is used rather than ``BasicParametersMixin``.
+    parameters_schema = AthenaParametersSchema()
+    default_driver = "rest"
+    sqlalchemy_uri_placeholder = (
+        "awsathena+rest://{aws_access_key_id}:{aws_secret_access_key}@"
+        "athena.{region_name}.amazonaws.com/{schema_name}"
+        "?s3_staging_dir={s3_staging_dir}"
+    )
+
+    metadata = {
+        "description": (
+            "Amazon Athena is an interactive query service for "
+            "analyzing data in S3 using SQL."
+        ),
+        "logo": "amazon-athena.jpg",
+        "homepage_url": "https://aws.amazon.com/athena/",
+        "categories": [
+            DatabaseCategory.CLOUD_AWS,
+            DatabaseCategory.QUERY_ENGINES,
+            DatabaseCategory.PROPRIETARY,
+        ],
+        "pypi_packages": ["pyathena[pandas]"],
+        "connection_string": (
+            "awsathena+rest://{aws_access_key_id}:{aws_secret_access_key}"
+            "@athena.{region_name}.amazonaws.com/{schema_name}"
+            "?s3_staging_dir={s3_staging_dir}"
+        ),
+        "drivers": [
+            {
+                "name": "PyAthena (REST)",
+                "pypi_package": "pyathena[pandas]",
+                "connection_string": (
+                    "awsathena+rest://{aws_access_key_id}:{aws_secret_access_key}"
+                    "@athena.{region_name}.amazonaws.com/{schema_name}"
+                    "?s3_staging_dir={s3_staging_dir}"
+                ),
+                "is_recommended": True,
+                "notes": (
+                    "No Java required. URL-encode special characters "
+                    "(e.g., s3:// -> s3%3A//)."
+                ),
+            },
+            {
+                "name": "PyAthenaJDBC",
+                "pypi_package": "PyAthenaJDBC",
+                "connection_string": (
+                    "awsathena+jdbc://{aws_access_key_id}:{aws_secret_access_key}"
+                    "@athena.{region_name}.amazonaws.com/{schema_name}"
+                    "?s3_staging_dir={s3_staging_dir}"
+                ),
+                "is_recommended": False,
+                "notes": "Requires Amazon Athena JDBC driver.",
+            },
+        ],
+        "engine_parameters": [
+            {
+                "name": "IAM Role Assumption",
+                "description": "Assume a specific IAM role for queries",
+                "json": {"connect_args": {"role_arn": "<role arn>"}},
+            },
+        ],
+        "notes": (
+            "URL-encode special characters in s3_staging_dir "
+            "(e.g., s3:// becomes s3%3A//). Either s3_staging_dir or "
+            "work_group is required; s3_staging_dir can be omitted when the "
+            "work group defines a query result location or uses managed "
+            "query results."
+        ),
+    }
 
     _time_grain_expressions = {
         None: "{col}",
-        "PT1S": "date_trunc('second', CAST({col} AS TIMESTAMP))",
-        "PT1M": "date_trunc('minute', CAST({col} AS TIMESTAMP))",
-        "PT1H": "date_trunc('hour', CAST({col} AS TIMESTAMP))",
-        "P1D": "date_trunc('day', CAST({col} AS TIMESTAMP))",
-        "P1W": "date_trunc('week', CAST({col} AS TIMESTAMP))",
-        "P1M": "date_trunc('month', CAST({col} AS TIMESTAMP))",
-        "P3M": "date_trunc('quarter', CAST({col} AS TIMESTAMP))",
-        "P1Y": "date_trunc('year', CAST({col} AS TIMESTAMP))",
-        "P1W/1970-01-03T00:00:00Z": "date_add('day', 5, date_trunc('week', \
+        TimeGrain.SECOND: "date_trunc('second', CAST({col} AS TIMESTAMP))",
+        TimeGrain.MINUTE: "date_trunc('minute', CAST({col} AS TIMESTAMP))",
+        TimeGrain.HOUR: "date_trunc('hour', CAST({col} AS TIMESTAMP))",
+        TimeGrain.DAY: "date_trunc('day', CAST({col} AS TIMESTAMP))",
+        TimeGrain.WEEK: "date_trunc('week', CAST({col} AS TIMESTAMP))",
+        TimeGrain.MONTH: "date_trunc('month', CAST({col} AS TIMESTAMP))",
+        TimeGrain.QUARTER: "date_trunc('quarter', CAST({col} AS TIMESTAMP))",
+        TimeGrain.YEAR: "date_trunc('year', CAST({col} AS TIMESTAMP))",
+        TimeGrain.WEEK_ENDING_SATURDAY: "date_add('day', 5, date_trunc('week', \
                                     date_add('day', 1, CAST({col} AS TIMESTAMP))))",
-        "1969-12-28T00:00:00Z/P1W": "date_add('day', -1, date_trunc('week', \
+        TimeGrain.WEEK_STARTING_SUNDAY: "date_add('day', -1, date_trunc('week', \
                                     date_add('day', 1, CAST({col} AS TIMESTAMP))))",
     }
 
-    custom_errors: Dict[Pattern[str], Tuple[str, SupersetErrorType, Dict[str, Any]]] = {
+    custom_errors: dict[Pattern[str], tuple[str, SupersetErrorType, dict[str, Any]]] = {
         SYNTAX_ERROR_REGEX: (
             __(
                 "Please check your query for syntax errors at or "
@@ -61,13 +218,16 @@ class AthenaEngineSpec(BaseEngineSpec):
     }
 
     @classmethod
-    def convert_dttm(cls, target_type: str, dttm: datetime) -> Optional[str]:
-        tt = target_type.upper()
-        if tt == utils.TemporalType.DATE:
-            return f"from_iso8601_date('{dttm.date().isoformat()}')"
-        if tt == utils.TemporalType.TIMESTAMP:
-            datetime_formatted = dttm.isoformat(timespec="microseconds")
-            return f"""from_iso8601_timestamp('{datetime_formatted}')"""
+    def convert_dttm(
+        cls, target_type: str, dttm: datetime, db_extra: Optional[dict[str, Any]] = None
+    ) -> Optional[str]:
+        sqla_type = cls.get_sqla_column_type(target_type)
+
+        if isinstance(sqla_type, types.Date):
+            return f"DATE '{dttm.date().isoformat()}'"
+        if isinstance(sqla_type, types.TIMESTAMP):
+            datetime_formatted = dttm.isoformat(sep=" ", timespec="milliseconds")
+            return f"""TIMESTAMP '{datetime_formatted}'"""
         return None
 
     @classmethod
@@ -83,3 +243,189 @@ class AthenaEngineSpec(BaseEngineSpec):
         :return: Conditionally mutated label
         """
         return label.lower()
+
+    @classmethod
+    def adjust_engine_params(
+        cls,
+        uri: URL,
+        connect_args: dict[str, Any],
+        catalog: str | None = None,
+        schema: str | None = None,
+    ) -> tuple[URL, dict[str, Any]]:
+        """
+        Adjust the SQLAlchemy URI for Athena with a provided catalog and schema.
+
+        For AWS Athena the SQLAlchemy URI looks like this:
+
+            awsathena+rest://athena.{region_name}.amazonaws.com:443/{schema_name}?catalog_name={catalog_name}&s3_staging_dir={s3_staging_dir}
+        """
+        if catalog:
+            uri = uri.update_query_dict({"catalog_name": catalog})
+
+        if schema:
+            uri = uri.set(database=schema)
+
+        return uri, connect_args
+
+    @classmethod
+    def get_schema_from_engine_params(
+        cls,
+        sqlalchemy_uri: URL,
+        connect_args: dict[str, Any],
+    ) -> str | None:
+        """
+        Return the configured schema.
+
+        For AWS Athena the SQLAlchemy URI looks like this:
+
+            awsathena+rest://athena.{region_name}.amazonaws.com:443/{schema_name}?catalog_name={catalog_name}&s3_staging_dir={s3_staging_dir}
+        """
+        return sqlalchemy_uri.database
+
+    @classmethod
+    def build_sqlalchemy_uri(
+        cls,
+        parameters: AthenaParametersType,
+        encrypted_extra: Optional[  # pylint: disable=unused-argument
+            dict[str, Any]
+        ] = None,
+    ) -> str:
+        # PyAthena needs an S3 result location or a work group (which may define
+        # its own result location or use managed query results); empty values
+        # are left out of the URI.
+        # Carry through any other URI query parameters (catalog_name, role_arn,
+        # endpoint_url, ...) so they are not lost when the form is re-saved.
+        query: dict[str, str] = {
+            key: str(value)
+            for key, value in (parameters.get("query") or {}).items()
+            if key not in ATHENA_FORM_QUERY_PARAMS and value is not None
+        }
+        if s3_staging_dir := parameters.get("s3_staging_dir"):
+            query["s3_staging_dir"] = s3_staging_dir
+        if work_group := parameters.get("work_group"):
+            query["work_group"] = work_group
+
+        # SQLAlchemy 2.0 made URL.__str__() hide the password by default
+        # (it rendered in full under 1.4); render_as_string(hide_password=
+        # False) is required here since this URI is stored/used to actually
+        # connect, not just displayed.
+        host, port = cls._build_host(parameters["region_name"])
+        return URL.create(
+            f"{cls.engine}+{cls.default_driver}",
+            username=parameters.get("aws_access_key_id"),
+            password=parameters.get("aws_secret_access_key"),
+            host=host,
+            port=port,
+            database=parameters.get("schema_name"),
+            query=query,
+        ).render_as_string(hide_password=False)
+
+    @staticmethod
+    def _build_host(region_name: str) -> tuple[str, Optional[int]]:
+        """
+        Return the URI host (and port) for the ``region_name`` parameter.
+
+        ``region_name`` is normally an AWS region code (``us-east-1``), from
+        which the standard regional Athena host is built (``.amazonaws.com.cn``
+        for China regions). Region codes never contain a dot or a colon, so a
+        value that does is a full host — e.g. a VPC/PrivateLink endpoint kept
+        verbatim by ``get_parameters_from_uri`` — and is used as-is, including
+        any ``:port`` suffix.
+        """
+        if "." not in region_name and ":" not in region_name:
+            suffix = ".cn" if region_name.startswith("cn-") else ""
+            return f"athena.{region_name}.amazonaws.com{suffix}", None
+
+        host, sep, port = region_name.rpartition(":")
+        if sep and port.isdigit():
+            return host, int(port)
+        return region_name, None
+
+    @classmethod
+    def get_parameters_from_uri(
+        cls,
+        uri: str,
+        encrypted_extra: Optional[  # pylint: disable=unused-argument
+            dict[str, Any]
+        ] = None,
+    ) -> AthenaParametersType:
+        url = make_url_safe(uri)
+        query = dict(url.query.items())
+
+        host = url.host or ""
+        if match := ATHENA_HOST_REGEX.match(host):
+            # PyAthena ignores the port, so a standard regional host reduces
+            # to just its region code.
+            region_name = match["region_name"]
+        else:
+            # Non-standard host (e.g. VPC/PrivateLink endpoint): keep it, and
+            # its port, verbatim so ``build_sqlalchemy_uri`` reproduces it.
+            region_name = f"{host}:{url.port}" if url.port else host
+
+        parameters: AthenaParametersType = {
+            "aws_access_key_id": url.username,
+            "aws_secret_access_key": url.password,
+            "region_name": region_name,
+            "schema_name": url.database,
+        }
+        if "s3_staging_dir" in query:
+            parameters["s3_staging_dir"] = query["s3_staging_dir"]
+        if "work_group" in query:
+            parameters["work_group"] = query["work_group"]
+        if extra_query := {
+            key: value
+            for key, value in query.items()
+            if key not in ATHENA_FORM_QUERY_PARAMS
+        }:
+            parameters["query"] = extra_query
+        return parameters
+
+    @classmethod
+    def validate_parameters(
+        cls,
+        properties: BasicPropertiesType,
+    ) -> list[SupersetError]:
+        errors: list[SupersetError] = []
+        parameters = properties.get("parameters", {})
+        present = {key for key in parameters if parameters.get(key, ())}
+
+        missing: list[str] = []
+        if "region_name" not in present:
+            missing.append("region_name")
+        # Athena needs somewhere to write query results: either an explicit S3
+        # location or a work group (which may define its own result location
+        # or use managed query results). Both fields are flagged when neither
+        # is set.
+        if not present & {"s3_staging_dir", "work_group"}:
+            missing.extend(["s3_staging_dir", "work_group"])
+
+        if missing:
+            errors.append(
+                SupersetError(
+                    message=(
+                        f"One or more parameters are missing: {', '.join(missing)}"
+                    ),
+                    error_type=SupersetErrorType.CONNECTION_MISSING_PARAMETERS_ERROR,
+                    level=ErrorLevel.WARNING,
+                    extra={"missing": missing},
+                ),
+            )
+        return errors
+
+    @classmethod
+    def parameters_json_schema(cls) -> Any:
+        """
+        Return configuration parameters as OpenAPI.
+        """
+        if not cls.parameters_schema:
+            return None
+
+        spec = APISpec(
+            title="Database Parameters",
+            version="1.0.0",
+            openapi_version="3.0.0",
+            plugins=[MarshmallowPlugin()],
+        )
+
+        spec.components.schema(cls.__name__, schema=cls.parameters_schema)
+        return spec.to_dict()["components"]["schemas"][cls.__name__]

@@ -17,11 +17,11 @@
  * under the License.
  */
 import { useEffect, useState } from 'react';
-import { FormInstance } from 'antd/lib/form';
-import { t } from '@superset-ui/core';
+import type { FormInstance } from '@superset-ui/core/components';
+import { t } from '@apache-superset/core/translation';
+import { ChartCustomization, Filter } from '@superset-ui/core';
 import { NativeFiltersForm, NativeFiltersFormItem } from '../types';
 import { setNativeFilterFieldValues, useForceUpdate } from './utils';
-import { Filter } from '../../types';
 
 // When some fields in form changed we need re-fetch data for Filter defaultValue
 // eslint-disable-next-line import/prefer-default-export
@@ -30,7 +30,7 @@ export const useBackendFormUpdate = (
   filterId: string,
 ) => {
   const forceUpdate = useForceUpdate();
-  const formFilter = (form.getFieldValue('filters') || {})[filterId];
+  const formFilter = form.getFieldValue('filters')?.[filterId];
   useEffect(() => {
     setNativeFilterFieldValues(form, filterId, {
       isDataDirty: true,
@@ -52,6 +52,7 @@ export const useBackendFormUpdate = (
 export const useDefaultValue = (
   formFilter?: NativeFiltersFormItem,
   filterToEdit?: Filter,
+  customizationToEdit?: ChartCustomization,
 ): [boolean, boolean, string, Function] => {
   const enableEmptyFilter = !!formFilter?.controlValues?.enableEmptyFilter;
   const defaultToFirstItem = !!formFilter?.controlValues?.defaultToFirstItem;
@@ -72,25 +73,26 @@ export const useDefaultValue = (
         ? false
         : !!formFilter?.defaultDataMask?.filterState?.value,
     );
-    // TODO: this logic should be unhardcoded
   }, [defaultToFirstItem, enableEmptyFilter]);
 
   useEffect(() => {
-    setHasDefaultValue(
-      defaultToFirstItem
-        ? false
-        : !!filterToEdit?.defaultDataMask?.filterState?.value,
-    );
-  }, []);
+    const defaultValue =
+      filterToEdit?.defaultDataMask?.filterState?.value ||
+      customizationToEdit?.defaultDataMask?.filterState?.value;
+
+    setHasDefaultValue(defaultToFirstItem ? false : !!defaultValue);
+  }, [filterToEdit, customizationToEdit, defaultToFirstItem]);
 
   useEffect(() => {
     let tooltip = '';
     if (defaultToFirstItem) {
       tooltip = t(
-        'Default value set automatically when "Default to first item" is checked',
+        'Default value set automatically when "Select first filter value by default" is checked',
       );
     } else if (isRequired) {
-      tooltip = t('Default value must be set when "Required" is checked');
+      tooltip = t(
+        'Default value must be set when "Filter value is required" is checked',
+      );
     } else if (hasDefaultValue) {
       tooltip = t(
         'Default value must be set when "Filter has default value" is checked',

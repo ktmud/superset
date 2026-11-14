@@ -15,32 +15,38 @@
 # specific language governing permissions and limitations
 # under the License.
 # pylint: disable=too-many-lines
-import json
+
+from __future__ import annotations
+
 import logging
 import re
-from contextlib import closing
-from datetime import datetime
+import warnings
+from collections.abc import Collection, Iterator
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+from inspect import signature
+from re import Match, Pattern
 from typing import (
     Any,
     Callable,
-    Dict,
-    List,
-    Match,
+    cast,
+    ContextManager,
     NamedTuple,
     Optional,
-    Pattern,
-    Set,
-    Tuple,
-    Type,
     TYPE_CHECKING,
+    TypedDict,
     Union,
 )
+from urllib.parse import urlencode, urljoin, urlparse
+from uuid import UUID, uuid4
 
 import pandas as pd
-import sqlparse
 from apispec import APISpec
 from apispec.ext.marshmallow import MarshmallowPlugin
-from flask import current_app, g
+from celery.exceptions import SoftTimeLimitExceeded
+from deprecation import deprecated
+from flask import current_app as app, g
+from flask_appbuilder.security.sqla.models import User
 from flask_babel import gettext as __, lazy_gettext as _
 from marshmallow import fields, Schema
 from marshmallow.validate import Range
@@ -48,68 +54,157 @@ from sqlalchemy import column, select, types
 from sqlalchemy.engine.base import Engine
 from sqlalchemy.engine.interfaces import Compiled, Dialect
 from sqlalchemy.engine.reflection import Inspector
-from sqlalchemy.engine.url import make_url, URL
+from sqlalchemy.engine.url import URL
 from sqlalchemy.ext.compiler import compiles
-from sqlalchemy.orm import Session
-from sqlalchemy.sql import quoted_name, text
-from sqlalchemy.sql.expression import ColumnClause, Select, TextAsFrom
-from sqlalchemy.types import String, TypeEngine, UnicodeText
-from typing_extensions import TypedDict
+from sqlalchemy.sql import literal_column, quoted_name, text
+from sqlalchemy.sql.expression import (
+    BinaryExpression,
+    ColumnClause,
+    ColumnElement,
+    Select,
+    TextClause,
+)
+from sqlalchemy.types import TypeEngine
 
-from superset import security_manager, sql_parse
+from superset import db, is_feature_enabled
+from superset.constants import (
+    EMBEDDED_CREDENTIALS_KEY,
+    EPOCH_FORMATS,
+    QUERY_CANCEL_KEY,
+    TimeGrain as TimeGrainConstants,
+)
+from superset.databases.types import encrypted_field_properties
+from superset.databases.utils import (
+    get_table_metadata,
+    make_url_safe,
+    validated_embedded_credentials,
+)
 from superset.errors import ErrorLevel, SupersetError, SupersetErrorType
-from superset.models.sql_lab import Query
-from superset.models.sql_types.base import literal_dttm_type_factory
-from superset.sql_parse import ParsedQuery, Table
-from superset.utils import core as utils
-from superset.utils.core import ColumnSpec, GenericDataType
-from superset.utils.hashing import md5_sha_from_str
-from superset.utils.memoized import memoized
-from superset.utils.network import is_hostname_valid, is_port_open
+from superset.exceptions import (
+    OAuth2Error,
+    OAuth2RedirectError,
+    OAuth2TokenRefreshError,
+    SupersetGenericDBErrorException,
+    SupersetParseError,
+    SupersetTimeoutException,
+)
+from superset.key_value.types import JsonKeyValueCodec, KeyValueResource
+from superset.sql.parse import (
+    BaseSQLStatement,
+    LimitMethod,
+    Partition,
+    RLSMethod,
+    SQLScript,
+    SQLStatement,
+    Table,
+)
+from superset.superset_typing import (
+    OAuth2ClientConfig,
+    OAuth2State,
+    OAuth2TokenResponse,
+    ResultSetColumnType,
+    SQLAColumnType,
+)
+from superset.utils import core as utils, json
+from superset.utils.core import ColumnSpec, GenericDataType, QuerySource
+from superset.utils.hashing import hash_from_str
+from superset.utils.json import redact_sensitive, reveal_sensitive
+from superset.utils.network import (
+    get_ssrf_safe_requester,
+    is_hostname_valid,
+    is_port_open,
+    is_safe_host,
+)
+from superset.utils.oauth2 import (
+    encode_oauth2_state,
+    generate_code_challenge,
+    generate_code_verifier,
+    get_oauth2_redirect_uri,
+    is_oauth2_retry_active,
+)
 
 if TYPE_CHECKING:
-    # prevent circular imports
     from superset.connectors.sqla.models import TableColumn
+    from superset.databases.schemas import TableMetadataResponse
     from superset.models.core import Database
+    from superset.models.sql_lab import Query
+
+
+ColumnTypeMapping = tuple[
+    Pattern[str],
+    Union[TypeEngine, Callable[[Match[str]], TypeEngine]],
+    GenericDataType,
+]
+
+# Trailing ``LIMIT n OFFSET m`` (optionally followed by a semicolon), anchored
+# to the end of the statement so subqueries are never touched.
+_TRAILING_LIMIT_OFFSET = re.compile(
+    r"\s+LIMIT\s+(\d+)\s+OFFSET\s+(\d+)(\s*;?\s*)$", re.IGNORECASE
+)
 
 logger = logging.getLogger()
+
+# When connecting to a database it's hard to catch specific exceptions, since we support
+# more than 50 different database drivers. Usually the try/except block will catch the
+# generic `Exception` class, which requires a pylint disablee comment. To make it clear
+# that we know this is a necessary evil we create an alias, and catch it instead.
+GenericDBException = Exception
+
+# SQL Lab's Celery soft limit for asynchronous runs and ``SQLLAB_TIMEOUT``
+# SIGALRM for main-thread synchronous runs reach the cancellation handlers.
+# The alarm is main-thread only: threaded synchronous requests are not covered
+# by this change. Each limit fires once, so swallowing it leaves the query running
+# with nothing left to stop it.
+# TimerTimeout raises KeyboardInterrupt inside its block on Windows and converts
+# it to SupersetTimeoutException on exit, after inner cursor cleanup has run.
+TIME_LIMIT_EXCEPTIONS = (
+    SoftTimeLimitExceeded,
+    SupersetTimeoutException,
+    KeyboardInterrupt,
+)
+
+
+def convert_inspector_columns(cols: list[SQLAColumnType]) -> list[ResultSetColumnType]:
+    result_set_columns: list[ResultSetColumnType] = []
+    for col in cols:
+        result_set_columns.append({"column_name": col.get("name"), **col})  # type: ignore
+    return result_set_columns
 
 
 class TimeGrain(NamedTuple):
     name: str  # TODO: redundant field, remove
     label: str
     function: str
-    duration: Optional[str]
+    duration: str | None
 
 
-builtin_time_grains: Dict[Optional[str], str] = {
-    None: __("Original value"),
-    "PT1S": __("Second"),
-    "PT5S": __("5 second"),
-    "PT30S": __("30 second"),
-    "PT1M": __("Minute"),
-    "PT5M": __("5 minute"),
-    "PT10M": __("10 minute"),
-    "PT15M": __("15 minute"),
-    "PT30M": __("30 minute"),
-    "PT1H": __("Hour"),
-    "PT6H": __("6 hour"),
-    "P1D": __("Day"),
-    "P1W": __("Week"),
-    "P1M": __("Month"),
-    "P3M": __("Quarter"),
-    "P1Y": __("Year"),
-    "1969-12-28T00:00:00Z/P1W": __("Week starting Sunday"),
-    "1969-12-29T00:00:00Z/P1W": __("Week starting Monday"),
-    "P1W/1970-01-03T00:00:00Z": __("Week ending Saturday"),
-    "P1W/1970-01-04T00:00:00Z": __("Week_ending Sunday"),
+builtin_time_grains: dict[str | None, str] = {
+    TimeGrainConstants.SECOND: _("Second"),
+    TimeGrainConstants.FIVE_SECONDS: _("5 second"),
+    TimeGrainConstants.THIRTY_SECONDS: _("30 second"),
+    TimeGrainConstants.MINUTE: _("Minute"),
+    TimeGrainConstants.FIVE_MINUTES: _("5 minute"),
+    TimeGrainConstants.TEN_MINUTES: _("10 minute"),
+    TimeGrainConstants.FIFTEEN_MINUTES: _("15 minute"),
+    TimeGrainConstants.THIRTY_MINUTES: _("30 minute"),
+    TimeGrainConstants.HOUR: _("Hour"),
+    TimeGrainConstants.SIX_HOURS: _("6 hour"),
+    TimeGrainConstants.DAY: _("Day"),
+    TimeGrainConstants.WEEK: _("Week"),
+    TimeGrainConstants.MONTH: _("Month"),
+    TimeGrainConstants.QUARTER: _("Quarter"),
+    TimeGrainConstants.YEAR: _("Year"),
+    TimeGrainConstants.WEEK_STARTING_SUNDAY: _("Week starting Sunday"),
+    TimeGrainConstants.WEEK_STARTING_MONDAY: _("Week starting Monday"),
+    TimeGrainConstants.WEEK_ENDING_SATURDAY: _("Week ending Saturday"),
+    TimeGrainConstants.WEEK_ENDING_SUNDAY: _("Week ending Sunday"),
 }
 
 
-class TimestampExpression(ColumnClause):  # pylint: disable=abstract-method
+class TimestampExpression(ColumnClause):  # pylint: disable=abstract-method, too-many-ancestors
     def __init__(self, expr: str, col: ColumnClause, **kwargs: Any) -> None:
-        """Sqlalchemy class that can be can be used to render native column elements
-        respeting engine-specific quoting rules as part of a string-based expression.
+        """Sqlalchemy class that can be used to render native column elements respecting
+        engine-specific quoting rules as part of a string-based expression.
 
         :param expr: Sql expression with '{col}' denoting the locations where the col
         object will be rendered.
@@ -133,12 +228,193 @@ def compile_timegrain_expression(
     return element.name.replace("{col}", compiler.process(element.col, **kwargs))
 
 
-class LimitMethod:  # pylint: disable=too-few-public-methods
-    """Enum the ways that limits can be applied"""
+class MetricType(TypedDict, total=False):
+    """
+    Type for metrics return by `get_metrics`.
+    """
 
-    FETCH_MANY = "fetch_many"
-    WRAP_SQL = "wrap_sql"
-    FORCE_LIMIT = "force_limit"
+    metric_name: str
+    expression: str
+    verbose_name: str | None
+    metric_type: str | None
+    description: str | None
+    d3format: str | None
+    currency: str | None
+    warning_text: str | None
+    extra: str | None
+
+
+class DatabaseCategory:
+    """
+    Standard categories for database classification.
+    Used for organizing databases in documentation and UI.
+
+    Categories are grouped into:
+    - Cloud providers (where the database runs)
+    - Database types (what kind of database it is)
+    - Licensing (open source vs proprietary)
+    """
+
+    # Cloud providers
+    CLOUD_AWS = "Cloud - AWS"
+    CLOUD_GCP = "Cloud - Google"
+    CLOUD_AZURE = "Cloud - Azure"
+    CLOUD_DATA_WAREHOUSES = "Cloud Data Warehouses"
+
+    # Database types
+    APACHE_PROJECTS = "Apache Projects"
+    TRADITIONAL_RDBMS = "Traditional RDBMS"
+    ANALYTICAL_DATABASES = "Analytical Databases"
+    SEARCH_NOSQL = "Search & NoSQL"
+    QUERY_ENGINES = "Query Engines"
+    TIME_SERIES = "Time Series Databases"
+    OTHER = "Other Databases"
+
+    # Licensing
+    OPEN_SOURCE = "Open Source"
+    HOSTED_OPEN_SOURCE = "Hosted Open Source"
+    PROPRIETARY = "Proprietary"
+
+
+class DriverInfo(TypedDict, total=False):
+    """Information about a database driver."""
+
+    name: str
+    pypi_package: str
+    connection_string: str
+    is_recommended: bool
+    notes: str
+    docs_url: str
+
+
+class AuthenticationMethod(TypedDict, total=False):
+    """Information about an authentication method."""
+
+    name: str
+    description: str
+    requirements: str
+    connection_string: str
+    engine_parameters: dict[str, Any]
+    secure_extra: dict[str, Any]
+    notes: str
+
+
+class ConnectionExample(TypedDict, total=False):
+    """Example connection string configuration."""
+
+    description: str
+    connection_string: str
+
+
+class CompatibleDatabase(TypedDict, total=False):
+    """Information about a compatible/derived database."""
+
+    name: str
+    description: str
+    logo: str
+    logo_dark: str
+    homepage_url: str
+    pypi_packages: list[str]
+    connection_string: str
+    parameters: dict[str, str]
+    connection_examples: list[ConnectionExample]
+    notes: str
+    docs_url: str
+    categories: list[str]  # Override parent categories (e.g., for HOSTED_OPEN_SOURCE)
+    known_incompatibilities: list[KnownIncompatibility]
+
+
+class KnownIncompatibility(TypedDict, total=False):
+    """A known, currently-unresolved incompatibility with a Superset dependency."""
+
+    dependency: str  # e.g. "SQLAlchemy 2.0"
+    reason: str
+    tracking_url: str  # upstream issue/PR tracking a fix, if one exists
+    since: str  # ISO date this was last confirmed still broken
+
+
+# Shared `known_incompatibilities` entry for the Aurora Data API driver
+# (`sqlalchemy-aurora-data-api`), used by both the MySQL and PostgreSQL
+# `compatible_databases` metadata for their respective Aurora entries.
+AURORA_DATA_API_KNOWN_INCOMPATIBILITIES: list[KnownIncompatibility] = [
+    {
+        "dependency": "SQLAlchemy 2.0",
+        "reason": (
+            "Neither our fork (preset-io/sqlalchemy-aurora-data-api, "
+            "dormant since 2021) nor the more active community fork "
+            "(cloud-utils/sqlalchemy-aurora-data-api) has resolved "
+            "SQLAlchemy 2.0 compatibility."
+        ),
+        "tracking_url": (
+            "https://github.com/cloud-utils/sqlalchemy-aurora-data-api/issues/43"
+        ),
+        "since": "2026-10-27",
+    }
+]
+
+# EPOCH_FORMATS keys resolve to a f"{pdf}_to_dttm" classmethod, except
+# "epoch_s": its method predates "epoch_ms"/"epoch_us" and kept the shorter
+# legacy name `epoch_to_dttm`. Only exceptions to the naming convention
+# belong here; a new EPOCH_FORMATS entry that follows the convention needs
+# no matching entry in this dict.
+_EPOCH_METHOD_ALIASES = {"epoch_s": "epoch_to_dttm"}
+
+
+class DBEngineSpecMetadata(TypedDict, total=False):
+    """
+    Metadata for database engine documentation and UI display.
+
+    This centralizes all documentation-related information for a database
+    engine, making it easier to add new databases without modifying
+    multiple files.
+    """
+
+    # Basic information
+    description: str
+    logo: str  # Filename in docs/static/img/databases/ or full URL
+    logo_dark: str  # Optional dark-theme variant; falls back to logo
+    homepage_url: str
+    docs_url: str
+    sqlalchemy_docs_url: str
+    categories: list[str]  # Use DatabaseCategory constants, supports multiple
+
+    # Connection information
+    pypi_packages: list[str]
+    connection_string: str
+    default_port: int
+    parameters: dict[str, str]  # Parameter name -> description
+    connection_examples: list[ConnectionExample]
+
+    # Driver options (for databases with multiple drivers)
+    drivers: list[DriverInfo]
+
+    # Authentication methods
+    authentication_methods: list[AuthenticationMethod]
+
+    # Engine parameters (JSON configs for advanced options)
+    engine_parameters: list[dict[str, Any]]
+
+    # Additional information
+    notes: str
+    warnings: list[str]
+    tutorials: list[str]
+    install_instructions: str
+    version_requirements: str
+
+    # Known, currently-unresolved incompatibilities with a Superset
+    # dependency (e.g. a driver that doesn't yet support SQLAlchemy 2.0).
+    # Hopefully temporary; remove the entry once resolved upstream.
+    known_incompatibilities: list[KnownIncompatibility]
+
+    # Related databases (e.g., PostgreSQL-compatible databases)
+    compatible_databases: list[CompatibleDatabase]
+
+    # Host examples (for databases with platform-specific configs)
+    host_examples: list[dict[str, str]]
+
+    # Advanced features documentation
+    ssl_configuration: dict[str, Any]
+    advanced_features: dict[str, str]
 
 
 class BaseEngineSpec:  # pylint: disable=too-many-public-methods
@@ -153,36 +429,95 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         allows_hidden_orderby_agg:     Whether the engine allows ORDER BY to
                                        directly use aggregation clauses, without
                                        having to add the same aggregation in SELECT.
+        select_alias_shadows_source_column: Whether the engine resolves an
+                                       identifier to a SELECT alias before a
+                                       source column of the same name in every
+                                       clause (WHERE, GROUP BY, HAVING, ORDER
+                                       BY), so such aliases must be renamed.
     """
 
+    engine_name: str | None = None  # for user messages, overridden in child classes
+
+    # Documentation metadata for this engine spec. Centralizes all documentation
+    # information so adding a new database only requires modifying one file.
+    # See DBEngineSpecMetadata TypedDict for available fields.
+    metadata: DBEngineSpecMetadata = {}
+
+    # These attributes map the DB engine spec to one or more SQLAlchemy dialects/drivers;  # noqa: E501
+    # see the ``supports_url`` and ``supports_backend`` methods below.
     engine = "base"  # str as defined in sqlalchemy.engine.engine
-    engine_aliases: Set[str] = set()
-    engine_name: Optional[
-        str
-    ] = None  # used for user messages, overridden in child classes
-    _date_trunc_functions: Dict[str, str] = {}
-    _time_grain_expressions: Dict[Optional[str], str] = {}
-    column_type_mappings: Tuple[
-        Tuple[
-            Pattern[str],
-            Union[TypeEngine, Callable[[Match[str]], TypeEngine]],
-            GenericDataType,
-        ],
-        ...,
-    ] = (
+    engine_aliases: set[str] = set()
+    drivers: dict[str, str] = {}
+    default_driver: str | None = None
+    # Historical default names that must continue to match DBS_AVAILABLE_DENYLIST.
+    default_driver_aliases: tuple[str, ...] = ()
+
+    # placeholder with the SQLAlchemy URI template
+    sqlalchemy_uri_placeholder = (
+        "engine+driver://user:password@host:port/dbname[?key=value&key=value...]"
+    )
+
+    disable_ssh_tunneling = False
+
+    _date_trunc_functions: dict[str, str] = {}
+    _time_grain_expressions: dict[str | None, str] = {}
+
+    # Whether the output of ``normalize_custom_sql_metric`` may be embedded in
+    # generated SQL verbatim (after line comments are converted to block
+    # comments) instead of being re-rendered by ``sanitize_clause``. Specs that
+    # override ``normalize_custom_sql_metric`` with a source-preserving
+    # normalizer set this so re-rendering cannot undo the normalization.
+    preserves_custom_sql_metric_source = False
+
+    @classmethod
+    def normalize_custom_sql_metric(cls, expression: str) -> str:
+        """Return custom metric SQL in the engine's canonical form."""
+        return expression
+
+    _default_column_type_mappings: tuple[ColumnTypeMapping, ...] = (
+        (
+            re.compile(r"^string", re.IGNORECASE),
+            types.String(),
+            GenericDataType.STRING,
+        ),
+        (
+            re.compile(r"^n((var)?char|text)", re.IGNORECASE),
+            types.UnicodeText(),
+            GenericDataType.STRING,
+        ),
+        (
+            re.compile(r"^(var)?char", re.IGNORECASE),
+            types.String(),
+            GenericDataType.STRING,
+        ),
+        (
+            re.compile(r"^(tiny|medium|long)?text", re.IGNORECASE),
+            types.String(),
+            GenericDataType.STRING,
+        ),
         (
             re.compile(r"^smallint", re.IGNORECASE),
             types.SmallInteger(),
             GenericDataType.NUMERIC,
         ),
         (
-            re.compile(r"^int.*", re.IGNORECASE),
+            re.compile(r"^tinyint", re.IGNORECASE),
+            types.SmallInteger(),
+            GenericDataType.NUMERIC,
+        ),
+        (
+            re.compile(r"^int(eger)?", re.IGNORECASE),
             types.Integer(),
             GenericDataType.NUMERIC,
         ),
         (
             re.compile(r"^bigint", re.IGNORECASE),
             types.BigInteger(),
+            GenericDataType.NUMERIC,
+        ),
+        (
+            re.compile(r"^long", re.IGNORECASE),
+            types.Float(),
             GenericDataType.NUMERIC,
         ),
         (
@@ -195,13 +530,21 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
             types.Numeric(),
             GenericDataType.NUMERIC,
         ),
-        (re.compile(r"^float", re.IGNORECASE), types.Float(), GenericDataType.NUMERIC,),
+        (
+            re.compile(r"^float", re.IGNORECASE),
+            types.Float(),
+            GenericDataType.NUMERIC,
+        ),
         (
             re.compile(r"^double", re.IGNORECASE),
             types.Float(),
             GenericDataType.NUMERIC,
         ),
-        (re.compile(r"^real", re.IGNORECASE), types.REAL, GenericDataType.NUMERIC,),
+        (
+            re.compile(r"^real", re.IGNORECASE),
+            types.REAL,
+            GenericDataType.NUMERIC,
+        ),
         (
             re.compile(r"^smallserial", re.IGNORECASE),
             types.SmallInteger(),
@@ -223,26 +566,10 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
             GenericDataType.NUMERIC,
         ),
         (
-            re.compile(r"^string", re.IGNORECASE),
-            types.String(),
-            utils.GenericDataType.STRING,
+            re.compile(r"^timestamp", re.IGNORECASE),
+            types.TIMESTAMP(),
+            GenericDataType.TEMPORAL,
         ),
-        (
-            re.compile(r"^N((VAR)?CHAR|TEXT)", re.IGNORECASE),
-            UnicodeText(),
-            utils.GenericDataType.STRING,
-        ),
-        (
-            re.compile(r"^((VAR)?CHAR|TEXT|STRING)", re.IGNORECASE),
-            String(),
-            utils.GenericDataType.STRING,
-        ),
-        (
-            re.compile(r"^((TINY|MEDIUM|LONG)?TEXT)", re.IGNORECASE),
-            String(),
-            utils.GenericDataType.STRING,
-        ),
-        (re.compile(r"^LONG", re.IGNORECASE), types.Float(), GenericDataType.NUMERIC,),
         (
             re.compile(r"^datetime", re.IGNORECASE),
             types.DateTime(),
@@ -250,12 +577,12 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         ),
         (
             re.compile(r"^date", re.IGNORECASE),
-            types.DateTime(),
+            types.Date(),
             GenericDataType.TEMPORAL,
         ),
         (
-            re.compile(r"^timestamp", re.IGNORECASE),
-            types.TIMESTAMP(),
+            re.compile(r"^time", re.IGNORECASE),
+            types.Time(),
             GenericDataType.TEMPORAL,
         ),
         (
@@ -263,49 +590,887 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
             types.Interval(),
             GenericDataType.TEMPORAL,
         ),
-        (re.compile(r"^time", re.IGNORECASE), types.Time(), GenericDataType.TEMPORAL,),
         (
-            re.compile(r"^bool.*", re.IGNORECASE),
+            re.compile(r"^bool(ean)?", re.IGNORECASE),
             types.Boolean(),
             GenericDataType.BOOLEAN,
         ),
     )
+    # engine-specific type mappings to check prior to the defaults
+    column_type_mappings: tuple[ColumnTypeMapping, ...] = ()
+
+    # type-specific functions to mutate values received from the database.
+    # Needed on certain databases that return values in an unexpected format
+    column_type_mutators: dict[TypeEngine, Callable[[Any], Any]] = {}
 
     # Does database support join-free timeslot grouping
     time_groupby_inline = False
     limit_method = LimitMethod.FORCE_LIMIT
-    time_secondary_columns = False
+    supports_multivalues_insert = False
+    # Whether this engine supports first-class multi-value (array-typed) columns.
+    # When True, array columns are classified as ``GenericDataType.MULTI_VALUE`` and
+    # the ``array_*`` capability methods below must be implemented. Defaults to
+    # False so engines that have not opted in keep treating arrays as strings.
+    supports_multivalue_columns = False
+    supports_temporal_column_shift: bool = False
     allows_joins = True
     allows_subqueries = True
     allows_alias_in_select = True
+    # Appended to a ``SELECT`` that has no ``FROM`` -- evaluating expressions
+    # and nothing else. Most engines accept a bare ``SELECT 1``; Oracle, DB2
+    # and Db2 for i require a one-row table to select it from.
+    select_without_from_suffix: str = ""
+    # Whether ``=`` on a text column compares byte-exactly by default: no case
+    # folding, no trailing-space padding, no accent insensitivity.
+    #
+    # Partition filter mapping needs this. It mirrors ``col = v`` onto
+    # ``partition_col = T(v)`` on the strength of ``col = v`` implying
+    # ``T(col) = T(v)``, which holds for value equality and not for SQL
+    # equality: under a case-insensitive collation a stored ``'us'`` satisfies
+    # a filter for ``'US'``, while the mirror ``hex('US')`` excludes the row,
+    # and the chart silently loses it. False by default, so a spec that has
+    # not said so does not mirror string equality.
+    #
+    # This speaks for the engine's *default* comparison only. A column
+    # declaring its own non-binary collation (``country COLLATE NOCASE``) is
+    # invisible to Superset -- nothing in SQLAlchemy's reflection or the engine
+    # specs exposes it -- so on such a column the assumption remains the
+    # owner's, like ``p = T(mapped_col)`` itself.
+    binary_string_comparison: bool = False
+
+    # Every text form this engine reads as a date or timestamp when one is
+    # compared against a temporal column. `strftime`/`strptime` patterns.
+    #
+    # Partition filter mapping needs this. A bucketing key such as
+    # ``to_char(:value, 'YYYYMMDD')`` is legitimately text, so the mirror
+    # ``part_date = '20260115'`` has to be allowed against a ``DATE`` partition
+    # column -- but only where the engine reads it, because comparing a
+    # temporal column against text is an implicit coercion an engine need not
+    # have. Trino has no VARCHAR-to-DATE comparison and BigQuery coerces only a
+    # canonical ``YYYY-MM-DD`` *literal*, so on those even plain ISO text fails
+    # the whole chart rather than merely losing the pruning -- which is why the
+    # ISO forms are declared here too rather than assumed universal.
+    #
+    # Empty by default, so an engine Superset has not confirmed declines the
+    # mirror and keeps the query working. Declared on concrete specs, not on a
+    # shared base: `PostgresBaseEngineSpec` is inherited by Snowflake, whose
+    # AUTO date input reads an all-digit string as epoch seconds instead.
+    temporal_literal_formats: tuple[str, ...] = ()
+
     allows_alias_in_orderby = True
     allows_sql_comments = True
+    allows_escaped_colons = True
+
+    # Whether the engine supports OFFSET in SQL queries. Defaults to True;
+    # engines like Elasticsearch SQL that do not support OFFSET set this to
+    # False and are expected to implement `fetch_data_with_cursor` for
+    # pagination via another mechanism (e.g. Elasticsearch's cursor API).
+    supports_offset = True
+
+    # Whether the engine's SQL grammar requires OFFSET to appear *before* LIMIT
+    # (Presto and Trino), unlike the ANSI ``LIMIT ... OFFSET`` ordering. Most
+    # SQLAlchemy dialects for these engines emit the clauses in the correct
+    # order, but some drivers (notably PyHive's Presto/Trino dialects) inherit
+    # the ANSI ordering, which Presto and Trino reject with a syntax error
+    # (``mismatched input 'OFFSET'``). When True, Superset normalizes compiled
+    # SQL so OFFSET precedes LIMIT, making paginated queries (e.g. Drill to
+    # Detail page 2+) valid regardless of the installed driver.
+    offset_before_limit = False
 
     # Whether ORDER BY clause can use aliases created in SELECT
     # that are the same as a source column
     allows_alias_to_source_column = True
 
-    # Whether ORDER BY clause must appear in SELECT
-    # if TRUE, then it doesn't have to.
-    allows_hidden_ordeby_agg = True
+    # Whether the engine resolves an identifier to a SELECT alias before a source
+    # column of the same name, in WHERE, GROUP BY, HAVING and ORDER BY alike
+    # (ClickHouse). An alias such as `DATE_TRUNC(ts) AS ts` then changes what the
+    # query's other clauses read, so chart queries rename it.
+    select_alias_shadows_source_column = False
 
-    # Whether ORDER BY clause can use sql caculated expression
+    # Whether ORDER BY clause must appear in SELECT
+    # if True, then it doesn't have to.
+    allows_hidden_orderby_agg = True
+
+    # Whether ORDER BY clause can use sql calculated expression
     # if True, use alias of select column for `order by`
     # the True is safely for most database
     # But for backward compatibility, False by default
     allows_hidden_cc_in_orderby = False
 
+    # Whether allow CTE as subquery or regular CTE
+    # If True, then it will allow  in subquery ,
+    # if False it will allow as regular CTE
+    allows_cte_in_subquery = True
+    # Define alias for CTE
+    cte_alias = "__cte"
+    # A set of disallowed connection query parameters by driver name
+    disallow_uri_query_params: dict[str, set[str]] = {}
+    # A Dict of query parameters that will always be used on every connection
+    # by driver name
+
+    # Whether to use equality operators (= true/false) instead of IS operators
+    # for boolean filters. Some databases like Snowflake don't support IS true/false
+    use_equality_for_boolean_filters = False
+    enforce_uri_query_params: dict[str, dict[str, Any]] = {}
+
     force_column_alias_quotes = False
     arraysize = 0
-    max_column_name_length = 0
+    max_column_name_length: int | None = None
+
+    # Characters used to quote identifiers (table/column names) that aren't simple.
+    # Defaults to ANSI double quotes; dialects that differ override these — e.g.
+    # MySQL/MariaDB use backticks and SQL Server uses square brackets. These are
+    # surfaced to the client (see `get_public_information`) so identifier quoting
+    # stays owned by the engine spec rather than duplicated per client.
+    identifier_quote_start: str = '"'
+    identifier_quote_end: str = '"'
+    # How an embedded closing-quote character is escaped within a quoted
+    # identifier. Most dialects (ANSI, MySQL/MariaDB backticks, SQL Server
+    # brackets) escape by doubling the closing character. BigQuery's GoogleSQL
+    # backtick identifiers are the exception, escaping with a backslash instead,
+    # so it overrides this to False.
+    identifier_quote_escape_by_doubling: bool = True
+
+    # Some databases (e.g. Druid, Pinot) build cursor.description by inspecting
+    # the values in the first returned row rather than from query-plan metadata.
+    # For those engines WHERE FALSE returns no rows and therefore leaves
+    # cursor.description as None, which breaks the adhoc column type probe.
+    # Set this to True on any engine spec where at least one row must be
+    # fetched for cursor.description to be populated.
+    type_probe_needs_row: bool = False
+    requires_column_value_normalization: bool = False
     try_remove_schema_from_table_name = True  # pylint: disable=invalid-name
     run_multiple_statements_as_one = False
-    custom_errors: Dict[
-        Pattern[str], Tuple[str, SupersetErrorType, Dict[str, Any]]
+    custom_errors: dict[
+        Pattern[str], tuple[str, SupersetErrorType, dict[str, Any]]
     ] = {}
 
+    # JSONPath fields in `encrypted_extra` that should be masked when the database is
+    # edited. Can be a set of paths (labels will default to the path) or a dict mapping
+    # paths to human-readable labels for import validation error messages.
+    # pylint: disable=invalid-name
+    encrypted_extra_sensitive_fields: set[str] | dict[str, str] = {
+        "$.*": "Encrypted Extra",
+    }
+
+    # Whether the engine supports file uploads
+    # if True, database will be listed as option in the upload file form
+    supports_file_upload = True
+
+    # Whether the engine supports SQL GROUPING SETS / ROLLUP / CUBE. When True,
+    # consumers (e.g. the pivot table's non-additive totals) can collapse the
+    # per-rollup-level queries into a single GROUPING SETS query instead of
+    # issuing one query per level. Conservative default of False; engines opt in.
+    supports_grouping_sets = False
+
+    # SQL-generating callables for metric aggregates that have no safe, universal
+    # cross-dialect spelling -- unlike SUM/COUNT/AVG/MIN/MAX/COUNT_DISTINCT (see
+    # `SqlaTable.sqla_aggregations`), which SQLAlchemy's generic `sa.func` can emit
+    # unchanged on every engine. Keyed by `Aggregate` name (see
+    # `superset-frontend/packages/superset-ui-core/src/query/types/Metric.ts`);
+    # each value takes a SQLAlchemy column and returns the aggregate expression.
+    # Absent by default: an aggregate not present here is unsupported on this
+    # engine, and callers must surface a clear "not supported" error rather than
+    # emit unverified SQL (a wrong statistic returned silently is worse than an
+    # error). Engines opt in via `get_extended_aggregation_func` below once the
+    # expression has been verified against real engine behavior, not assumed
+    # from syntax alone -- see the MySQL engine spec for a concrete example of
+    # why this distinction matters (its `VARIANCE()` computes the *population*
+    # variance, not the *sample* variance `VAR_SAMP` denotes).
+    _extended_aggregations: dict[str, Callable[[ColumnElement], ColumnElement]] = {}
+
     @classmethod
-    def get_dbapi_exception_mapping(cls) -> Dict[Type[Exception], Type[Exception]]:
+    def get_extended_aggregation_func(
+        cls, aggregate: str
+    ) -> Callable[[ColumnElement], ColumnElement] | None:
+        """
+        SQL-generating callable for an aggregate not handled by the generic
+        `sa.func` mapping (e.g. MEDIAN, STDDEV_SAMP, VAR_SAMP). Returns None if
+        this engine has no verified, correct expression for it.
+        """
+        return cls._extended_aggregations.get(aggregate)
+
+    # Is the DB engine spec able to change the default schema? This requires implementing  # noqa: E501
+    # a custom `adjust_engine_params` method.
+    supports_dynamic_schema = False
+
+    # Does the qualified identifier built by `quote_table` include the schema (and
+    # catalog, if any)? True for virtually every engine. A driver that treats the
+    # whole FROM reference as a single opaque name (e.g. PyMongoSQL, which resolves
+    # `schema.table` as a literal collection name instead of parsing it) sets this to
+    # False and overrides `quote_table` to emit only the table, relying on
+    # `adjust_engine_params`/`supports_dynamic_schema` to select the schema at the
+    # connection level instead. `SqlaTable.get_sqla_table` consults this flag so
+    # datasets build the same FROM-clause identifier as `select_star` (SQL Lab).
+    quote_table_includes_schema = True
+
+    # Does the DB support catalogs? A catalog here is a group of schemas, and has
+    # different names depending on the DB: BigQuery calles it a "project", Postgres calls  # noqa: E501
+    # it a "database", Trino calls it a "catalog", etc.
+    #
+    # When this is changed to true in a DB engine spec it MUST support the
+    # `get_default_catalog` and `get_catalog_names` methods. In addition, you MUST write
+    # a database migration updating any existing schema permissions using the helper
+    # `upgrade_catalog_perms`.
+    supports_catalog = False
+
+    # Can the catalog be changed on a per-query basis?
+    supports_dynamic_catalog = False
+
+    # Does the DB engine spec support cross-catalog queries?
+    supports_cross_catalog_queries = False
+
+    # Are catalog names case-insensitive? When True, a catalog can appear in
+    # permissions with different cases (eg, the catalog listing returns `SALES` while
+    # the connection URI says `sales`), and catalog/schema permissions match when only
+    # the case of the catalog differs. Database and schema names still match exactly.
+    # Only set this for engines where catalogs that differ only by case are the same
+    # catalog, otherwise users would be granted access to a different catalog.
+    case_insensitive_catalogs = False
+
+    # Does the DB engine support schemas? When set to False the schema selector is
+    # hidden in the dataset creation UI and schema is not required for table access.
+    supports_schemas = True
+
+    # Does the engine supports OAuth 2.0? This requires logic to be added to one of the
+    # the user impersonation methods to handle personal tokens.
+    supports_oauth2 = False
+
+    # Can a connection on this engine carry a username/password used only for embedded
+    # guest requests? Opting in requires the engine's impersonation to be a no-op for
+    # the fallback path, so that the stored credential -- rather than a per-user OAuth2
+    # token the guest does not have -- authenticates the connection.
+    supports_embedded_credential_fallback = False
+    oauth2_scope = ""
+    oauth2_authorization_request_uri: str | None = None  # pylint: disable=invalid-name
+    oauth2_token_request_uri: str | None = None
+    oauth2_token_request_type = "data"  # noqa: S105
+
+    # Driver-specific query params to be included in `get_oauth2_authorization_uri`
+    oauth2_additional_auth_uri_query_params: dict[str, Any] = {}
+    # Driver-specific params to be included in the `get_oauth2_token` request body
+    oauth2_additional_token_request_params: dict[str, Any] = {}
+    # Driver-specific exception that should be mapped to OAuth2RedirectError
+    oauth2_exception: type[Exception] | tuple[type[Exception], ...] = (
+        OAuth2RedirectError
+    )
+
+    # Default partition value transform offered by the dataset editor when a
+    # temporal column is mapped onto a partition column. `:value` stands for the
+    # filter bound being mirrored. The expression is engine syntax, so the
+    # default only belongs on engines where it actually parses; `None` means the
+    # editor offers no pre-fill and the owner writes the transform themselves.
+    partition_value_transform_default: str | None = None
+
+    # Does the query id related to the connection?
+    # The default value is True, which means that the query id is determined when
+    # the connection is created.
+    # When this is changed to false in a DB engine spec it means the query id
+    # is determined only after the specific query is executed and it will update
+    # the `cancel_query` value in the `extra` field of the `query` object
+    has_query_id_before_execute = True
+
+    # Can another thread read ``get_cancel_query_id`` from the live cursor
+    # while ``execute`` is still blocked? Clients that block until results are
+    # ready (e.g. Trino's) expose the id only then, which lets an execution
+    # owner cancel a query whose caller has given up.
+    has_query_id_during_execute = False
+
+    @classmethod
+    def apply_sampling_read_limit_override(cls, sql: str) -> str | None:
+        """Build the bounded-read retry form of system-authored sampling SQL.
+
+        Some engines reject bounded queries from a pre-execution row estimate
+        that ignores LIMIT (e.g. ClickHouse ``max_rows_to_read``), which breaks
+        Superset-authored sampling queries (filter values, samples/preview,
+        datetime format detection) on large tables. Engine specs that support
+        a bounded-read override return a modified query; ``None`` (the base
+        implementation, mirroring ``get_column_description_retry_sql``) means
+        no retry is available.
+
+        The override must only be applied to sampling queries whose statement
+        Superset generated (a physical-table dataset, not a virtual dataset's
+        user-authored base query), and only as a retry after the engine
+        rejected the un-modified statement with a read-limit error (see
+        ``is_read_limit_error``), so deployments whose queries already succeed
+        — including ClickHouse users connected with ``readonly=1``, which
+        rejects in-query SETTINGS changes — never see altered SQL. Callers go
+        through ``Database.sampling_read_limit_retry_sql`` so the per-database
+        opt-out is honored.
+        """
+        return None
+
+    @classmethod
+    def is_read_limit_error(cls, ex: Exception) -> bool:
+        """Return True when the exception is this engine's read-limit rejection.
+
+        Used to decide whether a failed system-sampling query should be
+        retried with ``apply_sampling_read_limit_override``. The base
+        implementation recognizes nothing.
+        """
+        return False
+
+    @classmethod
+    def encrypted_extra_sensitive_field_paths(cls) -> set[str]:
+        """
+        Returns a set of JSONPath expressions for fields that should be masked
+        in the ``masked_encrypted_extra`` JSON.
+
+        The OAuth2 client secret and the embedded fallback credential's secrets are
+        always included: ``Database`` reads both blocks from the ``encrypted_extra``
+        of any database regardless of its engine, so engine specs that override
+        ``encrypted_extra_sensitive_fields`` cannot accidentally expose them.
+        """
+        return set(cls.encrypted_extra_sensitive_fields) | {
+            "$.oauth2_client_info.secret",
+            f"$.{EMBEDDED_CREDENTIALS_KEY}.password",
+            f"$.{EMBEDDED_CREDENTIALS_KEY}.privatekey_body",
+            f"$.{EMBEDDED_CREDENTIALS_KEY}.privatekey_pass",
+        }
+
+    @classmethod
+    def get_rls_method(cls) -> RLSMethod:
+        """
+        Returns the RLS method to be used for this engine.
+
+        There are two ways to insert RLS: either replacing the table with a subquery
+        that has the RLS, or appending the RLS to the ``WHERE`` clause. The former is
+        safer, but not supported in all databases.
+        """
+        return (
+            RLSMethod.AS_SUBQUERY
+            if cls.allows_subqueries and cls.allows_alias_in_select
+            else RLSMethod.AS_PREDICATE
+        )
+
+    @classmethod
+    def is_oauth2_enabled(cls) -> bool:
+        return (
+            cls.supports_oauth2
+            and cls.engine_name in app.config["DATABASE_OAUTH2_CLIENTS"]
+        )
+
+    @classmethod
+    def start_oauth2_dance(cls, database: Database) -> None:
+        """
+        Start the OAuth2 dance.
+
+        This method will raise a custom exception that is captured by the frontend to
+        start the OAuth2 authentication. The frontend will open a new tab where the user
+        can authorize Superset to access the database. Once the user has authorized, the
+        tab sends a message to the original tab informing that authorization was
+        successful (or not), and then closes. The original tab will automatically
+        re-run the query after authorization.
+
+        PKCE (RFC 7636) is used to protect against authorization code interception
+        attacks. A code_verifier is generated and stored server-side in the KV store,
+        while the code_challenge (derived from the verifier) is sent to the
+        authorization server.
+        """
+        # Prevent circular import.
+        from superset.daos.key_value import KeyValueDAO
+
+        # Every caller is expected to have gone through `needs_oauth2`, which refuses
+        # the dance for principals that cannot complete it. This is the backstop: the
+        # state below needs a user id, and an embedded `GuestUser` has none, so without
+        # it a caller that skipped the check gets an `AttributeError` and a 500 rather
+        # than something a reader can act on.
+        user_id = getattr(getattr(g, "user", None), "id", None)
+        if user_id is None:
+            raise OAuth2Error(
+                "OAuth2 requires an authenticated user with an id; "
+                "the current principal has none"
+            )
+
+        tab_id = str(uuid4())
+        default_redirect_uri = get_oauth2_redirect_uri()
+
+        # Generate PKCE code verifier (RFC 7636)
+        code_verifier = generate_code_verifier()
+
+        # Store the code_verifier server-side in the KV store, keyed by tab_id.
+        # This avoids exposing it in the URL/browser history via the JWT state.
+        KeyValueDAO.delete_expired_entries(KeyValueResource.PKCE_CODE_VERIFIER)
+        KeyValueDAO.create_entry(
+            resource=KeyValueResource.PKCE_CODE_VERIFIER,
+            value={"code_verifier": code_verifier},
+            codec=JsonKeyValueCodec(),
+            key=UUID(tab_id),
+            expires_on=datetime.now() + timedelta(minutes=5),
+        )
+        # We need to commit here because we're going to raise an exception, which will
+        # revert any non-commited changes.
+        db.session.commit()  # pylint: disable=consider-using-transaction
+
+        # The state is passed to the OAuth2 provider, and sent back to Superset after
+        # the user authorizes the access. The redirect endpoint in Superset can then
+        # inspect the state to figure out to which user/database the access token
+        # belongs to.
+        state: OAuth2State = {
+            # Database ID and user ID are the primary key associated with the token.
+            "database_id": database.id,
+            "user_id": user_id,
+            # In multi-instance deployments there might be a single proxy handling
+            # redirects, with a custom `DATABASE_OAUTH2_REDIRECT_URI`. Since the OAuth2
+            # application requires every redirect URL to be registered a priori, this
+            # allows OAuth2 to be used where new instances are being constantly
+            # deployed. The proxy can extract `default_redirect_uri` from the state and
+            # then forward the token to the instance that initiated the authentication.
+            "default_redirect_uri": default_redirect_uri,
+            # When OAuth2 is complete the browser tab where OAuth2 happened will send a
+            # message to the original browser tab informing that the process was
+            # successful. To allow cross-tab commmunication in a safe way we assign a
+            # UUID to the original tab, and the second tab will use it when sending the
+            # message.
+            "tab_id": tab_id,
+        }
+        oauth2_config = database.get_oauth2_config()
+        if oauth2_config is None:
+            raise OAuth2Error("No configuration found for OAuth2")
+
+        oauth_url = cls.get_oauth2_authorization_uri(
+            oauth2_config,
+            state,
+            code_verifier=code_verifier,
+        )
+
+        raise OAuth2RedirectError(oauth_url, tab_id, default_redirect_uri)
+
+    @classmethod
+    def resolve_oauth2_client_info(
+        cls,
+        database: Database,
+        client_info: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Complete a database's ``oauth2_client_info`` before it is validated.
+
+        Engine specs that can derive values (for example the OAuth2 endpoints
+        from the connection host) return a copy with the missing values filled
+        in; values set explicitly must be kept. The default returns it as is.
+        """
+        return client_info
+
+    @classmethod
+    def get_oauth2_config(cls) -> OAuth2ClientConfig | None:
+        """
+        Build the DB engine spec level OAuth2 client config.
+        """
+        oauth2_config = app.config["DATABASE_OAUTH2_CLIENTS"]
+        if cls.engine_name not in oauth2_config:
+            return None
+
+        db_engine_spec_config = oauth2_config[cls.engine_name]
+        redirect_uri = get_oauth2_redirect_uri()
+
+        config: OAuth2ClientConfig = {
+            "id": db_engine_spec_config["id"],
+            "secret": db_engine_spec_config["secret"],
+            "scope": db_engine_spec_config.get("scope") or cls.oauth2_scope,
+            "redirect_uri": redirect_uri,
+            "authorization_request_uri": db_engine_spec_config.get(
+                "authorization_request_uri",
+                cls.oauth2_authorization_request_uri,
+            ),
+            "token_request_uri": db_engine_spec_config.get(
+                "token_request_uri",
+                cls.oauth2_token_request_uri,
+            ),
+            "request_content_type": db_engine_spec_config.get(
+                "request_content_type", cls.oauth2_token_request_type
+            ),
+        }
+
+        return config
+
+    @staticmethod
+    def _validate_oauth2_endpoint_host(uri: str) -> None:
+        """
+        Validate an OAuth2 authorization/token endpoint URI before it's used.
+
+        ``config["authorization_request_uri"]``/``config["token_request_uri"]``
+        can come from a database's own ``encrypted_extra.oauth2_client_info``
+        (editable by anyone with ``can_write`` on Database, not just the
+        deployment operator). The authorization URI is handed to the user's
+        browser as a redirect target; the token URI is POSTed to directly by
+        this server, carrying the connection's ``client_secret`` in the
+        request body. Neither is otherwise validated, so an attacker with
+        write access to one database's config could point either at an
+        internal host, exfiltrating the client secret (token URI) or using
+        Superset as an open redirect into the internal network (authorization
+        URI) -- and since the connection is typically shared, this is
+        exercised by every user who goes through that database's OAuth2 flow,
+        not just the one who configured it.
+
+        Operators with a legitimately internal IdP can opt out via
+        ``DATABASE_OAUTH2_ALLOW_INTERNAL_HOSTS`` -- but that flag only
+        widens which *hosts* are acceptable, not which URI *schemes* are;
+        a non-http(s) scheme is refused unconditionally.
+        """
+        try:
+            parsed = urlparse(uri)
+        except ValueError as ex:
+            # e.g. an unmatched IPv6 bracket -- urlparse raises rather than
+            # returning an unusable result.
+            raise OAuth2Error("Invalid OAuth2 endpoint URI") from ex
+
+        if parsed.scheme not in ("http", "https"):
+            raise OAuth2Error("Invalid OAuth2 endpoint URI")
+
+        if app.config["DATABASE_OAUTH2_ALLOW_INTERNAL_HOSTS"]:
+            return
+
+        if not parsed.hostname or not is_safe_host(parsed.hostname):
+            logger.warning("OAuth2 endpoint refused: target host is not allowed")
+            raise OAuth2Error("Invalid OAuth2 endpoint URI")
+
+    @classmethod
+    def get_oauth2_authorization_uri(
+        cls,
+        config: OAuth2ClientConfig,
+        state: OAuth2State,
+        code_verifier: str | None = None,
+    ) -> str:
+        """
+        Return URI for initial OAuth2 request.
+
+        Uses standard OAuth 2.0 parameters plus PKCE (RFC 7636) parameters.
+        Subclasses can override to add provider-specific parameters
+        (e.g., Google's prompt=consent).
+        """
+        uri = config["authorization_request_uri"]
+        cls._validate_oauth2_endpoint_host(uri)
+        params: dict[str, str] = {
+            "scope": config["scope"],
+            "response_type": "code",
+            "state": encode_oauth2_state(state),
+            "redirect_uri": config["redirect_uri"],
+            "client_id": config["id"],
+            **cls.oauth2_additional_auth_uri_query_params,
+        }
+
+        # Add PKCE parameters (RFC 7636) if code_verifier is provided
+        if code_verifier:
+            params["code_challenge"] = generate_code_challenge(code_verifier)
+            params["code_challenge_method"] = "S256"
+
+        return urljoin(uri, "?" + urlencode(params))
+
+    @classmethod
+    def get_oauth2_token(
+        cls,
+        config: OAuth2ClientConfig,
+        code: str,
+        code_verifier: str | None = None,
+    ) -> OAuth2TokenResponse:
+        """
+        Exchange authorization code for refresh/access tokens.
+
+        If code_verifier is provided (PKCE flow), it will be included in the
+        token request per RFC 7636.
+        """
+        timeout = app.config["DATABASE_OAUTH2_TIMEOUT"].total_seconds()
+        uri = config["token_request_uri"]
+        cls._validate_oauth2_endpoint_host(uri)
+        req_body: dict[str, str] = {
+            "code": code,
+            "client_id": config["id"],
+            "client_secret": config["secret"],
+            "redirect_uri": config["redirect_uri"],
+            "grant_type": "authorization_code",
+            **cls.oauth2_additional_token_request_params,
+        }
+        # Add PKCE code_verifier if present (RFC 7636)
+        if code_verifier:
+            req_body["code_verifier"] = code_verifier
+
+        # `_validate_oauth2_endpoint_host` only checked the hostname; a
+        # server at that (safe) host could still respond with a 30x
+        # redirecting the actual request to an internal target, or a
+        # low-TTL DNS record could resolve differently by the time this
+        # connects (DNS rebinding). Don't follow redirects, and re-validate
+        # the address actually connected to.
+        requester = get_ssrf_safe_requester(
+            allow_unsafe_hosts=app.config["DATABASE_OAUTH2_ALLOW_INTERNAL_HOSTS"]
+        )
+        response = (
+            requester.post(uri, data=req_body, timeout=timeout, allow_redirects=False)
+            if config["request_content_type"] == "data"
+            else requester.post(
+                uri, json=req_body, timeout=timeout, allow_redirects=False
+            )
+        )
+        response.raise_for_status()
+        return response.json()
+
+    @classmethod
+    def get_oauth2_fresh_token(
+        cls,
+        config: OAuth2ClientConfig,
+        refresh_token: str,
+    ) -> OAuth2TokenResponse:
+        """
+        Refresh an access token that has expired.
+        """
+        timeout = app.config["DATABASE_OAUTH2_TIMEOUT"].total_seconds()
+        uri = config["token_request_uri"]
+        cls._validate_oauth2_endpoint_host(uri)
+        req_body = {
+            "client_id": config["id"],
+            "client_secret": config["secret"],
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        }
+        # See the matching comment in ``get_oauth2_token``: the hostname
+        # check above doesn't protect against a 30x redirect to an internal
+        # target or DNS rebinding, so route through the peer-validating
+        # requester and refuse to follow redirects.
+        requester = get_ssrf_safe_requester(
+            allow_unsafe_hosts=app.config["DATABASE_OAUTH2_ALLOW_INTERNAL_HOSTS"]
+        )
+        response = (
+            requester.post(uri, data=req_body, timeout=timeout, allow_redirects=False)
+            if config["request_content_type"] == "data"
+            else requester.post(
+                uri, json=req_body, timeout=timeout, allow_redirects=False
+            )
+        )
+        if response.status_code in (400, 401, 403):
+            try:
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    payload = json.loads(response.text)
+                error = payload.get("error")
+            except (ValueError, TypeError, AttributeError):
+                error = None
+            # RFC 6749 defines invalid_grant for an invalid, expired, or revoked
+            # refresh token. Other error responses can be transient or indicate a
+            # client configuration problem and must not invalidate stored tokens.
+            if error == "invalid_grant":
+                raise OAuth2TokenRefreshError()
+        response.raise_for_status()
+        return response.json()
+
+    @classmethod
+    def get_allows_alias_in_select(
+        cls,
+        database: Database,  # pylint: disable=unused-argument
+    ) -> bool:
+        """
+        Method for dynamic `allows_alias_in_select`.
+
+        In Dremio this atribute is version-dependent, so Superset needs to inspect the
+        database configuration in order to determine it. This method allows engine-specs
+        to define dynamic values for the attribute.
+        """
+        return cls.allows_alias_in_select
+
+    @classmethod
+    def get_limit_method(
+        cls,
+        database: Database,  # pylint: disable=unused-argument
+    ) -> LimitMethod:
+        """
+        Method for dynamic `limit_method`.
+
+        In Oracle the limit syntax is version-dependent, so Superset needs to inspect
+        the database configuration in order to determine it. This method allows
+        engine-specs to define dynamic values for the attribute.
+        """
+        return cls.limit_method
+
+    @classmethod
+    def supports_url(cls, url: URL) -> bool:
+        """
+        Returns true if the DB engine spec supports a given SQLAlchemy URL.
+
+        As an example, if a given DB engine spec has:
+
+            class PostgresDBEngineSpec:
+                engine = "postgresql"
+                engine_aliases = "postgres"
+                drivers = {
+                    "psycopg2": "The default Postgres driver",
+                    "asyncpg": "An asynchronous Postgres driver",
+                }
+
+        It would be used for all the following SQLAlchemy URIs:
+
+            - postgres://user:password@host/db
+            - postgresql://user:password@host/db
+            - postgres+asyncpg://user:password@host/db
+            - postgres+psycopg2://user:password@host/db
+            - postgresql+asyncpg://user:password@host/db
+            - postgresql+psycopg2://user:password@host/db
+
+        Note that SQLAlchemy has a default driver even if one is not specified:
+
+            >>> from sqlalchemy.engine.url import make_url
+            >>> make_url('postgres://').get_driver_name()
+            'psycopg2'
+
+        """
+        backend = url.get_backend_name()
+        driver = url.get_driver_name()
+        return cls.supports_backend(backend, driver)
+
+    @classmethod
+    def supports_backend(cls, backend: str, driver: str | None = None) -> bool:
+        """
+        Returns true if the DB engine spec supports a given SQLAlchemy backend/driver.
+        """
+        # check the backend first
+        if backend != cls.engine and backend not in cls.engine_aliases:
+            return False
+
+        # originally DB engine specs didn't declare any drivers and the check was made
+        # only on the engine; if that's the case, ignore the driver for backwards
+        # compatibility
+        if not cls.drivers or driver is None:
+            return True
+
+        return driver in cls.drivers
+
+    @classmethod
+    def get_default_catalog(
+        cls,
+        database: Database,  # pylint: disable=unused-argument
+    ) -> str | None:
+        """
+        Return the default catalog for a given database.
+        """
+        return None
+
+    @classmethod
+    def get_default_schema(cls, database: Database, catalog: str | None) -> str | None:
+        """
+        Return the default schema for a catalog in a given database.
+        """
+        with database.get_inspector(catalog=catalog) as inspector:
+            return inspector.default_schema_name
+
+    @classmethod
+    def get_catalog_reference_schema(
+        cls,
+        catalog: str,  # pylint: disable=unused-argument
+    ) -> str | None:
+        """
+        The schema a table naming a catalog but no schema (``catalog..table``) is
+        read from, whatever schema the connection is in.
+
+        Such a reference does not go through the connection's own default schema or
+        search path, which are those of the catalog the query runs in. An engine
+        that fixes the schema it reads returns it, and one that leaves it to the
+        catalog, or doesn't say, returns ``None``: the schema is then unknown, and a
+        control that matches tables by schema has to match the table in any schema.
+
+        :param catalog: The catalog the reference names
+        """
+        return None
+
+    @classmethod
+    def get_search_path(
+        cls,
+        database: Database,
+        catalog: str | None,
+        tables: Collection[str] = (),
+    ) -> tuple[list[str], dict[str, list[str]]]:
+        """
+        Resolve tables referenced without a schema the way the connection does.
+
+        Most engines look in their default schema only. An engine with a search
+        path looks in each of its schemas in order and reads the first table of
+        the name it finds, so the default schema isn't necessarily the one holding
+        a given table, and a control that matches tables by schema (RLS,
+        ``DISALLOWED_SQL_TABLES``) has to know which one does.
+
+        :param tables: The names of tables referenced without a schema
+        :returns: The schemas looked in, in order, and the schema holding each of
+            ``tables`` that one does (an engine that can't tell leaves a table
+            out, so it's taken to be in any of them)
+        :raises Exception: If the connection can't be asked
+        """
+        schema = cls.get_default_schema(database, catalog)
+        return ([schema] if schema else []), {}
+
+    @classmethod
+    def get_schema_from_engine_params(  # pylint: disable=unused-argument
+        cls,
+        sqlalchemy_uri: URL,
+        connect_args: dict[str, Any],
+    ) -> str | None:
+        """
+        Return the schema configured in a SQLALchemy URI and connection arguments, if any.
+        """  # noqa: E501
+        return None
+
+    @classmethod
+    def get_catalog_from_engine_params(  # pylint: disable=unused-argument
+        cls,
+        sqlalchemy_uri: URL,
+        connect_args: dict[str, Any],
+    ) -> str | None:
+        """
+        Return the catalog/database configured in a SQLAlchemy URI or connection
+        arguments, if statically determinable.
+
+        Used to recognize when a SQL statement's leading, catalog-like qualifier is
+        a redundant restatement of the connection's own database rather than a
+        request for a genuinely different one -- relevant for engines that don't
+        otherwise model catalogs (``supports_catalog`` is False) but whose
+        connection is nonetheless scoped to a single database. The default
+        implementation reads the URL's own database segment; engine specs whose
+        connection strings can encode the database elsewhere (e.g. inside an
+        opaque connection-string query parameter) should override this.
+        """
+        return sqlalchemy_uri.database or None
+
+    @classmethod
+    def get_default_schema_for_query(
+        cls,
+        database: Database,
+        query: Query,
+        template_params: Optional[dict[str, Any]] = None,
+    ) -> str | None:
+        """
+        Return the default schema for a given query.
+
+        This is used to determine the schema of tables that aren't fully qualified, eg:
+
+            SELECT * FROM foo;
+
+        In the example above, the schema where the `foo` table lives depends on a few
+        factors:
+
+            1. For DB engine specs that allow dynamically changing the schema based on the
+               query we should use the query schema.
+            2. For DB engine specs that don't support dynamically changing the schema and
+               have the schema hardcoded in the SQLAlchemy URI we should use the schema
+               from the URI.
+            3. For DB engine specs that don't connect to a specific schema and can't
+               change it dynamically we need to probe the database for the default schema.
+
+        Determining the correct schema is crucial for managing access to data, so please
+        make sure you understand this logic when working on a new DB engine spec.
+        """  # noqa: E501
+        # dynamic schema varies on a per-query basis
+        if cls.supports_dynamic_schema:
+            return query.schema
+
+        # check if the schema is stored in the SQLAlchemy URI or connection arguments
+        try:
+            connect_args = database.get_extra()["engine_params"]["connect_args"]
+        except KeyError:
+            connect_args = {}
+        sqlalchemy_uri = make_url_safe(database.sqlalchemy_uri)
+        if schema := cls.get_schema_from_engine_params(sqlalchemy_uri, connect_args):
+            return schema
+
+        # return the default schema of the database
+        return cls.get_default_schema(database, query.catalog)
+
+    @classmethod
+    def get_dbapi_exception_mapping(cls) -> dict[type[Exception], type[Exception]]:
         """
         Each engine can implement and converge its own specific exceptions into
         Superset DBAPI exceptions
@@ -316,6 +1481,15 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         :return: A map of driver specific exception to superset custom exceptions
         """
         return {}
+
+    @classmethod
+    def parse_error_exception(cls, exception: Exception) -> Exception:
+        """
+        Each engine can implement and converge its own specific parser method
+
+        :return: An Exception with a parsed string off the original exception
+        """
+        return exception
 
     @classmethod
     def get_dbapi_mapped_exception(cls, exception: Exception) -> Exception:
@@ -330,34 +1504,52 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         """
         new_exception = cls.get_dbapi_exception_mapping().get(type(exception))
         if not new_exception:
-            return exception
+            return cls.parse_error_exception(exception)
         return new_exception(str(exception))
 
     @classmethod
     def get_allow_cost_estimate(  # pylint: disable=unused-argument
-        cls, extra: Dict[str, Any],
+        cls,
+        extra: dict[str, Any],
     ) -> bool:
         return False
 
     @classmethod
+    def get_text_clause(cls, clause: str) -> TextClause:
+        """
+        SQLAlchemy wrapper to ensure text clauses are escaped properly
+
+        :param clause: string clause with potentially unescaped characters
+        :return: text clause with escaped characters
+        """
+        if cls.allows_escaped_colons:
+            clause = clause.replace(":", "\\:")
+        return text(clause)
+
+    @classmethod
     def get_engine(
         cls,
-        database: "Database",
-        schema: Optional[str] = None,
-        source: Optional[str] = None,
-    ) -> Engine:
-        user_name = utils.get_username()
-        return database.get_sqla_engine(
-            schema=schema, nullpool=True, user_name=user_name, source=source
-        )
+        database: Database,
+        catalog: str | None = None,
+        schema: str | None = None,
+        source: utils.QuerySource | None = None,
+    ) -> ContextManager[Engine]:
+        """
+        Return an engine context manager.
+
+            >>> with DBEngineSpec.get_engine(database, catalog, schema, source) as engine:
+            ...     connection = engine.connect()
+            ...     connection.execute(sql)
+
+        """  # noqa: E501
+        return database.get_sqla_engine(catalog=catalog, schema=schema, source=source)
 
     @classmethod
     def get_timestamp_expr(
         cls,
         col: ColumnClause,
-        pdf: Optional[str],
-        time_grain: Optional[str],
-        type_: Optional[str] = None,
+        pdf: str | None,
+        time_grain: str | None,
     ) -> TimestampExpression:
         """
         Construct a TimestampExpression to be used in a SQLAlchemy query.
@@ -365,10 +1557,10 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         :param col: Target column for the TimestampExpression
         :param pdf: date format (seconds or milliseconds)
         :param time_grain: time grain, e.g. P1Y for 1 year
-        :param type_: the source column type
         :return: TimestampExpression object
         """
         if time_grain:
+            type_ = str(getattr(col, "type", ""))
             time_expr = cls.get_time_grain_expressions().get(time_grain)
             if not time_expr:
                 raise NotImplementedError(
@@ -386,15 +1578,52 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
             time_expr = "{col}"
 
         # if epoch, translate to DATE using db specific conf
-        if pdf == "epoch_s":
-            time_expr = time_expr.replace("{col}", cls.epoch_to_dttm())
-        elif pdf == "epoch_ms":
-            time_expr = time_expr.replace("{col}", cls.epoch_ms_to_dttm())
+        if pdf in EPOCH_FORMATS:
+            # "epoch_s" predates "epoch_ms"/"epoch_us" and kept the shorter
+            # legacy method name; every other format follows f"{pdf}_to_dttm",
+            # so adding a new EPOCH_FORMATS entry needs no second edit here.
+            method_name = _EPOCH_METHOD_ALIASES.get(pdf, f"{pdf}_to_dttm")
+            time_expr = time_expr.replace("{col}", getattr(cls, method_name)())
+        elif pdf == "%Y":
+            # a bare four-digit year (e.g. the `year` column on the `video_game_sales`
+            # example dataset) has no native date type to lean on; without this the
+            # column value is passed straight into the grain function below, which
+            # every engine interprets as something other than a calendar year (SQLite
+            # reads a bare integer as a Julian day number, for instance), silently
+            # producing NULL for every row.
+            time_expr = cls._apply_year_to_dttm(time_expr)
 
         return TimestampExpression(time_expr, col, type_=col.type)
 
     @classmethod
-    def get_time_grains(cls) -> Tuple[TimeGrain, ...]:
+    def get_temporal_column_shift_expr(
+        cls,
+        col: ColumnClause,
+        offset_hours: int,
+    ) -> TimestampExpression:
+        """Shift a temporal SQL expression by a bounded number of hours."""
+        return TimestampExpression(
+            f"{{col}} + INTERVAL '{offset_hours}' HOUR",
+            col,
+            type_=col.type,
+        )
+
+    @classmethod
+    def _apply_year_to_dttm(cls, time_expr: str) -> str:
+        """
+        Substitute `{col}` in ``time_expr`` with the ``year_to_dttm`` expression.
+
+        Engine specs that have not implemented `year_to_dttm` fall back to the
+        prior behavior of passing the raw column through, rather than raising
+        for every dataset with a bare-year column.
+        """
+        try:
+            return time_expr.replace("{col}", cls.year_to_dttm())
+        except NotImplementedError:
+            return time_expr
+
+    @classmethod
+    def get_time_grains(cls) -> tuple[TimeGrain, ...]:
         """
         Generate a tuple of supported time grains.
 
@@ -403,7 +1632,7 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
 
         ret_list = []
         time_grains = builtin_time_grains.copy()
-        time_grains.update(current_app.config["TIME_GRAIN_ADDONS"])
+        time_grains.update(app.config["TIME_GRAIN_ADDONS"])
         for duration, func in cls.get_time_grain_expressions().items():
             if duration in time_grains:
                 name = time_grains[duration]
@@ -412,8 +1641,8 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
 
     @classmethod
     def _sort_time_grains(
-        cls, val: Tuple[Optional[str], str], index: int
-    ) -> Union[float, int, str]:
+        cls, val: tuple[str | None, str], index: int
+    ) -> float | int | str:
         """
         Return an ordered time-based value of a portion of a time grain
         for sorting
@@ -473,7 +1702,7 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         return plist.get(index, 0)
 
     @classmethod
-    def get_time_grain_expressions(cls) -> Dict[Optional[str], str]:
+    def get_time_grain_expressions(cls) -> dict[str | None, str]:
         """
         Return a dict of all supported time grains including any potential added grains
         but excluding any potentially disabled grains in the config file.
@@ -482,11 +1711,11 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         """
         # TODO: use @memoize decorator or similar to avoid recomputation on every call
         time_grain_expressions = cls._time_grain_expressions.copy()
-        grain_addon_expressions = current_app.config["TIME_GRAIN_ADDON_EXPRESSIONS"]
+        grain_addon_expressions = app.config["TIME_GRAIN_ADDON_EXPRESSIONS"]
         time_grain_expressions.update(grain_addon_expressions.get(cls.engine, {}))
-        denylist: List[str] = current_app.config["TIME_GRAIN_DENYLIST"]
+        denylist: list[str] = app.config["TIME_GRAIN_DENYLIST"]
         for key in denylist:
-            time_grain_expressions.pop(key)
+            time_grain_expressions.pop(key, None)
 
         return dict(
             sorted(
@@ -501,9 +1730,7 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         )
 
     @classmethod
-    def fetch_data(
-        cls, cursor: Any, limit: Optional[int] = None
-    ) -> List[Tuple[Any, ...]]:
+    def fetch_data(cls, cursor: Any, limit: int | None = None) -> list[tuple[Any, ...]]:
         """
 
         :param cursor: Cursor instance
@@ -513,16 +1740,67 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         if cls.arraysize:
             cursor.arraysize = cls.arraysize
         try:
+            # Statements that return no result set (DDL, DML) leave the cursor
+            # description empty (``None`` per PEP 249), and several DB-API
+            # drivers (mysql-connector, ibm_db, pyexasol, impyla, ...) raise on
+            # a fetch in that state instead of returning no rows.
+            description = cursor.description
+            if not description:
+                return []
             if cls.limit_method == LimitMethod.FETCH_MANY and limit:
                 return cursor.fetchmany(limit)
-            return cursor.fetchall()
+            data = cursor.fetchall()
+            # Create a mapping between column index and a mutator function to normalize
+            # values with. The first two items in the description row are the column
+            # name and type.
+            column_mutators = {
+                index: func
+                for index, row in enumerate(description)
+                if (
+                    func := cls.column_type_mutators.get(
+                        type(cls.get_sqla_column_type(cls.get_datatype(row[1])))
+                    )
+                )
+            }
+            if column_mutators:
+                if not isinstance(data, list):
+                    data = list(data)
+                for row_idx, row in enumerate(data):
+                    new_row = list(row)
+                    for col_idx, func in column_mutators.items():
+                        new_row[col_idx] = func(row[col_idx])
+                    data[row_idx] = tuple(new_row)
+
+            return data
         except Exception as ex:
-            raise cls.get_dbapi_mapped_exception(ex)
+            raise cls.get_dbapi_mapped_exception(ex) from ex
+
+    @classmethod
+    def fetch_data_with_cursor(
+        cls,
+        database: Database,
+        sql: str,
+        page_index: int,
+        page_size: int,
+    ) -> tuple[list[list[Any]], list[str]]:
+        """
+        Fetch a single page of results via engine-native cursor pagination.
+
+        Only called when ``cls.supports_offset`` is False and a non-first
+        page is requested (see ``superset/views/datasource/utils.py``).
+        Engines that set ``supports_offset = False`` must override this.
+        """
+        raise NotImplementedError(
+            f"{cls.__name__} sets supports_offset=False but does not "
+            "implement fetch_data_with_cursor()"
+        )
 
     @classmethod
     def expand_data(
-        cls, columns: List[Dict[Any, Any]], data: List[Dict[Any, Any]]
-    ) -> Tuple[List[Dict[Any, Any]], List[Dict[Any, Any]], List[Dict[Any, Any]]]:
+        cls, columns: list[ResultSetColumnType], data: list[dict[Any, Any]]
+    ) -> tuple[
+        list[ResultSetColumnType], list[dict[Any, Any]], list[ResultSetColumnType]
+    ]:
         """
         Some engines support expanding nested fields. See implementation in Presto
         spec for details.
@@ -535,13 +1813,12 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         return columns, data, []
 
     @classmethod
-    def alter_new_orm_column(cls, orm_col: "TableColumn") -> None:
+    def alter_new_orm_column(cls, orm_col: TableColumn) -> None:
         """Allow altering default column attributes when first detected/added
 
         For instance special column like `__time` for Druid can be
         set to is_dttm=True. Note that this only gets called when new
         columns are detected/created"""
-        # TODO: Fix circular import caused by importing TableColumn
 
     @classmethod
     def epoch_to_dttm(cls) -> str:
@@ -565,7 +1842,35 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         return cls.epoch_to_dttm().replace("{col}", "({col}/1000)")
 
     @classmethod
-    def get_datatype(cls, type_code: Any) -> Optional[str]:
+    def epoch_us_to_dttm(cls) -> str:
+        """
+        SQL expression that converts epoch (microseconds) to datetime that can be used
+        in a query.
+
+        The default routes through ``epoch_ms_to_dttm`` so engines that already
+        override the millisecond conversion keep their validated SQL. The result
+        inherits whatever resolution that engine's ``epoch_ms_to_dttm`` has,
+        which is seconds when the default is inherited. Engines with a native
+        microsecond function should override this (see BigQuery, Snowflake,
+        Kusto, Pinot).
+
+        :return: SQL Expression
+        """
+        return cls.epoch_ms_to_dttm().replace("{col}", "({col}/1000)")
+
+    @classmethod
+    def year_to_dttm(cls) -> str:
+        """
+        SQL expression that converts a bare four-digit year value to the January 1st
+        datetime of that year, for use in a query. The reference column should be
+        denoted as `{col}` in the return expression, e.g. "MAKE_DATE({col}, 1, 1)"
+
+        :return: SQL Expression
+        """
+        raise NotImplementedError()
+
+    @classmethod
+    def get_datatype(cls, type_code: Any) -> str | None:
         """
         Change column type code from cursor description to string representation.
 
@@ -577,7 +1882,40 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         return None
 
     @classmethod
-    def normalize_indexes(cls, indexes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def normalize_column_values(cls, col_values: list[Any]) -> list[Any]:
+        """
+        Engine-specific hook to normalize column values before PyArrow conversion.
+
+        Called when the initial pa.array() conversion raises an exception, giving
+        the engine a chance to clean up values (e.g. replace sentinel strings with
+        None) before a second conversion attempt.
+
+        :param col_values: Raw Python values for one column
+        :return: Normalized values; return the input list unchanged by default
+        """
+        return col_values
+
+    @classmethod
+    def resolve_column_type(
+        cls, cursor_type: str | None, pa_mapped: str | None
+    ) -> str | None:
+        """
+        Choose the reported column type from the cursor description type and the
+        type inferred by PyArrow.
+
+        The default prefers the cursor description when available.  Override in
+        engine specs where the cursor description is unreliable (e.g. pydruid
+        infers STRING from a None or special-float first row value).
+
+        :param cursor_type: Type string from the cursor description, or None
+        :param pa_mapped: Type string inferred by PyArrow, or None
+        :return: The type string to report for this column
+        """
+        return cursor_type or pa_mapped
+
+    @classmethod
+    @deprecated(deprecated_in="3.0")
+    def normalize_indexes(cls, indexes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """
         Normalizes indexes for more consistency across db engines
 
@@ -589,78 +1927,136 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         return indexes
 
     @classmethod
-    def extra_table_metadata(  # pylint: disable=unused-argument
-        cls, database: "Database", table_name: str, schema_name: str,
-    ) -> Dict[str, Any]:
+    def get_table_metadata(
+        cls,
+        database: Database,
+        table: Table,
+        partition: Partition | None = None,
+    ) -> TableMetadataResponse:
+        """
+        Returns basic table metadata
+
+        :param database: Database instance
+        :param table: A Table instance
+        :param partition: Optional partition info used by engines that support
+            partitioned tables (e.g. ODPS). Ignored by engines that don't.
+        :return: Basic table metadata
+        """
+        return get_table_metadata(database, table)
+
+    @classmethod
+    def get_extra_table_metadata(
+        cls,
+        database: Database,
+        table: Table,
+    ) -> dict[str, Any]:
         """
         Returns engine-specific table metadata
 
         :param database: Database instance
-        :param table_name: Table name
-        :param schema_name: Schema name
+        :param table: A Table instance
         :return: Engine-specific table metadata
         """
-        # TODO: Fix circular import caused by importing Database
+        # old method that doesn't work with catalogs
+        if hasattr(cls, "extra_table_metadata"):
+            warnings.warn(  # noqa: B028
+                "The `extra_table_metadata` method is deprecated, please implement "
+                "the `get_extra_table_metadata` method in the DB engine spec.",
+                DeprecationWarning,
+            )
+
+            # If a catalog is passed, return nothing, since we don't know the exact
+            # table that is being requested.
+            if table.catalog:
+                return {}
+
+            return cls.extra_table_metadata(database, table.table, table.schema)
+
         return {}
 
     @classmethod
-    def apply_limit_to_sql(
-        cls, sql: str, limit: int, database: "Database", force: bool = False
-    ) -> str:
-        """
-        Alters the SQL statement to apply a LIMIT clause
-
-        :param sql: SQL query
-        :param limit: Maximum number of rows to be returned by the query
-        :param database: Database instance
-        :return: SQL query with limit clause
-        """
-        # TODO: Fix circular import caused by importing Database
-        if cls.limit_method == LimitMethod.WRAP_SQL:
-            sql = sql.strip("\t\n ;")
-            qry = (
-                select("*")
-                .select_from(TextAsFrom(text(sql), ["*"]).alias("inner_qry"))
-                .limit(limit)
-            )
-            return database.compile_sqla_query(qry)
-
-        if cls.limit_method == LimitMethod.FORCE_LIMIT:
-            parsed_query = sql_parse.ParsedQuery(sql)
-            sql = parsed_query.set_or_update_query_limit(limit, force=force)
-
-        return sql
-
-    @classmethod
-    def get_limit_from_sql(cls, sql: str) -> Optional[int]:
+    def get_limit_from_sql(cls, sql: str) -> int | None:
         """
         Extract limit from SQL query
 
         :param sql: SQL query
         :return: Value of limit clause in query
         """
-        parsed_query = sql_parse.ParsedQuery(sql)
-        return parsed_query.limit
+        try:
+            script = SQLScript(sql, engine=cls.engine)
+            return script.statements[-1].get_limit_value()
+        except SupersetParseError:
+            # SQL with a malformed LIMIT clause (e.g. LIMIT without a value) is
+            # not parseable in sqlglot 30+, which now requires an expression arg.
+            return None
 
     @classmethod
-    def set_or_update_query_limit(cls, sql: str, limit: int) -> str:
+    def apply_offset_before_limit(cls, sql: str) -> str:
         """
-        Create a query based on original query but with new limit clause
+        Reorder a trailing ``LIMIT n OFFSET m`` into ``OFFSET m LIMIT n``
+        for engines whose grammar requires OFFSET to precede LIMIT.
+
+        This is a no-op unless ``offset_before_limit`` is set (Presto/Trino) and
+        the compiled SQL ends in the invalid ANSI order. Some drivers (e.g.
+        PyHive's Presto/Trino dialects) emit ``LIMIT n OFFSET m``, which Presto
+        and Trino reject with ``mismatched input 'OFFSET'``.
+
+        Only the anchored trailing clause is rewritten; the rest of the query is
+        left byte-for-byte unchanged rather than re-rendered, so dialect
+        differences in the rest of the statement (e.g. ``log(10, x)`` becoming
+        ``LOG(x, 10)``) can't leak in.
+
+        :param sql: A single compiled SQL statement
+        :return: The statement with OFFSET before LIMIT when required
+        """
+        if not cls.offset_before_limit:
+            return sql
+
+        return _TRAILING_LIMIT_OFFSET.sub(r" OFFSET \2 LIMIT \1\3", sql, count=1)
+
+    @classmethod
+    def get_cte_query(cls, sql: str) -> str | None:
+        """
+        Convert the input CTE based SQL to the SQL for virtual table conversion
 
         :param sql: SQL query
-        :param limit: New limit to insert/replace into query
-        :return: Query with new limit
+        :return: CTE with the main select query aliased as `__cte`
+
         """
-        parsed_query = sql_parse.ParsedQuery(sql)
-        return parsed_query.set_or_update_query_limit(limit)
+        if not cls.allows_cte_in_subquery:
+            statement = SQLStatement(sql, engine=cls.engine)
+            if statement.has_cte():
+                return statement.as_cte(cls.cte_alias).format()
+
+        return None
+
+    @classmethod
+    def normalize_table_name_for_upload(
+        cls,
+        table_name: str,
+        schema_name: str | None = None,
+    ) -> tuple[str, str | None]:
+        """
+        Normalize table and schema names for file upload.
+
+        Some databases (e.g., Redshift) fold unquoted identifiers to lowercase,
+        which can cause issues when the upload creates a table with one case
+        but metadata operations use a different case. Override this method
+        to normalize names according to database-specific rules.
+
+        :param table_name: The table name to normalize
+        :param schema_name: The schema name to normalize (optional)
+        :return: Tuple of (normalized_table_name, normalized_schema_name)
+        """
+        return table_name, schema_name
 
     @classmethod
     def df_to_sql(
         cls,
-        database: "Database",
+        database: Database,
         table: Table,
         df: pd.DataFrame,
-        to_sql_kwargs: Dict[str, Any],
+        to_sql_kwargs: dict[str, Any],
     ) -> None:
         """
         Upload data from a Pandas DataFrame to a database.
@@ -677,76 +2073,196 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         :param to_sql_kwargs: The kwargs to be passed to pandas.DataFrame.to_sql` method
         """
 
-        engine = cls.get_engine(database)
         to_sql_kwargs["name"] = table.table
 
         if table.schema:
-
-            # Only add schema when it is preset and non empty.
+            # Only add schema when it is preset and non-empty.
             to_sql_kwargs["schema"] = table.schema
 
-        if engine.dialect.supports_multivalues_insert:
-            to_sql_kwargs["method"] = "multi"
-
-        df.to_sql(con=engine, **to_sql_kwargs)
+        with cls.get_engine(
+            database,
+            catalog=table.catalog,
+            schema=table.schema,
+        ) as engine:
+            if (
+                engine.dialect.supports_multivalues_insert
+                or cls.supports_multivalues_insert
+            ):
+                to_sql_kwargs["method"] = "multi"
+            df.to_sql(con=engine, **to_sql_kwargs)
 
     @classmethod
     def convert_dttm(  # pylint: disable=unused-argument
-        cls, target_type: str, dttm: datetime,
-    ) -> Optional[str]:
+        cls, target_type: str, dttm: datetime, db_extra: dict[str, Any] | None = None
+    ) -> str | None:
         """
-        Convert Python datetime object to a SQL expression
+        Convert a Python `datetime` object to a SQL expression.
 
         :param target_type: The target type of expression
         :param dttm: The datetime object
+        :param db_extra: The database extra object
         :return: The SQL expression
         """
         return None
 
     @classmethod
-    def get_all_datasource_names(
-        cls, database: "Database", datasource_type: str
-    ) -> List[utils.DatasourceName]:
-        """Returns a list of all tables or views in database.
-
-        :param database: Database instance
-        :param datasource_type: Datasource_type can be 'table' or 'view'
-        :return: List of all datasources in database or schema
+    def coerce_boolean_for_sql(cls, value: bool | None) -> Any:
         """
-        # TODO: Fix circular import caused by importing Database
-        schemas = database.get_all_schema_names(
-            cache=database.schema_cache_enabled,
-            cache_timeout=database.schema_cache_timeout,
-            force=True,
-        )
-        all_datasources: List[utils.DatasourceName] = []
-        for schema in schemas:
-            if datasource_type == "table":
-                all_datasources += database.get_all_table_names_in_schema(
-                    schema=schema,
-                    force=True,
-                    cache=database.table_cache_enabled,
-                    cache_timeout=database.table_cache_timeout,
-                )
-            elif datasource_type == "view":
-                all_datasources += database.get_all_view_names_in_schema(
-                    schema=schema,
-                    force=True,
-                    cache=database.table_cache_enabled,
-                    cache_timeout=database.table_cache_timeout,
-                )
-            else:
-                raise Exception(f"Unsupported datasource_type: {datasource_type}")
-        return all_datasources
+        Convert a Python boolean to the value used when building SQL filter
+        expressions for boolean columns.
+
+        Most engines accept Python booleans, but some drivers render them as
+        integer literals (0/1), which strict engines like Databricks reject
+        with a DATATYPE_MISMATCH error when the value is compared against a
+        boolean column (#36765). Override this in engine specs whose drivers
+        misrender Python booleans, returning an expression that compiles to an
+        explicit boolean literal (e.g. sqlalchemy.true()/false()).
+
+        :param value: Boolean value (True, False, or None)
+        :return: Value suitable for the engine's filter expressions
+        """
+        return value
 
     @classmethod
-    def handle_cursor(cls, cursor: Any, query: Query, session: Session) -> None:
+    def handle_boolean_filter(
+        cls, sqla_col: Any, op: str, value: bool
+    ) -> BinaryExpression:
+        """
+        Handle boolean filter operations with engine-specific logic.
+
+        By default, uses SQLAlchemy's IS operator (column IS true/false).
+        Engines that don't support IS for boolean values can override
+        use_equality_for_boolean_filters to use equality operators instead.
+
+        :param sqla_col: SQLAlchemy column element
+        :param op: Filter operator (IS_TRUE or IS_FALSE)
+        :param value: Boolean value (True or False)
+        :return: SQLAlchemy expression for the boolean filter
+        """
+        value = cls.coerce_boolean_for_sql(value)
+        if cls.use_equality_for_boolean_filters:
+            return sqla_col == value
+        else:
+            return sqla_col.is_(value)
+
+    @classmethod
+    def handle_null_filter(
+        cls,
+        sqla_col: Any,
+        op: utils.FilterOperator,
+    ) -> BinaryExpression:
+        """
+        Handle null/not null filter operations.
+
+        :param sqla_col: SQLAlchemy column element
+        :param op: Filter operator (IS_NULL or IS_NOT_NULL)
+        :return: SQLAlchemy expression for the null filter
+        """
+        from superset.utils import core as utils
+
+        if op == utils.FilterOperator.IS_NULL:
+            return sqla_col.is_(None)
+        elif op == utils.FilterOperator.IS_NOT_NULL:
+            return sqla_col.isnot(None)
+        else:
+            raise ValueError(f"Invalid null filter operator: {op}")
+
+    @classmethod
+    def handle_comparison_filter(
+        cls, sqla_col: Any, op: utils.FilterOperator, value: Any
+    ) -> BinaryExpression:
+        """
+        Handle comparison filter operations (=, !=, >, <, >=, <=).
+
+        :param sqla_col: SQLAlchemy column element
+        :param op: Filter operator
+        :param value: Filter value
+        :return: SQLAlchemy expression for the comparison filter
+        """
+        from superset.utils import core as utils
+
+        if op == utils.FilterOperator.EQUALS:
+            return sqla_col == value
+        elif op == utils.FilterOperator.NOT_EQUALS:
+            return sqla_col != value
+        elif op == utils.FilterOperator.GREATER_THAN:
+            return sqla_col > value
+        elif op == utils.FilterOperator.LESS_THAN:
+            return sqla_col < value
+        elif op == utils.FilterOperator.GREATER_THAN_OR_EQUALS:
+            return sqla_col >= value
+        elif op == utils.FilterOperator.LESS_THAN_OR_EQUALS:
+            return sqla_col <= value
+        else:
+            raise ValueError(f"Invalid comparison filter operator: {op}")
+
+    @classmethod
+    def handle_cursor(cls, cursor: Any, query: Query) -> None:
         """Handle a live cursor between the execute and fetchall calls
 
         The flow works without this method doing anything, but it allows
         for handling the cursor and updating progress information in the
         query object"""
-        # TODO: Fix circular import error caused by importing sql_lab.Query
+
+    @classmethod
+    def prepare_connection(cls, connection: Any) -> None:
+        """Install driver-specific safeguards before creating a cursor."""
+
+    @classmethod
+    def prepare_cursor(cls, cursor: Any) -> Callable[[BaseException], None] | None:
+        """Install safeguards and return the driver's time-limit callback."""
+        return None
+
+    @classmethod
+    def _abandon_cursor(cls, cursor: Any) -> None:
+        """Disable driver cleanup when an interrupted reply cannot be reused."""
+
+    @classmethod
+    @contextmanager
+    def cursor_context(cls, cursor: Any) -> Iterator[None]:
+        """Preserve time limits before callers or drivers start cursor cleanup."""
+        on_timeout = None
+        try:
+            on_timeout = cls.prepare_cursor(cursor)
+            yield
+        except TIME_LIMIT_EXCEPTIONS as ex:
+            try:
+                if on_timeout is not None:
+                    on_timeout(ex)
+                else:
+                    cls._abandon_cursor(cursor)
+            except (Exception, KeyboardInterrupt):  # pylint: disable=broad-except
+                logger.warning("Abandoning an interrupted cursor failed")
+            raise
+
+    @classmethod
+    # pylint: disable=consider-using-transaction
+    def execute_with_cursor(
+        cls,
+        cursor: Any,
+        sql: str,
+        query: Query,
+    ) -> None:
+        """
+        Trigger execution of a query and handle the resulting cursor.
+
+        For most implementations this just makes calls to `execute` and
+        `handle_cursor` consecutively, but in some engines (e.g. Trino) we may
+        need to handle client limitations such as lack of async support and
+        perform a more complicated operation to get information from the cursor
+        in a timely manner and facilitate operations such as query stop
+        """
+        logger.debug("Query %d: Running query: %s", query.id, sql)
+        cls.execute(cursor, sql, query.database, async_=True)
+        if not cls.has_query_id_before_execute:
+            cancel_query_id = query.database.db_engine_spec.get_cancel_query_id(
+                cursor, query
+            )
+            if cancel_query_id is not None:
+                query.set_extra_json_key(QUERY_CANCEL_KEY, cancel_query_id)
+                db.session.commit()  # pylint: disable=consider-using-transaction
+        logger.debug("Query %d: Handling cursor", query.id)
+        cls.handle_cursor(cursor, query)
 
     @classmethod
     def extract_error_message(cls, ex: Exception) -> str:
@@ -758,21 +2274,43 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         return utils.error_msg_from_exception(ex)
 
     @classmethod
+    def get_database_custom_errors(
+        cls, database_name: str | None
+    ) -> dict[Any, tuple[str, SupersetErrorType, dict[str, Any]]]:
+        config_custom_errors = app.config.get("CUSTOM_DATABASE_ERRORS", {})
+        if not isinstance(config_custom_errors, dict):
+            return {}
+
+        if database_name and database_name in config_custom_errors:
+            database_errors = config_custom_errors[database_name]
+            if isinstance(database_errors, dict):
+                return database_errors
+        return {}
+
+    @classmethod
     def extract_errors(
-        cls, ex: Exception, context: Optional[Dict[str, Any]] = None
-    ) -> List[SupersetError]:
+        cls,
+        ex: Exception,
+        context: dict[str, Any] | None = None,
+        database_name: str | None = None,
+    ) -> list[SupersetError]:
         raw_message = cls._extract_error_message(ex)
 
         context = context or {}
-        for regex, (message, error_type, extra) in cls.custom_errors.items():
-            match = regex.search(raw_message)
-            if match:
+        db_engine_custom_errors = cls.get_database_custom_errors(database_name)
+
+        for regex, (message, error_type, extra) in [
+            *db_engine_custom_errors.items(),
+            *cls.custom_errors.items(),
+        ]:
+            if match := regex.search(raw_message):
                 params = {**context, **match.groupdict()}
                 extra["engine_name"] = cls.engine_name
+                formatted_message = (message % params) if message else raw_message
                 return [
                     SupersetError(
                         error_type=error_type,
-                        message=message % params,
+                        message=formatted_message,
                         level=ErrorLevel.ERROR,
                         extra=extra,
                     )
@@ -788,25 +2326,75 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         ]
 
     @classmethod
-    def adjust_database_uri(cls, uri: URL, selected_schema: Optional[str]) -> None:
+    def get_catalog_for_connection(  # pylint: disable=unused-argument
+        cls,
+        database: Database,
+        uri: URL,
+        catalog: str | None,
+    ) -> str | None:
+        """Return the selected catalog, allowing engine-specific legacy aliases."""
+        return catalog
+
+    @classmethod
+    def adjust_engine_params(  # pylint: disable=unused-argument
+        cls,
+        uri: URL,
+        connect_args: dict[str, Any],
+        catalog: str | None = None,
+        schema: str | None = None,
+    ) -> tuple[URL, dict[str, Any]]:
         """
-        Mutate the database component of the SQLAlchemy URI.
+        Return a new URL and ``connect_args`` for a specific catalog/schema.
 
-        The URI here represents the URI as entered when saving the database,
-        ``selected_schema`` is the schema currently active presumably in
-        the SQL Lab dropdown. Based on that, for some database engine,
-        we can return a new altered URI that connects straight to the
-        active schema, meaning the users won't have to prefix the object
-        names by the schema name.
+        This is used in SQL Lab, allowing users to select a schema from the list of
+        schemas available in a given database, and have the query run with that schema as
+        the default one.
 
-        Some databases engines have 2 level of namespacing: database and
-        schema (postgres, oracle, mssql, ...)
-        For those it's probably better to not alter the database
-        component of the URI with the schema name, it won't work.
+        For some databases (like MySQL, Presto, Snowflake) this requires modifying the
+        SQLAlchemy URI before creating the connection. For others (like Postgres), it
+        requires additional parameters in ``connect_args`` or running pre-session
+        queries with ``set`` parameters.
 
-        Some database drivers like presto accept '{catalog}/{schema}' in
-        the database component of the URL, that can be handled here.
+        When a DB engine spec implements this method or ``get_prequeries`` (see below) it
+        should also have the attribute ``supports_dynamic_schema`` set to true, so that
+        Superset knows in which schema a given query is running in order to enforce
+        permissions (see #23385 and #23401).
+        """  # noqa: E501
+        return uri, {
+            **connect_args,
+            **cls.enforce_uri_query_params.get(uri.get_driver_name(), {}),
+        }
+
+    @classmethod
+    def register_engine_events(cls, engine: Engine) -> None:
         """
+        Attach SQLAlchemy event listeners to a freshly created engine.
+
+        Called once per engine creation, before the engine is cached, so
+        listeners must not be added or removed once it is shared.
+        """
+
+    @classmethod
+    def get_prequeries(
+        cls,
+        database: Database,  # pylint: disable=unused-argument
+        catalog: str | None = None,  # pylint: disable=unused-argument
+        schema: str | None = None,  # pylint: disable=unused-argument
+    ) -> list[str]:
+        """
+        Return pre-session queries.
+
+        These are currently used as an alternative to ``adjust_engine_params`` for
+        databases where the selected schema cannot be specified in the SQLAlchemy URI or
+        connection arguments.
+
+        For example, in order to specify a default schema in RDS we need to run a query
+        at the beginning of the session:
+
+            sql> set search_path = my_schema;
+
+        """
+        return []
 
     @classmethod
     def patch(cls) -> None:
@@ -815,62 +2403,132 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         """
 
     @classmethod
-    def get_schema_names(cls, inspector: Inspector) -> List[str]:
+    def get_catalog_names(  # pylint: disable=unused-argument
+        cls,
+        database: Database,
+        inspector: Inspector,
+    ) -> set[str]:
+        """
+        Get all catalogs from database.
+
+        This needs to be implemented per database, since SQLAlchemy doesn't offer an
+        abstraction.
+        """
+        return set()
+
+    @classmethod
+    def get_schema_names(cls, inspector: Inspector) -> set[str]:
         """
         Get all schemas from database
 
         :param inspector: SqlAlchemy inspector
         :return: All schemas in the database
         """
-        return sorted(inspector.get_schema_names())
+        return set(inspector.get_schema_names())
 
     @classmethod
     def get_table_names(  # pylint: disable=unused-argument
-        cls, database: "Database", inspector: Inspector, schema: Optional[str],
-    ) -> List[str]:
+        cls,
+        database: Database,
+        inspector: Inspector,
+        schema: str | None,
+    ) -> set[str]:
         """
-        Get all tables from schema
+        Get all the real table names within the specified schema.
 
-        :param inspector: SqlAlchemy inspector
-        :param schema: Schema to inspect. If omitted, uses default schema for database
-        :return: All tables in schema
+        Per the SQLAlchemy definition if the schema is omitted the database’s default
+        schema is used, however some dialects infer the request as schema agnostic.
+
+        :param database: The database to inspect
+        :param inspector: The SQLAlchemy inspector
+        :param schema: The schema to inspect
+        :returns: The physical table names
         """
-        tables = inspector.get_table_names(schema)
+
+        try:
+            tables = set(inspector.get_table_names(schema))
+        except Exception as ex:
+            raise cls.get_dbapi_mapped_exception(ex) from ex
+
         if schema and cls.try_remove_schema_from_table_name:
-            tables = [re.sub(f"^{schema}\\.", "", table) for table in tables]
-        return sorted(tables)
+            escaped_schema = re.escape(schema)
+            tables = {re.sub(f"^{escaped_schema}\\.", "", table) for table in tables}
+        return tables
 
     @classmethod
     def get_view_names(  # pylint: disable=unused-argument
-        cls, database: "Database", inspector: Inspector, schema: Optional[str],
-    ) -> List[str]:
+        cls,
+        database: Database,
+        inspector: Inspector,
+        schema: str | None,
+    ) -> set[str]:
         """
-        Get all views from schema
+        Get all the view names within the specified schema.
 
-        :param inspector: SqlAlchemy inspector
-        :param schema: Schema name. If omitted, uses default schema for database
-        :return: All views in schema
+        Per the SQLAlchemy definition if the schema is omitted the database’s default
+        schema is used, however some dialects infer the request as schema agnostic.
+
+        :param database: The database to inspect
+        :param inspector: The SQLAlchemy inspector
+        :param schema: The schema to inspect
+        :returns: The view names
         """
-        views = inspector.get_view_names(schema)
+
+        try:
+            views = set(inspector.get_view_names(schema))
+        except Exception as ex:
+            raise cls.get_dbapi_mapped_exception(ex) from ex
+
         if schema and cls.try_remove_schema_from_table_name:
-            views = [re.sub(f"^{schema}\\.", "", view) for view in views]
-        return sorted(views)
+            escaped_schema = re.escape(schema)
+            views = {re.sub(f"^{escaped_schema}\\.", "", view) for view in views}
+        return views
+
+    @classmethod
+    def get_materialized_view_names(
+        cls,
+        database: Database,
+        inspector: Inspector,
+        schema: str | None,
+    ) -> set[str]:
+        """
+        Get all materialized views.
+        """
+        return set()
+
+    @classmethod
+    def get_indexes(
+        cls,
+        database: Database,  # pylint: disable=unused-argument
+        inspector: Inspector,
+        table: Table,
+    ) -> list[dict[str, Any]]:
+        """
+        Get the indexes associated with the specified schema/table.
+
+        :param database: The database to inspect
+        :param inspector: The SQLAlchemy inspector
+        :param table: The table instance to inspect
+        :returns: The indexes
+        """
+
+        return inspector.get_indexes(table.table, table.schema)
 
     @classmethod
     def get_table_comment(
-        cls, inspector: Inspector, table_name: str, schema: Optional[str]
-    ) -> Optional[str]:
+        cls,
+        inspector: Inspector,
+        table: Table,
+    ) -> str | None:
         """
         Get comment of table from a given schema and table
-
         :param inspector: SqlAlchemy Inspector instance
-        :param table_name: Table name
-        :param schema: Schema name. If omitted, uses default schema for database
+        :param table: Table instance
         :return: comment of table
         """
         comment = None
         try:
-            comment = inspector.get_table_comment(table_name, schema)
+            comment = inspector.get_table_comment(table.table, table.schema)
             comment = comment.get("text") if isinstance(comment, dict) else None
         except NotImplementedError:
             # It's expected that some dialects don't implement the comment method
@@ -881,151 +2539,194 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         return comment
 
     @classmethod
-    def get_columns(
-        cls, inspector: Inspector, table_name: str, schema: Optional[str]
-    ) -> List[Dict[str, Any]]:
+    def get_columns(  # pylint: disable=unused-argument
+        cls,
+        inspector: Inspector,
+        table: Table,
+        options: dict[str, Any] | None = None,
+    ) -> list[ResultSetColumnType]:
         """
-        Get all columns from a given schema and table
+        Get all columns from a given schema and table.
+
+        The inspector will be bound to a catalog, if one was specified.
 
         :param inspector: SqlAlchemy Inspector instance
-        :param table_name: Table name
-        :param schema: Schema name. If omitted, uses default schema for database
+        :param table: Table instance
+        :param options: Extra options to customise the display of columns in
+                        some databases
         :return: All columns in table
         """
-        return inspector.get_columns(table_name, schema)
+        return convert_inspector_columns(
+            cast(
+                list[SQLAColumnType],
+                inspector.get_columns(table.table, table.schema),
+            )
+        )
 
     @classmethod
-    def where_latest_partition(  # pylint: disable=too-many-arguments,unused-argument
+    def get_metrics(  # pylint: disable=unused-argument
         cls,
-        table_name: str,
-        schema: Optional[str],
-        database: "Database",
+        database: Database,
+        inspector: Inspector,
+        table: Table,
+    ) -> list[MetricType]:
+        """
+        Get all metrics from a given schema and table.
+        """
+        return [
+            {
+                "metric_name": "count",
+                "verbose_name": "COUNT(*)",
+                "metric_type": "count",
+                "expression": "COUNT(*)",
+            }
+        ]
+
+    @classmethod
+    def where_latest_partition(  # pylint: disable=unused-argument
+        cls,
+        database: Database,
+        table: Table,
         query: Select,
-        columns: Optional[List[Dict[str, str]]] = None,
-    ) -> Optional[Select]:
+        columns: list[ResultSetColumnType] | None = None,
+    ) -> Select | None:
         """
         Add a where clause to a query to reference only the most recent partition
 
-        :param table_name: Table name
-        :param schema: Schema name
+        :param table: Table instance
         :param database: Database instance
         :param query: SqlAlchemy query
         :param columns: List of TableColumns
-        :return: SqlAlchemy query with additional where clause referencing latest
+        :return: SqlAlchemy query with additional where clause referencing the latest
         partition
         """
         # TODO: Fix circular import caused by importing Database, TableColumn
         return None
 
     @classmethod
-    def _get_fields(cls, cols: List[Dict[str, Any]]) -> List[Any]:
-        return [column(c["name"]) for c in cols]
+    def _get_fields(cls, cols: list[ResultSetColumnType]) -> list[Any]:
+        return [
+            (
+                literal_column(query_as)
+                if (query_as := c.get("query_as"))
+                else column(c["column_name"])
+            )
+            for c in cols
+        ]
 
     @classmethod
-    def select_star(  # pylint: disable=too-many-arguments,too-many-locals
+    def select_star(  # pylint: disable=too-many-arguments
         cls,
-        database: "Database",
-        table_name: str,
-        engine: Engine,
-        schema: Optional[str] = None,
+        database: Database,
+        table: Table,
+        dialect: Dialect,
         limit: int = 100,
         show_cols: bool = False,
         indent: bool = True,
         latest_partition: bool = True,
-        cols: Optional[List[Dict[str, Any]]] = None,
+        cols: list[ResultSetColumnType] | None = None,
     ) -> str:
         """
-        Generate a "SELECT * from [schema.]table_name" query with appropriate limit.
+        Generate a "SELECT * from [catalog.][schema.]table_name" query with limit.
 
         WARNING: expects only unquoted table and schema names.
 
         :param database: Database instance
-        :param table_name: Table name, unquoted
-        :param engine: SqlALchemy Engine instance
-        :param schema: Schema, unquoted
+        :param table: Table instance
+        :param dialect: SqlAlchemy Dialect instance
         :param limit: limit to impose on query
         :param show_cols: Show columns in query; otherwise use "*"
         :param indent: Add indentation to query
-        :param latest_partition: Only query latest partition
+        :param latest_partition: Only query the latest partition
         :param cols: Columns to include in query
         :return: SQL query
         """
+        if not cls.supports_cross_catalog_queries:
+            table = Table(table.table, table.schema, None)
+
         # pylint: disable=redefined-outer-name
-        fields: Union[str, List[Any]] = "*"
+        fields: str | list[Any] = "*"
         cols = cols or []
         if (show_cols or latest_partition) and not cols:
-            cols = database.get_columns(table_name, schema)
+            cols = database.get_columns(table)
 
         if show_cols:
             fields = cls._get_fields(cols)
-        quote = engine.dialect.identifier_preparer.quote
-        if schema:
-            full_table_name = quote(schema) + "." + quote(table_name)
-        else:
-            full_table_name = quote(table_name)
 
-        qry = select(fields).select_from(text(full_table_name))
+        full_table_name = cls.quote_table(table, dialect)
+        qry = select(*fields if isinstance(fields, list) else fields).select_from(
+            text(full_table_name)
+        )
 
-        if limit:
-            qry = qry.limit(limit)
+        qry = qry.limit(limit)
         if latest_partition:
             partition_query = cls.where_latest_partition(
-                table_name, schema, database, qry, columns=cols
+                database,
+                table,
+                qry,
+                columns=cols,
             )
             if partition_query is not None:
                 qry = partition_query
-        sql = database.compile_sqla_query(qry)
+        sql = database.compile_sqla_query(qry, table.catalog, table.schema)
         if indent:
-            sql = sqlparse.format(sql, reindent=True)
+            sql = SQLScript(sql, engine=cls.engine).format()
         return sql
 
     @classmethod
-    def estimate_statement_cost(cls, statement: str, cursor: Any,) -> Dict[str, Any]:
+    def estimate_statement_cost(
+        cls, database: Database, statement: str, cursor: Any
+    ) -> dict[str, Any]:
         """
         Generate a SQL query that estimates the cost of a given statement.
 
+        :param database: A Database object
         :param statement: A single SQL statement
         :param cursor: Cursor instance
         :return: Dictionary with different costs
         """
-        raise Exception("Database does not support cost estimation")
+        raise Exception(  # pylint: disable=broad-exception-raised
+            "Database does not support cost estimation"
+        )
 
     @classmethod
     def query_cost_formatter(
-        cls, raw_cost: List[Dict[str, Any]]
-    ) -> List[Dict[str, str]]:
+        cls, raw_cost: list[dict[str, Any]]
+    ) -> list[dict[str, str]]:
         """
         Format cost estimate.
 
         :param raw_cost: Raw estimate from `estimate_query_cost`
         :return: Human readable cost estimate
         """
-        raise Exception("Database does not support cost estimation")
+        raise Exception(  # pylint: disable=broad-exception-raised
+            "Database does not support cost estimation"
+        )
 
     @classmethod
     def process_statement(
-        cls, statement: str, database: "Database", user_name: str
+        cls,
+        statement: BaseSQLStatement[Any],
+        database: Database,
     ) -> str:
         """
-        Process a SQL statement by stripping and mutating it.
+        Process a SQL statement by mutating it.
 
         :param statement: A single SQL statement
         :param database: Database instance
-        :param username: Effective username
         :return: Dictionary with different costs
         """
-        parsed_query = ParsedQuery(statement)
-        sql = parsed_query.stripped()
-        sql_query_mutator = current_app.config["SQL_QUERY_MUTATOR"]
-        if sql_query_mutator:
-            sql = sql_query_mutator(sql, user_name, security_manager, database)
-
-        return sql
+        return database.mutate_sql_based_on_config(str(statement), is_split=True)
 
     @classmethod
-    def estimate_query_cost(
-        cls, database: "Database", schema: str, sql: str, source: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
+    def estimate_query_cost(  # pylint: disable=too-many-arguments
+        cls,
+        database: Database,
+        catalog: str | None,
+        schema: str,
+        sql: str,
+        source: utils.QuerySource | None = None,
+    ) -> list[dict[str, Any]]:
         """
         Estimate the cost of a multiple statement SQL query.
 
@@ -1034,83 +2735,226 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         :param sql: SQL query with possibly multiple statements
         :param source: Source of the query (eg, "sql_lab")
         """
-        extra = database.get_extra() or {}
+        extra = database.get_extra(source) or {}
         if not cls.get_allow_cost_estimate(extra):
-            raise Exception("Database does not support cost estimation")
+            raise Exception(  # pylint: disable=broad-exception-raised
+                "Database does not support cost estimation"
+            )
 
-        user_name = g.user.username if g.user and hasattr(g.user, "username") else None
-        parsed_query = sql_parse.ParsedQuery(sql)
-        statements = parsed_query.get_statements()
+        parsed_script = SQLScript(sql, engine=cls.engine)
 
-        engine = cls.get_engine(database, schema=schema, source=source)
-        costs = []
-        with closing(engine.raw_connection()) as conn:
+        with database.get_raw_connection(
+            catalog=catalog,
+            schema=schema,
+            source=source,
+        ) as conn:
             cursor = conn.cursor()
-            for statement in statements:
-                processed_statement = cls.process_statement(
-                    statement, database, user_name
+            return [
+                cls.estimate_statement_cost(
+                    database,
+                    cls.process_statement(statement, database),
+                    cursor,
                 )
-                costs.append(cls.estimate_statement_cost(processed_statement, cursor))
-        return costs
+                for statement in parsed_script.statements
+            ]
 
     @classmethod
-    def modify_url_for_impersonation(
-        cls, url: URL, impersonate_user: bool, username: Optional[str]
-    ) -> None:
+    def impersonate_user(
+        cls,
+        database: Database,
+        username: str | None,
+        user_token: str | None,
+        url: URL,
+        engine_kwargs: dict[str, Any],
+    ) -> tuple[URL, dict[str, Any]]:
         """
-        Modify the SQL Alchemy URL object with the user to impersonate if applicable.
+        Modify URL and/or engine kwargs to impersonate a different user.
+        """
+        # Update URL using old methods until 6.0.0.
+        url = cls.get_url_for_impersonation(url, True, username, user_token)
+
+        # Update engine kwargs using old methods. Note that #30674 modified the method
+        # signature, so we need to check if the method has the old signature.
+        connect_args = engine_kwargs.setdefault("connect_args", {})
+        args = [
+            connect_args,
+            url,
+            username,
+            user_token,
+        ]
+        if "database" in signature(cls.update_impersonation_config).parameters:
+            args.insert(0, database)
+
+        cls.update_impersonation_config(*args)
+
+        return url, engine_kwargs
+
+    @classmethod
+    def validate_embedded_credentials(cls, credentials: Any) -> dict[str, str] | None:
+        """
+        Return a complete embedded fallback credential, or ``None``.
+
+        Called by ``Database.get_embedded_fallback_credentials`` once its gate has
+        decided the request is one the fallback governs. The canonical shape is
+        ``{username, password}`` or ``{username, auth_method: "keypair",
+        privatekey_body, privatekey_pass}``; an engine whose driver needs a
+        different shape overrides this. The database API and parameter-validation
+        command use the same hook when checking credentials before saving.
+        """
+        return validated_embedded_credentials(credentials)
+
+    @classmethod
+    def apply_embedded_credentials(
+        cls,
+        database: Database,  # pylint: disable=unused-argument
+        credentials: dict[str, str],
+        url: URL,
+        engine_kwargs: dict[str, Any],
+    ) -> tuple[URL, dict[str, Any]]:
+        """
+        Apply an embedded fallback credential to the connection.
+
+        Called *instead of* :meth:`impersonate_user`, not alongside it -- see the
+        comment in ``Database._get_sqla_engine`` for why skipping impersonation is
+        load-bearing twice over.
+
+        The identity is replaced on the URL rather than added to ``connect_args``
+        because the per-process engine cache is keyed on the rendered URL and the
+        engine kwargs: putting it on the URL is what keeps a guest engine and a
+        logged-in user's engine on separate entries. ``URL.create`` rather than
+        ``URL.set`` so that the base credential is *replaced* -- ``set`` ignores
+        ``password=None``, which would leave a key-pair credential carrying the
+        connection's own password.
+        """
+        url = URL.create(
+            drivername=url.drivername,
+            username=credentials["username"],
+            password=credentials.get("password"),
+            host=url.host,
+            port=url.port,
+            database=url.database,
+            query=url.query,
+        )
+        return url, engine_kwargs
+
+    @classmethod
+    def get_embedded_credential_cache_key(cls, credentials: dict[str, str]) -> str:
+        """
+        Cache-key material for results produced under an embedded fallback credential.
+
+        Keyed on the configured identity rather than on the requesting principal: a
+        ``GuestUser`` carries whatever username the guest token claims, and whoever
+        mints the token must not get to choose which cache entry they read. All
+        guests on one connection legitimately share an entry -- they do run as one
+        database user -- and guest-token RLS already separates them.
+        """
+        return f"embedded:{credentials['username']}"
+
+    @classmethod
+    @deprecated(deprecated_in="6.0.0")
+    def get_url_for_impersonation(
+        cls,
+        url: URL,
+        impersonate_user: bool,
+        username: str | None,
+        access_token: str | None,  # pylint: disable=unused-argument
+    ) -> URL:
+        """
+        Return a modified URL with the username set.
+
         :param url: SQLAlchemy URL object
         :param impersonate_user: Flag indicating if impersonation is enabled
         :param username: Effective username
+        :param access_token: Personal access token
         """
         if impersonate_user and username is not None:
-            url.username = username
+            url = url.set(username=username)
+
+        return url
 
     @classmethod
-    def update_impersonation_config(
-        cls, connect_args: Dict[str, Any], uri: str, username: Optional[str],
+    @deprecated(deprecated_in="6.0.0")
+    def update_impersonation_config(  # pylint: disable=too-many-arguments
+        cls,
+        database: Database,
+        connect_args: dict[str, Any],
+        uri: str,
+        username: str | None,
+        access_token: str | None,
     ) -> None:
         """
         Update a configuration dictionary
         that can set the correct properties for impersonating users
 
+        :param connect_args: a Database object
         :param connect_args: config to be updated
         :param uri: URI
-        :param impersonate_user: Flag indicating if impersonation is enabled
         :param username: Effective username
+        :param access_token: Personal access token for OAuth2
         :return: None
         """
 
     @classmethod
     def execute(  # pylint: disable=unused-argument
-        cls, cursor: Any, query: str, **kwargs: Any,
+        cls,
+        cursor: Any,
+        query: str,
+        database: Database,
+        **kwargs: Any,
     ) -> None:
         """
         Execute a SQL query
 
         :param cursor: Cursor instance
         :param query: Query to execute
+        :param database_id: ID of the database where the query will run
         :param kwargs: kwargs to be passed to cursor.execute()
         :return:
         """
-        if not cls.allows_sql_comments:
-            query = sql_parse.strip_comments_from_sql(query)
-
         if cls.arraysize:
             cursor.arraysize = cls.arraysize
         try:
             cursor.execute(query)
         except Exception as ex:
-            raise cls.get_dbapi_mapped_exception(ex)
+            if (
+                not is_oauth2_retry_active()
+                and database.is_oauth2_enabled()
+                and cls.needs_oauth2(ex)
+            ):
+                cls.start_oauth2_dance(database)
+            raise cls.get_dbapi_mapped_exception(ex) from ex
 
     @classmethod
-    def make_label_compatible(cls, label: str) -> Union[str, quoted_name]:
+    def needs_oauth2(cls, ex: Exception) -> bool:
+        """
+        Check if the exception is one that indicates OAuth2 is needed.
+        """
+        # The cheap type check comes first so that the common case -- an error that
+        # has nothing to do with OAuth2 -- never reaches the import or the feature
+        # flag lookup below.
+        if not isinstance(ex, cls.oauth2_exception):
+            return False
+
+        if not (g and hasattr(g, "user")):
+            return False
+
+        # Prevent circular import.
+        from superset import security_manager
+
+        # An embedded viewer authenticates with a guest token rather than a Superset
+        # account, so there is no per-user token to resolve for them and no route by
+        # which they could authorize one. Starting the dance would raise instead of
+        # helping; let the driver's own error reach the user.
+        return not security_manager.is_guest_user(g.user)
+
+    @classmethod
+    def make_label_compatible(cls, label: str) -> str | quoted_name:
         """
         Conditionally mutate and/or quote a sqlalchemy expression label. If
         force_column_alias_quotes is set to True, return the label as a
         sqlalchemy.sql.elements.quoted_name object to ensure that the select query
-        and query results have same case. Otherwise return the mutated label as a
-        regular string. If maxmimum supported column name length is exceeded,
+        and query results have same case. Otherwise, return the mutated label as a
+        regular string. If maximum supported column name length is exceeded,
         generate a truncated label by calling truncate_label().
 
         :param label: expected expression label/alias
@@ -1127,35 +2971,31 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         return label_mutated
 
     @classmethod
-    def get_sqla_column_type(
+    def get_column_types(
         cls,
-        column_type: Optional[str],
-        column_type_mappings: Tuple[
-            Tuple[
-                Pattern[str],
-                Union[TypeEngine, Callable[[Match[str]], TypeEngine]],
-                GenericDataType,
-            ],
-            ...,
-        ] = column_type_mappings,
-    ) -> Union[Tuple[TypeEngine, GenericDataType], None]:
+        column_type: str | None,
+    ) -> tuple[TypeEngine, GenericDataType] | None:
         """
-        Return a sqlalchemy native column type that corresponds to the column type
-        defined in the data source (return None to use default type inferred by
-        SQLAlchemy). Override `column_type_mappings` for specific needs
+        Return a sqlalchemy native column type and generic data type that corresponds
+        to the column type defined in the data source (return None to use default type
+        inferred by SQLAlchemy). Override `column_type_mappings` for specific needs
         (see MSSQL for example of NCHAR/NVARCHAR handling).
 
         :param column_type: Column type returned by inspector
-        :return: SqlAlchemy column type
+        :return: SQLAlchemy and generic Superset column types
         """
         if not column_type:
             return None
-        for regex, sqla_type, generic_type in column_type_mappings:
+
+        for regex, sqla_type, generic_type in (
+            cls.column_type_mappings + cls._default_column_type_mappings
+        ):
             match = regex.match(column_type)
-            if match:
-                if callable(sqla_type):
-                    return sqla_type(match), generic_type
-                return sqla_type, generic_type
+            if not match:
+                continue
+            if callable(sqla_type):
+                return sqla_type(match), generic_type
+            return sqla_type, generic_type
         return None
 
     @staticmethod
@@ -1179,14 +3019,14 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         """
         In the case that a label exceeds the max length supported by the engine,
         this method is used to construct a deterministic and unique label based on
-        the original label. By default this returns an md5 hash of the original label,
+        the original label. By default, this returns a md5 hash of the original label,
         conditionally truncated if the length of the hash exceeds the max column length
         of the engine.
 
         :param label: Expected expression label
         :return: Truncated label
         """
-        label = md5_sha_from_str(label)
+        label = hash_from_str(label)
         # truncate hash if it exceeds max length
         if cls.max_column_name_length and len(label) > cls.max_column_name_length:
             label = label[: cls.max_column_name_length]
@@ -1198,8 +3038,8 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
     ) -> str:
         """
         Convert sqlalchemy column type to string representation.
-        By default removes collation and character encoding info to avoid unnecessarily
-        long datatypes.
+        By default, removes collation and character encoding info to avoid
+        unnecessarily long datatypes.
 
         :param sqla_column_type: SqlAlchemy column type
         :param dialect: Sqlalchemy dialect
@@ -1214,8 +3054,9 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
 
     @classmethod
     def get_function_names(  # pylint: disable=unused-argument
-        cls, database: "Database",
-    ) -> List[str]:
+        cls,
+        database: Database,
+    ) -> list[str]:
         """
         Get a list of function names that are able to be called on the database.
         Used for SQL Lab autocomplete.
@@ -1225,8 +3066,62 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         """
         return []
 
+    @classmethod
+    def get_column_description_limit_size(cls) -> int:
+        """
+        Get a minimum limit size for the sample SELECT column query
+        to fetch the column metadata.
+
+        :return: A number of limit size
+        """
+        return 1
+
+    @classmethod
+    def get_column_description_retry_sql(cls, sql: str) -> str | None:
+        """
+        Build a comment-safe fallback query for ``get_columns_description`` to
+        retry with when a zero-row metadata probe unexpectedly comes back with
+        an empty ``cursor.description``.
+
+        Some DB-API drivers only run their own "empty result" metadata
+        fallback -- used to populate ``cursor.description`` when a query
+        legitimately returns zero rows -- when the executed SQL text starts
+        with ``SELECT``/``WITH``. ``SQL_QUERY_MUTATOR`` can prepend comments
+        (e.g. query attribution) ahead of the ``SELECT`` keyword, which
+        defeats that startswith check on those drivers even though the query
+        itself is valid.
+
+        Engine specs affected by this can override this hook to wrap the
+        already-mutated SQL passed in so that the outer statement always
+        starts with a bare ``SELECT``. The original SQL -- including any
+        comments added by ``SQL_QUERY_MUTATOR`` -- is preserved verbatim, so
+        no mutation/audit behavior is lost, and the wrapped query still
+        returns zero rows.
+
+        Returning ``None`` (the default) means the engine doesn't support or
+        need this retry.
+
+        :param sql: The already limited and mutated SQL that was executed
+        :return: A comment-safe SQL string to retry with, or ``None``
+        """
+        return None
+
+    @classmethod
+    def expand_nested_columns(
+        cls,
+        cursor: Any,
+        columns: list[ResultSetColumnType],
+    ) -> list[ResultSetColumnType]:
+        """
+        Add one column per nested field (e.g. STRUCT members) to the columns
+        inferred from ``cursor.description`` by ``get_columns_description``, so
+        virtual datasets get the dotted columns the inspector returns for
+        physical tables. The default returns ``columns`` unchanged.
+        """
+        return columns
+
     @staticmethod
-    def pyodbc_rows_to_tuples(data: List[Any]) -> List[Tuple[Any, ...]]:
+    def pyodbc_rows_to_tuples(data: list[Any]) -> list[tuple[Any, ...]]:
         """
         Convert pyodbc.Row objects from `fetch_data` to tuples.
 
@@ -1239,7 +3134,7 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
 
     @staticmethod
     def mutate_db_for_connection_test(  # pylint: disable=unused-argument
-        database: "Database",
+        database: Database,
     ) -> None:
         """
         Some databases require passing additional parameters for validating database
@@ -1251,72 +3146,167 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         return None
 
     @staticmethod
-    def get_extra_params(database: "Database") -> Dict[str, Any]:
+    def get_extra_params(
+        database: Database, source: QuerySource | None = None
+    ) -> dict[str, Any]:
         """
         Some databases require adding elements to connection parameters,
         like passing certificates to `extra`. This can be done here.
 
         :param database: database instance from which to extract extras
+        :param source: in which context is the connection needed
         :raises CertificateException: If certificate is not valid/unparseable
         """
-        extra: Dict[str, Any] = {}
+        extra: dict[str, Any] = {}
         if database.extra:
             try:
                 extra = json.loads(database.extra)
             except json.JSONDecodeError as ex:
                 logger.error(ex, exc_info=True)
-                raise ex
+                raise SupersetGenericDBErrorException(message=str(ex)) from ex
         return extra
 
+    @staticmethod
+    def update_params_from_encrypted_extra(  # pylint: disable=invalid-name
+        database: Database, params: dict[str, Any]
+    ) -> None:
+        """
+        Some databases require some sensitive information which do not conform to
+        the username:password syntax normally used by SQLAlchemy.
+
+        :param database: database instance from which to extract extras
+        :param params: params to be updated
+        """
+        if not database.encrypted_extra:
+            return
+        try:
+            encrypted_extra = json.loads(database.encrypted_extra)
+            # The embedded fallback credential is read by `Database._get_sqla_engine`,
+            # not by any driver. Splatting it in here would make it a `create_engine`
+            # kwarg and raise `TypeError` on every engine that inherits this method, so
+            # it is dropped regardless of whether the engine opted into the feature.
+            encrypted_extra.pop(EMBEDDED_CREDENTIALS_KEY, None)
+            params.update(encrypted_extra)
+        except json.JSONDecodeError as ex:
+            logger.error(ex, exc_info=True)
+            raise SupersetGenericDBErrorException(message=str(ex)) from ex
+
     @classmethod
-    def is_readonly_query(cls, parsed_query: ParsedQuery) -> bool:
-        """Pessimistic readonly, 100% sure statement won't mutate anything"""
-        return (
-            parsed_query.is_select()
-            or parsed_query.is_explain()
-            or parsed_query.is_show()
+    def array_contains_any(cls, col: ColumnElement, values: list[Any]) -> ColumnElement:
+        """
+        Build a boolean expression testing whether array column ``col`` contains
+        **any** of ``values`` (element-level membership, like ``IN``). Engines
+        that set ``supports_multivalue_columns = True`` must override this with
+        their native function (e.g. ClickHouse ``hasAny``).
+
+        :param col: SQLAlchemy column element for the array column
+        :param values: element values to look for inside the array
+        :return: a SQLAlchemy boolean expression
+        """
+        raise NotImplementedError(
+            f"{cls.engine} does not support multi-value (array) columns"
         )
 
     @classmethod
-    def is_select_query(cls, parsed_query: ParsedQuery) -> bool:
+    def array_contains_all(cls, col: ColumnElement, values: list[Any]) -> ColumnElement:
         """
-        Determine if the statement should be considered as SELECT statement.
-        Some query dialects do not contain "SELECT" word in queries (eg. Kusto)
+        Build a boolean expression testing whether array column ``col`` contains
+        **all** of ``values``. Engines that set
+        ``supports_multivalue_columns = True`` must override this with their
+        native function (e.g. ClickHouse ``hasAll``).
+
+        :param col: SQLAlchemy column element for the array column
+        :param values: element values that must all be present
+        :return: a SQLAlchemy boolean expression
         """
-        return parsed_query.is_select()
+        raise NotImplementedError(
+            f"{cls.engine} does not support multi-value (array) columns"
+        )
 
     @classmethod
-    @memoized
+    def array_length(cls, col: ColumnElement) -> ColumnElement:
+        """
+        Build a numeric expression returning the number of elements in array
+        column ``col``. Engines that set ``supports_multivalue_columns = True``
+        must override this with their native array-length function. Used both for
+        the ``Length`` filter and the ``Is empty`` / ``Is not empty`` operators.
+
+        :param col: SQLAlchemy column element for the array column
+        :return: a SQLAlchemy numeric expression
+        """
+        raise NotImplementedError(
+            f"{cls.engine} does not support multi-value (array) columns"
+        )
+
+    @classmethod
+    def array_literal(cls, values: list[Any]) -> ColumnElement:
+        """
+        Build an array-literal expression from ``values`` (e.g. ClickHouse
+        ``array(v1, v2)`` == ``[v1, v2]``). Used for the whole-array (column-
+        level) operators ``=`` / ``!=`` / ``IN`` / ``NOT IN`` where the array is
+        compared as a single value. Engines that set
+        ``supports_multivalue_columns = True`` must override this.
+
+        :param values: element values that make up the array
+        :return: a SQLAlchemy array-literal expression
+        """
+        raise NotImplementedError(
+            f"{cls.engine} does not support multi-value (array) columns"
+        )
+
+    @classmethod
+    def array_explode(cls, col: ColumnElement) -> ColumnElement:
+        """
+        Build an expression that expands array column ``col`` into one row per
+        element (e.g. ClickHouse ``arrayJoin``). Used to source **element-level**
+        value suggestions (``SELECT DISTINCT array_explode(col)``) for the
+        ``Contains any`` / ``Contains all`` filter operators, so the picker offers
+        individual elements rather than whole arrays. Engines that set
+        ``supports_multivalue_columns = True`` must override this.
+
+        :param col: SQLAlchemy column element for the array column
+        :return: a SQLAlchemy expression yielding one element per row
+        """
+        raise NotImplementedError(
+            f"{cls.engine} does not support multi-value (array) columns"
+        )
+
+    @classmethod
+    def get_array_element_type(  # pylint: disable=unused-argument
+        cls, native_type: str | None
+    ) -> GenericDataType | None:
+        """
+        Return the generic type of an array column's **element** type, derived
+        from its native type string (e.g. ClickHouse ``Array(Int32)`` ->
+        ``NUMERIC``), or ``None`` when the engine has no array support or the
+        element type cannot be resolved.
+
+        Callers use this to coerce filter values to the element type before
+        building array expressions, so, for example, a ``Contains any`` filter on
+        a numeric array compares against numbers rather than quoted strings.
+
+        :param native_type: native column type string of the array column
+        :return: the element's :class:`GenericDataType`, or ``None``
+        """
+        return None
+
+    @classmethod
     def get_column_spec(  # pylint: disable=unused-argument
         cls,
-        native_type: Optional[str],
+        native_type: str | None,
+        db_extra: dict[str, Any] | None = None,
         source: utils.ColumnTypeSource = utils.ColumnTypeSource.GET_TABLE,
-        column_type_mappings: Tuple[
-            Tuple[
-                Pattern[str],
-                Union[TypeEngine, Callable[[Match[str]], TypeEngine]],
-                GenericDataType,
-            ],
-            ...,
-        ] = column_type_mappings,
-    ) -> Union[ColumnSpec, None]:
+    ) -> ColumnSpec | None:
         """
-        Converts native database type to sqlalchemy column type.
-        :param native_type: Native database typee
+        Get generic type related specs regarding a native column type.
+
+        :param native_type: Native database type
+        :param db_extra: The database extra object
         :param source: Type coming from the database table or cursor description
         :return: ColumnSpec object
         """
-        col_types = cls.get_sqla_column_type(
-            native_type, column_type_mappings=column_type_mappings
-        )
-        if col_types:
+        if col_types := cls.get_column_types(native_type):
             column_type, generic_type = col_types
-            # wrap temporal types in custom type that supports literal binding
-            # using datetimes
-            if generic_type == GenericDataType.TEMPORAL:
-                column_type = literal_dttm_type_factory(
-                    column_type, cls, native_type or ""
-                )
             is_dttm = generic_type == GenericDataType.TEMPORAL
             return ColumnSpec(
                 sqla_type=column_type, generic_type=generic_type, is_dttm=is_dttm
@@ -1324,10 +3314,46 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
         return None
 
     @classmethod
+    def get_sqla_column_type(
+        cls,
+        native_type: str | None,
+        db_extra: dict[str, Any] | None = None,
+        source: utils.ColumnTypeSource = utils.ColumnTypeSource.GET_TABLE,
+    ) -> TypeEngine | None:
+        """
+        Converts native database type to sqlalchemy column type.
+
+        :param native_type: Native database type
+        :param db_extra: The database extra object
+        :param source: Type coming from the database table or cursor description
+        :return: ColumnSpec object
+        """
+        column_spec = cls.get_column_spec(
+            native_type=native_type,
+            db_extra=db_extra,
+            source=source,
+        )
+        return column_spec.sqla_type if column_spec else None
+
+    # pylint: disable=unused-argument
+    @classmethod
+    def prepare_cancel_query(cls, query: Query) -> None:
+        """
+        Some databases may acquire the query cancelation id after the query
+        cancelation request has been received. For those cases, the db engine spec
+        can record the cancelation intent so that the query can either be stopped
+        prior to execution, or canceled once the query id is acquired.
+
+        Only stage changes on the query; do not flush or commit here. The caller
+        persists them with a guarded stop so a concurrent terminal result wins.
+        """
+        return None
+
+    @classmethod
     def has_implicit_cancel(cls) -> bool:
         """
         Return True if the live cursor handles the implicit cancelation of the query,
-        False otherise.
+        False otherwise.
 
         :return: Whether the live cursor implicitly cancels the query
         :see: handle_cursor
@@ -1337,8 +3363,10 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
 
     @classmethod
     def get_cancel_query_id(  # pylint: disable=unused-argument
-        cls, cursor: Any, query: Query,
-    ) -> Optional[str]:
+        cls,
+        cursor: Any,
+        query: Query,
+    ) -> str | None:
         """
         Select identifiers from the database engine that uniquely identifies the
         queries to cancel. The identifier is typically a session id, process id
@@ -1351,9 +3379,33 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
 
         return None
 
+    @staticmethod
+    def validate_cancel_query_id(
+        cancel_query_id: str | None,
+        pattern: str = r"^\d+$",
+    ) -> bool:
+        """
+        Validate that a cancel_query_id matches expected format.
+
+        This is a defense-in-depth measure to prevent SQL injection in cancel_query
+        implementations that use string interpolation. While cancel_query_id typically
+        comes from trusted database sources (e.g., CONNECTION_ID()), validation ensures
+        safety even if the data source is compromised.
+
+        :param cancel_query_id: The query identifier to validate
+        :param pattern: Regex pattern to match (default: numeric only)
+        :return: True if valid, False otherwise
+        """
+        if cancel_query_id is None:
+            return False
+        return bool(re.fullmatch(pattern, str(cancel_query_id)))
+
     @classmethod
     def cancel_query(  # pylint: disable=unused-argument
-        cls, cursor: Any, query: Query, cancel_query_id: str,
+        cls,
+        cursor: Any,
+        query: Query,
+        cancel_query_id: str,
     ) -> bool:
         """
         Cancel query in the underlying database.
@@ -1367,39 +3419,222 @@ class BaseEngineSpec:  # pylint: disable=too-many-public-methods
 
         return False
 
+    @classmethod
+    def get_impersonation_key(cls, user: User | None) -> Any:
+        """
+        Construct an impersonation key, by default it's the given username.
+
+        :param user: logged-in user
+
+        :returns: username if given user is not null
+        """
+        return user.username if user else None
+
+    @classmethod
+    def mask_encrypted_extra(cls, encrypted_extra: str | None) -> str | None:
+        """
+        Mask `encrypted_extra`.
+
+        This is used to remove any sensitive data in `encrypted_extra` when presenting
+        it to the user when a database is edited. For example, a private key might be
+        replaced with a masked value "XXXXXXXXXX". If the masked value is changed the
+        corresponding entry is updated, otherwise the old value is used (see
+        `unmask_encrypted_extra` below).
+        """
+        if encrypted_extra is None:
+            return encrypted_extra
+
+        try:
+            config = json.loads(encrypted_extra)
+        except (TypeError, json.JSONDecodeError):
+            return encrypted_extra
+
+        masked_encrypted_extra = redact_sensitive(
+            config,
+            cls.encrypted_extra_sensitive_field_paths(),
+        )
+
+        return json.dumps(masked_encrypted_extra)
+
+    @classmethod
+    def unmask_encrypted_extra(cls, old: str | None, new: str | None) -> str | None:
+        """
+        Remove masks from `encrypted_extra`.
+
+        This method allows reusing existing values from the current encrypted extra on
+        updates. It's useful for reusing masked passwords, allowing keys to be updated
+        without having to provide sensitive data to the client.
+        """
+        if old is None or new is None:
+            return new
+
+        try:
+            old_config = json.loads(old)
+            new_config = json.loads(new)
+        except (TypeError, json.JSONDecodeError):
+            return new
+
+        new_config = reveal_sensitive(
+            old_config,
+            new_config,
+            cls.encrypted_extra_sensitive_field_paths(),
+        )
+
+        return json.dumps(new_config)
+
+    @classmethod
+    def get_connection_identity(cls, uri: URL, connect_args: dict[str, Any]) -> URL:
+        """
+        Return the destination a stored credential is sent to, for checks that
+        decide whether the credential may be reused on an edited connection.
+        """
+        return uri
+
+    @classmethod
+    def get_extra_from_parameters(
+        cls, parameters: dict[str, Any], extra: str | None
+    ) -> str | None:
+        """Reconcile field-form values with settings stored outside the URI."""
+        return extra
+
+    @classmethod
+    def get_parameters_from_database(
+        cls,
+        database: Database,
+        encrypted_extra: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return masked form parameters, including engine-specific stored settings."""
+        return cls.get_parameters_from_uri(  # type: ignore
+            make_url_safe(database.sqlalchemy_uri), encrypted_extra=encrypted_extra
+        )
+
+    @classmethod
+    def get_public_information(cls) -> dict[str, Any]:
+        """
+        Construct a Dict with properties we want to expose.
+
+        :returns: Dict with properties of our class like supports_file_upload
+        and disable_ssh_tunneling
+        """
+        return {
+            "supports_file_upload": cls.supports_file_upload,
+            "disable_ssh_tunneling": cls.disable_ssh_tunneling,
+            "supports_dynamic_catalog": cls.supports_dynamic_catalog,
+            "supports_oauth2": cls.supports_oauth2,
+            "supports_schemas": cls.supports_schemas,
+            "supports_offset": cls.supports_offset,
+            "identifier_quote": {
+                "start": cls.identifier_quote_start,
+                "end": cls.identifier_quote_end,
+                "escape_by_doubling": cls.identifier_quote_escape_by_doubling,
+            },
+        }
+
+    @classmethod
+    def validate_database_uri(cls, sqlalchemy_uri: URL) -> None:
+        """
+        Validates a database SQLAlchemy URI per engine spec.
+        Use this to implement a final validation for unwanted connection configuration
+
+        :param sqlalchemy_uri:
+        """
+        if db_engine_uri_validator := app.config["DB_SQLA_URI_VALIDATOR"]:
+            db_engine_uri_validator(sqlalchemy_uri)
+
+        if existing_disallowed := cls.disallow_uri_query_params.get(
+            sqlalchemy_uri.get_driver_name(), set()
+        ).intersection(sqlalchemy_uri.query):
+            raise ValueError(f"Forbidden query parameter(s): {existing_disallowed}")
+
+    @classmethod
+    def denormalize_name(cls, dialect: Dialect, name: str) -> str:
+        if (
+            hasattr(dialect, "requires_name_normalize")
+            and dialect.requires_name_normalize
+        ):
+            return dialect.denormalize_name(name)
+
+        return name
+
+    @classmethod
+    def prepare_identifier(
+        cls,
+        name: str,
+        normalize_columns: bool = False,
+    ) -> str:
+        """
+        Prepare a physical identifier for SQLAlchemy column construction.
+
+        The default preserves SQLAlchemy's automatic identifier-quoting behavior.
+        """
+        return name
+
+    @classmethod
+    def quote_table(cls, table: Table, dialect: Dialect) -> str:
+        """
+        Fully quote a table name, including the schema and catalog.
+        """
+        quoters = {
+            "catalog": dialect.identifier_preparer.quote_schema,
+            "schema": dialect.identifier_preparer.quote_schema,
+            "table": dialect.identifier_preparer.quote,
+        }
+
+        return ".".join(
+            function(getattr(table, key))
+            for key, function in quoters.items()
+            if getattr(table, key)
+        )
+
 
 # schema for adding a database by providing parameters instead of the
 # full SQLAlchemy URI
 class BasicParametersSchema(Schema):
-    username = fields.String(required=True, allow_none=True, description=__("Username"))
-    password = fields.String(allow_none=True, description=__("Password"))
-    host = fields.String(required=True, description=__("Hostname or IP address"))
+    username = fields.String(
+        required=True, allow_none=True, metadata={"description": __("Username")}
+    )
+    password = fields.String(allow_none=True, metadata={"description": __("Password")})
+    host = fields.String(
+        required=True, metadata={"description": __("Hostname or IP address")}
+    )
     port = fields.Integer(
         required=True,
-        description=__("Database port"),
-        validate=Range(min=0, max=2 ** 16, max_inclusive=False),
+        metadata={"description": __("Database port")},
+        validate=Range(min=0, max=2**16, max_inclusive=False),
     )
-    database = fields.String(required=True, description=__("Database name"))
+    database = fields.String(
+        required=True, metadata={"description": __("Database name")}
+    )
     query = fields.Dict(
-        keys=fields.Str(), values=fields.Raw(), description=__("Additional parameters")
+        keys=fields.Str(),
+        values=fields.Raw(),
+        metadata={"description": __("Additional parameters")},
     )
     encryption = fields.Boolean(
-        required=False, description=__("Use an encrypted connection to the database")
+        required=False,
+        metadata={"description": __("Use an encrypted connection to the database")},
+    )
+    ssh = fields.Boolean(
+        required=False,
+        metadata={"description": __("Use an ssh tunnel connection to the database")},
     )
 
 
 class BasicParametersType(TypedDict, total=False):
-    username: Optional[str]
-    password: Optional[str]
+    username: str | None
+    password: str | None
     host: str
     port: int
     database: str
-    query: Dict[str, Any]
+    query: dict[str, Any]
     encryption: bool
 
 
-class BasicParametersMixin:
+class BasicPropertiesType(TypedDict):
+    parameters: BasicParametersType
 
+
+class BasicParametersMixin:
     """
     Mixin for configuring DB engine specs via a dictionary.
 
@@ -1417,49 +3652,65 @@ class BasicParametersMixin:
     # recommended driver name for the DB engine spec
     default_driver = ""
 
-    # placeholder with the SQLAlchemy URI template
-    sqlalchemy_uri_placeholder = (
-        "engine+driver://user:password@host:port/dbname[?key=value&key=value...]"
-    )
-
     # query parameter to enable encryption in the database connection
     # for Postgres this would be `{"sslmode": "verify-ca"}`, eg.
-    encryption_parameters: Dict[str, str] = {}
+    encryption_parameters: dict[str, str] = {}
+
+    # query parameter to explicitly disable encryption, for drivers that do not
+    # treat the absence of `encryption_parameters` as an unencrypted connection
+    # for Databend this would be `{"sslmode": "disable"}`, eg.
+    encryption_disable_parameters: dict[str, str] = {}
+
+    # parameters that `validate_parameters` treats as mandatory; subclasses
+    # override this to relax a parameter (e.g. `port`) without duplicating
+    # the rest of `validate_parameters`
+    required_parameters: set[str] = {"host", "port", "username", "database"}
 
     @classmethod
     def build_sqlalchemy_uri(  # pylint: disable=unused-argument
         cls,
         parameters: BasicParametersType,
-        encryted_extra: Optional[Dict[str, str]] = None,
+        encrypted_extra: dict[str, str] | None = None,
     ) -> str:
+        # TODO (betodealmeida): this method should also build `connect_args`
         # make a copy so that we don't update the original
         query = parameters.get("query", {}).copy()
         if parameters.get("encryption"):
             if not cls.encryption_parameters:
-                raise Exception("Unable to build a URL with encryption enabled")
+                raise Exception(  # pylint: disable=broad-exception-raised
+                    "Unable to build a URL with encryption enabled"
+                )
             query.update(cls.encryption_parameters)
+        else:
+            query.update(cls.encryption_disable_parameters)
 
-        return str(
-            URL(
-                f"{cls.engine}+{cls.default_driver}".rstrip("+"),  # type: ignore
-                username=parameters.get("username"),
-                password=parameters.get("password"),
-                host=parameters["host"],
-                port=parameters["port"],
-                database=parameters["database"],
-                query=query,
-            )
-        )
+        # SQLAlchemy 2.0 made URL.__str__() hide the password by default
+        # (it rendered in full under 1.4); render_as_string(hide_password=
+        # False) is required here since this URI is stored/used to actually
+        # connect, not just displayed.
+        return URL.create(
+            f"{cls.engine}+{cls.default_driver}".rstrip("+"),  # type: ignore
+            username=parameters.get("username"),
+            password=parameters.get("password"),
+            host=parameters["host"],
+            port=parameters["port"],
+            database=parameters["database"],
+            query=query,
+        ).render_as_string(hide_password=False)
 
     @classmethod
     def get_parameters_from_uri(  # pylint: disable=unused-argument
-        cls, uri: str, encrypted_extra: Optional[Dict[str, Any]] = None
+        cls, uri: str, encrypted_extra: dict[str, Any] | None = None
     ) -> BasicParametersType:
-        url = make_url(uri)
+        url = make_url_safe(uri)
+        encryption_items = [
+            *cls.encryption_parameters.items(),
+            *cls.encryption_disable_parameters.items(),
+        ]
         query = {
             key: value
             for (key, value) in url.query.items()
-            if (key, value) not in cls.encryption_parameters.items()
+            if (key, value) not in encryption_items
         }
         encryption = all(
             item in url.query.items() for item in cls.encryption_parameters.items()
@@ -1476,24 +3727,24 @@ class BasicParametersMixin:
 
     @classmethod
     def validate_parameters(
-        cls, parameters: BasicParametersType
-    ) -> List[SupersetError]:
+        cls, properties: BasicPropertiesType
+    ) -> list[SupersetError]:
         """
         Validates any number of parameters, for progressive validation.
 
         If only the hostname is present it will check if the name is resolvable. As more
         parameters are present in the request, more validation is done.
         """
-        errors: List[SupersetError] = []
+        errors: list[SupersetError] = []
 
-        required = {"host", "port", "username", "database"}
+        required = cls.required_parameters
+        parameters = properties.get("parameters", {})
         present = {key for key in parameters if parameters.get(key, ())}
-        missing = sorted(required - present)
 
-        if missing:
+        if missing := sorted(required - present):
             errors.append(
                 SupersetError(
-                    message=f'One or more parameters are missing: {", ".join(missing)}',
+                    message=f"One or more parameters are missing: {', '.join(missing)}",
                     error_type=SupersetErrorType.CONNECTION_MISSING_PARAMETERS_ERROR,
                     level=ErrorLevel.WARNING,
                     extra={"missing": missing},
@@ -1515,7 +3766,7 @@ class BasicParametersMixin:
             return errors
 
         port = parameters.get("port", None)
-        if not port:
+        if port is None or port == "":
             return errors
         try:
             port = int(port)
@@ -1528,12 +3779,11 @@ class BasicParametersMixin:
                     extra={"invalid": ["port"]},
                 ),
             )
-        if not (isinstance(port, int) and 0 <= port < 2 ** 16):
+        if not (isinstance(port, int) and 0 <= port < 2**16):
             errors.append(
                 SupersetError(
                     message=(
-                        "The port must be an integer between 0 and 65535 "
-                        "(inclusive)."
+                        "The port must be an integer between 0 and 65535 (inclusive)."
                     ),
                     error_type=SupersetErrorType.CONNECTION_INVALID_PORT_ERROR,
                     level=ErrorLevel.ERROR,
@@ -1557,14 +3807,83 @@ class BasicParametersMixin:
         """
         Return configuration parameters as OpenAPI.
         """
-        if not cls.parameters_schema:
-            return None
+        return build_parameters_json_schema(cast("type[BaseEngineSpec]", cls))
 
-        spec = APISpec(
-            title="Database Parameters",
-            version="1.0.0",
-            openapi_version="3.0.2",
-            plugins=[MarshmallowPlugin()],
-        )
-        spec.components.schema(cls.__name__, schema=cls.parameters_schema)
-        return spec.to_dict()["components"]["schemas"][cls.__name__]
+
+def build_parameters_json_schema(engine_spec: type[BaseEngineSpec]) -> Any:
+    """
+    Return a DB engine spec's configuration parameters as OpenAPI.
+
+    A module-level function rather than a method so that it is reachable both from
+    ``BasicParametersMixin``, which most dynamic-parameter engines inherit, and from
+    a spec that cannot mix that in because its ``build_sqlalchemy_uri`` takes a
+    narrower parameters type. Before this existed each such spec carried a
+    near-verbatim copy, and the copies drifted.
+    """
+    # `parameters_schema` is deliberately absent from `BaseEngineSpec` -- its presence
+    # is what `ValidateDatabaseParametersCommand` tests to tell a dynamic-parameters
+    # engine from a URI-only one -- so it is read defensively rather than declared.
+    parameters_schema = getattr(engine_spec, "parameters_schema", None)
+    if not parameters_schema:
+        return None
+
+    ma_plugin = MarshmallowPlugin()
+    spec = APISpec(
+        title="Database Parameters",
+        version="1.0.0",
+        openapi_version="3.0.2",
+        plugins=[ma_plugin],
+    )
+
+    # `APISpec` has already run `init_spec` for the plugin passed above, so the
+    # converter exists by now. This is what tags `EncryptedField` parameters with
+    # `x-encrypted-extra`, which is the signal the connection dialog uses both to
+    # render the field and to move its value into `masked_encrypted_extra` rather
+    # than posting it as a plain parameter.
+    ma_plugin.converter.add_attribute_function(encrypted_field_properties)
+
+    spec.components.schema(engine_spec.__name__, schema=parameters_schema)
+    schema = spec.to_dict()["components"]["schemas"][engine_spec.__name__]
+    _apply_embedded_credentials_schema(engine_spec, schema)
+    return schema
+
+
+def _apply_embedded_credentials_schema(
+    engine_spec: type[BaseEngineSpec],
+    schema: dict[str, Any],
+) -> None:
+    """
+    Gate and annotate the embedded fallback credential parameter, in place.
+
+    This payload is the sole source of the fields the connection dialog renders, so
+    dropping the property is all it takes to hide the sub-form -- no feature-flag
+    plumbing is needed on the frontend. Note that this only stops the credential
+    being *offered*: one already stored is left untouched, so turning the flag off is
+    reversible rather than destructive.
+
+    Lives here rather than in each opted-in engine so that a second engine's opt-in
+    is a schema field and a class attribute, not a copied override.
+    """
+    properties = schema.get("properties")
+    if not isinstance(properties, dict) or EMBEDDED_CREDENTIALS_KEY not in properties:
+        return
+
+    # Both flags are required because `Database.embedded_fallback_applies` requires
+    # both: without `EMBEDDED_SUPERSET` there are no guests for the credential to
+    # apply to, so offering the field would save a setting the gate then ignores.
+    if not (
+        is_feature_enabled("EMBEDDED_CREDENTIAL_FALLBACK")
+        and is_feature_enabled("EMBEDDED_SUPERSET")
+    ):
+        properties.pop(EMBEDDED_CREDENTIALS_KEY, None)
+        return
+
+    # Not a default *value* for the field. A property's `default` is the only channel
+    # the connection dialog plumbs through to a field component (as `default_value`),
+    # and whether a deployment-wide OAuth2 client exists -- `DATABASE_OAUTH2_CLIENTS`,
+    # the second half of `Database.is_oauth2_enabled` -- is knowable only here. The
+    # per-connection half is live form state, so the field reads that itself and shows
+    # the sub-form when either holds.
+    properties[EMBEDDED_CREDENTIALS_KEY]["default"] = {
+        "engine_oauth2_client_configured": engine_spec.is_oauth2_enabled(),
+    }

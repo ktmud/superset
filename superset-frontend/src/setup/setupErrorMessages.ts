@@ -16,12 +16,20 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import getErrorMessageComponentRegistry from 'src/components/ErrorMessage/getErrorMessageComponentRegistry';
-import { ErrorTypeEnum } from 'src/components/ErrorMessage/types';
-import TimeoutErrorMessage from 'src/components/ErrorMessage/TimeoutErrorMessage';
-import DatabaseErrorMessage from 'src/components/ErrorMessage/DatabaseErrorMessage';
-import ParameterErrorMessage from 'src/components/ErrorMessage/ParameterErrorMessage';
-import DatasetNotFoundErrorMessage from 'src/components/ErrorMessage/DatasetNotFoundErrorMessage';
+import { ErrorTypeEnum } from '@superset-ui/core';
+import {
+  getErrorMessageComponentRegistry,
+  TimeoutErrorMessage,
+  DatabaseErrorMessage,
+  MarshmallowErrorMessage,
+  ParameterErrorMessage,
+  DatasetNotFoundErrorMessage,
+  DatasourceSecurityAccessErrorMessage,
+  InvalidSQLErrorMessage,
+  OAuth2RedirectMessage,
+  FrontendNetworkErrorMessage,
+  CsrfErrorMessage,
+} from 'src/components';
 
 import setupErrorMessagesExtra from './setupErrorMessagesExtra';
 
@@ -31,6 +39,14 @@ export default function setupErrorMessages() {
   errorMessageComponentRegistry.registerValue(
     ErrorTypeEnum.FRONTEND_TIMEOUT_ERROR,
     TimeoutErrorMessage,
+  );
+  errorMessageComponentRegistry.registerValue(
+    ErrorTypeEnum.FRONTEND_NETWORK_ERROR,
+    FrontendNetworkErrorMessage,
+  );
+  errorMessageComponentRegistry.registerValue(
+    ErrorTypeEnum.CSRF_ERROR,
+    CsrfErrorMessage,
   );
   errorMessageComponentRegistry.registerValue(
     ErrorTypeEnum.BACKEND_TIMEOUT_ERROR,
@@ -83,6 +99,14 @@ export default function setupErrorMessages() {
   errorMessageComponentRegistry.registerValue(
     ErrorTypeEnum.QUERY_SECURITY_ACCESS_ERROR,
     DatabaseErrorMessage,
+  );
+  errorMessageComponentRegistry.registerValue(
+    ErrorTypeEnum.DATASOURCE_SECURITY_ACCESS_ERROR,
+    DatasourceSecurityAccessErrorMessage,
+  );
+  errorMessageComponentRegistry.registerValue(
+    ErrorTypeEnum.TABLE_SECURITY_ACCESS_ERROR,
+    DatasourceSecurityAccessErrorMessage,
   );
   errorMessageComponentRegistry.registerValue(
     ErrorTypeEnum.CONNECTION_INVALID_HOSTNAME_ERROR,
@@ -143,6 +167,22 @@ export default function setupErrorMessages() {
   errorMessageComponentRegistry.registerValue(
     ErrorTypeEnum.FAILED_FETCHING_DATASOURCE_INFO_ERROR,
     DatasetNotFoundErrorMessage,
+  );
+  errorMessageComponentRegistry.registerValue(
+    ErrorTypeEnum.MARSHMALLOW_ERROR,
+    MarshmallowErrorMessage,
+  );
+  errorMessageComponentRegistry.registerValue(
+    ErrorTypeEnum.OAUTH2_REDIRECT,
+    OAuth2RedirectMessage,
+  );
+  errorMessageComponentRegistry.registerValue(
+    ErrorTypeEnum.INVALID_SQL_ERROR,
+    InvalidSQLErrorMessage,
+  );
+  errorMessageComponentRegistry.registerValue(
+    ErrorTypeEnum.RESULT_TOO_LARGE_ERROR,
+    DatabaseErrorMessage,
   );
   setupErrorMessagesExtra();
 }

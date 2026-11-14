@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from superset.db_engine_specs.base import BaseEngineSpec
+from superset.db_engine_specs.base import BaseEngineSpec, DatabaseCategory
 
 
 class SolrEngineSpec(BaseEngineSpec):  # pylint: disable=abstract-method
@@ -25,9 +25,36 @@ class SolrEngineSpec(BaseEngineSpec):  # pylint: disable=abstract-method
     engine_name = "Apache Solr"
 
     time_groupby_inline = False
-    time_secondary_columns = False
     allows_joins = False
     allows_subqueries = False
+
+    metadata = {
+        "description": "Apache Solr is an open-source enterprise search platform.",
+        "logo": "apache-solr.png",
+        "homepage_url": "https://solr.apache.org/",
+        "categories": [
+            DatabaseCategory.APACHE_PROJECTS,
+            DatabaseCategory.SEARCH_NOSQL,
+            DatabaseCategory.OPEN_SOURCE,
+        ],
+        "pypi_packages": ["sqlalchemy-solr"],
+        "connection_string": (
+            "solr://{username}:{password}@{host}:{port}/{server_path}/{collection}"
+            "[/?use_ssl=true|false]"
+        ),
+        "default_port": 8983,
+        "known_incompatibilities": [
+            {
+                "dependency": "SQLAlchemy 2.0",
+                "reason": (
+                    "sqlalchemy-solr hard-pins sqlalchemy~=1.4.7 and has seen no "
+                    "activity beyond dependabot bumps since 2024."
+                ),
+                "tracking_url": "https://github.com/aadel/sqlalchemy-solr",
+                "since": "2026-10-27",
+            }
+        ],
+    }
 
     _time_grain_expressions = {
         None: "{col}",

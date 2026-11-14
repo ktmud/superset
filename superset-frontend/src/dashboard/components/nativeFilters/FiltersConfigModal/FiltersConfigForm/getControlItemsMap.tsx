@@ -16,16 +16,23 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+import { CustomControlItem } from '@superset-ui/chart-controls';
+import { ReactNode } from 'react';
 import {
-  CustomControlItem,
-  InfoTooltipWithTrigger,
-} from '@superset-ui/chart-controls';
-import React from 'react';
-import { Checkbox } from 'src/common/components';
-import { FormInstance } from 'antd/lib/form';
-import { getChartControlPanelRegistry, styled, t } from '@superset-ui/core';
-import { Tooltip } from 'src/components/Tooltip';
-import { FormItem } from 'src/components/Form';
+  Checkbox,
+  FormItem,
+  InfoTooltip,
+  Tooltip,
+  type FormInstance,
+} from '@superset-ui/core/components';
+import { t } from '@apache-superset/core/translation';
+import {
+  Filter,
+  ChartCustomization,
+  DatasourceType,
+  getChartControlPanelRegistry,
+} from '@superset-ui/core';
+import { styled } from '@apache-superset/core/theme';
 import {
   doesColumnMatchFilterType,
   getControlItems,
@@ -37,17 +44,20 @@ import {
   StyledLabel,
   StyledRowFormItem,
 } from './FiltersConfigForm';
-import { Filter } from '../../types';
 import { ColumnSelect } from './ColumnSelect';
 
 export interface ControlItemsProps {
-  datasetId: number;
+  expanded: boolean;
+  datasetId?: number;
+  datasourceType?: DatasourceType;
   disabled: boolean;
   forceUpdate: Function;
+  formChanged: Function;
   form: FormInstance<NativeFiltersForm>;
   filterId: string;
   filterType: string;
   filterToEdit?: Filter;
+  customizationToEdit?: ChartCustomization;
   formFilter?: NativeFiltersFormItem;
   removed?: boolean;
 }
@@ -57,13 +67,17 @@ const CleanFormItem = styled(FormItem)`
 `;
 
 export default function getControlItemsMap({
+  expanded,
   datasetId,
+  datasourceType,
   disabled,
   forceUpdate,
+  formChanged,
   form,
   filterId,
   filterType,
   filterToEdit,
+  customizationToEdit,
   formFilter,
   removed,
 }: ControlItemsProps) {
@@ -72,11 +86,11 @@ export default function getControlItemsMap({
     getControlItems(controlPanelRegistry.get(filterType)) ?? [];
   const mapControlItems: Record<
     string,
-    { element: React.ReactNode; checked: boolean }
+    { element: ReactNode; checked: boolean }
   > = {};
   const mapMainControlItems: Record<
     string,
-    { element: React.ReactNode; checked: boolean }
+    { element: ReactNode; checked: boolean }
   > = {};
 
   controlItems
@@ -87,8 +101,11 @@ export default function getControlItemsMap({
     .forEach(mainControlItem => {
       const initialValue =
         filterToEdit?.controlValues?.[mainControlItem.name] ??
+        customizationToEdit?.controlValues?.[mainControlItem.name] ??
         mainControlItem?.config?.default;
-      const initColumn = filterToEdit?.targets[0]?.column?.name;
+      const initColumn =
+        customizationToEdit?.targets?.[0]?.column?.name ??
+        filterToEdit?.targets?.[0]?.column?.name;
 
       const element = (
         <>
@@ -101,12 +118,15 @@ export default function getControlItemsMap({
             }
           />
           <StyledFormItem
+            expanded={expanded}
             // don't show the column select unless we have a dataset
             name={['filters', filterId, 'column']}
             initialValue={initColumn}
             label={
               <StyledLabel>
-                {t(`${mainControlItem.config?.label}`) || t('Column')}
+                {typeof mainControlItem.config?.label === 'function'
+                  ? (mainControlItem.config.label as Function)()
+                  : mainControlItem.config?.label || t('Column')}
               </StyledLabel>
             }
             rules={[
@@ -122,15 +142,21 @@ export default function getControlItemsMap({
               form={form}
               filterId={filterId}
               datasetId={datasetId}
+              datasourceType={datasourceType}
               filterValues={column =>
-                doesColumnMatchFilterType(formFilter?.filterType || '', column)
+                doesColumnMatchFilterType(
+                  formFilter?.filterType || '',
+                  column,
+                  datasourceType,
+                ) && !!column?.filterable
               }
               onChange={() => {
-                // We need reset default value when when column changed
+                // We need reset default value when column changed
                 setNativeFilterFieldValues(form, filterId, {
                   defaultDataMask: null,
                 });
                 forceUpdate();
+                formChanged();
               }}
             />
           </StyledFormItem>
@@ -145,11 +171,15 @@ export default function getControlItemsMap({
     .filter(
       (controlItem: CustomControlItem) =>
         controlItem?.config?.renderTrigger &&
-        controlItem.name !== 'sortAscending',
+        controlItem.name !== 'sortAscending' &&
+        controlItem.name !== 'enableSingleValue' &&
+        controlItem.name !== 'operatorType' &&
+        controlItem.name !== 'displayFormat',
     )
     .forEach(controlItem => {
       const initialValue =
         filterToEdit?.controlValues?.[controlItem.name] ??
+        customizationToEdit?.controlValues?.[controlItem.name] ??
         controlItem?.config?.default;
       const element = (
         <>
@@ -169,42 +199,57 @@ export default function getControlItemsMap({
               t('Populate "Default value" to enable this control')
             }
           >
-            <StyledRowFormItem
-              key={controlItem.name}
-              name={['filters', filterId, 'controlValues', controlItem.name]}
-              initialValue={initialValue}
-              valuePropName="checked"
-              colon={false}
-            >
-              <Checkbox
-                disabled={controlItem.config.affectsDataMask && disabled}
-                onChange={({ target: { checked } }) => {
-                  if (controlItem.config.requiredFirst) {
-                    setNativeFilterFieldValues(form, filterId, {
-                      requiredFirst: {
-                        ...formFilter?.requiredFirst,
-                        [controlItem.name]: checked,
-                      },
-                    });
-                  }
-                  if (controlItem.config.resetConfig) {
-                    setNativeFilterFieldValues(form, filterId, {
-                      defaultDataMask: null,
-                    });
-                  }
-                  forceUpdate();
-                }}
+            {/* Wrap in span so antd Tooltip can attach a ref without
+                relying on findDOMNode (deprecated in React 18+). */}
+            <span>
+              <StyledRowFormItem
+                expanded={expanded}
+                key={controlItem.name}
+                name={['filters', filterId, 'controlValues', controlItem.name]}
+                initialValue={initialValue}
+                valuePropName="checked"
+                colon={false}
               >
-                {controlItem.config.label}&nbsp;
-                {controlItem.config.description && (
-                  <InfoTooltipWithTrigger
-                    placement="top"
-                    label={controlItem.config.name}
-                    tooltip={controlItem.config.description}
-                  />
-                )}
-              </Checkbox>
-            </StyledRowFormItem>
+                <Checkbox
+                  disabled={controlItem.config.affectsDataMask && disabled}
+                  onChange={checked => {
+                    if (controlItem.config.requiredFirst) {
+                      setNativeFilterFieldValues(form, filterId, {
+                        requiredFirst: {
+                          ...formFilter?.requiredFirst,
+                          [controlItem.name]: checked,
+                        },
+                      });
+                    }
+                    if (controlItem.config.resetConfig) {
+                      setNativeFilterFieldValues(form, filterId, {
+                        defaultDataMask: null,
+                      });
+                    }
+                    formChanged();
+                    forceUpdate();
+                  }}
+                >
+                  <>
+                    {typeof controlItem.config.label === 'function'
+                      ? (controlItem.config.label as Function)()
+                      : controlItem.config.label}
+                    &nbsp;
+                    {controlItem.config.description && (
+                      <InfoTooltip
+                        placement="top"
+                        tooltip={
+                          typeof controlItem.config.description === 'function'
+                            ? (controlItem.config.description as Function)()
+                            : (controlItem.config
+                                .description as React.ReactNode)
+                        }
+                      />
+                    )}
+                  </>
+                </Checkbox>
+              </StyledRowFormItem>
+            </span>
           </Tooltip>
         </>
       );

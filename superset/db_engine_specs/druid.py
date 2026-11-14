@@ -14,21 +14,30 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-import json
+
+from __future__ import annotations
+
 import logging
 from datetime import datetime
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
+
+from sqlalchemy import types
 
 from superset import is_feature_enabled
-from superset.db_engine_specs.base import BaseEngineSpec
+from superset.constants import TimeGrain
+from superset.db_engine_specs.base import BaseEngineSpec, DatabaseCategory
+from superset.db_engine_specs.exceptions import SupersetDBAPIConnectionError
 from superset.exceptions import SupersetException
-from superset.utils import core as utils
+from superset.utils import core as utils, json
+from superset.utils.core import QuerySource
 
 if TYPE_CHECKING:
     from superset.connectors.sqla.models import TableColumn
     from superset.models.core import Database
 
 logger = logging.getLogger()
+
+_DRUID_FLOAT_SPECIAL = frozenset({"NaN", "Infinity", "-Infinity"})
 
 
 class DruidEngineSpec(BaseEngineSpec):
@@ -39,44 +48,129 @@ class DruidEngineSpec(BaseEngineSpec):
     allows_joins = is_feature_enabled("DRUID_JOINS")
     allows_subqueries = True
 
+    # pydruid builds cursor.description from the first returned row, so a
+    # WHERE FALSE query (zero rows) leaves description as None.
+    type_probe_needs_row = True
+    requires_column_value_normalization = True
+
+    encrypted_extra_sensitive_fields = {
+        "$.connect_args.jwt": "JWT Token",
+        "$.connect_args.password": "Password",
+    }
+
+    metadata = {
+        "description": (
+            "Apache Druid is a high performance real-time analytics database."
+        ),
+        "logo": "druid.png",
+        "homepage_url": "https://druid.apache.org/",
+        "categories": [
+            DatabaseCategory.APACHE_PROJECTS,
+            DatabaseCategory.TIME_SERIES,
+            DatabaseCategory.OPEN_SOURCE,
+        ],
+        "pypi_packages": ["pydruid"],
+        "connection_string": (
+            "druid://{username}:{password}@{host}:{port}/druid/v2/sql"
+        ),
+        "default_port": 9088,
+        "parameters": {
+            "username": "Database username",
+            "password": "Database password",
+            "host": "IP address or URL of the host",
+            "port": "Default 9088",
+        },
+        "ssl_configuration": {
+            "custom_certificate": (
+                "Add certificate in Root Certificate field. "
+                "pydruid will automatically use https."
+            ),
+            "disable_ssl_verification": {
+                "engine_params": {
+                    "connect_args": {"scheme": "https", "ssl_verify_cert": False}
+                }
+            },
+        },
+        "advanced_features": {
+            "aggregations": (
+                "Define common aggregations in datasource edit view "
+                "under List Druid Column tab."
+            ),
+            "post_aggregations": (
+                "Create metrics with postagg as Metric Type and provide "
+                "valid JSON post-aggregation definition."
+            ),
+        },
+        "notes": (
+            "A native Druid connector ships with Superset "
+            "(behind DRUID_IS_ACTIVE flag) but SQLAlchemy connector "
+            "via pydruid is preferred."
+        ),
+        "compatible_databases": [
+            {
+                "name": "Imply",
+                "description": (
+                    "Imply is a fully-managed cloud platform and enterprise "
+                    "distribution built on Apache Druid. It provides real-time "
+                    "analytics with enterprise security and support."
+                ),
+                "logo": "imply.png",
+                "homepage_url": "https://imply.io/",
+                "categories": [
+                    DatabaseCategory.TIME_SERIES,
+                    DatabaseCategory.CLOUD_DATA_WAREHOUSES,
+                    DatabaseCategory.HOSTED_OPEN_SOURCE,
+                ],
+                "pypi_packages": ["pydruid"],
+                "connection_string": (
+                    "druid://{username}:{password}@{host}/druid/v2/sql"
+                ),
+                "docs_url": "https://docs.imply.io/",
+            },
+        ],
+    }
+
     _time_grain_expressions = {
         None: "{col}",
-        "PT1S": "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'PT1S')",
-        "PT5S": "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'PT5S')",
-        "PT30S": "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'PT30S')",
-        "PT1M": "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'PT1M')",
-        "PT5M": "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'PT5M')",
-        "PT10M": "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'PT10M')",
-        "PT15M": "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'PT15M')",
-        "PT30M": "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'PT30M')",
-        "PT1H": "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'PT1H')",
-        "PT6H": "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'PT6H')",
-        "P1D": "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'P1D')",
-        "P1W": "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'P1W')",
-        "P1M": "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'P1M')",
-        "P3M": "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'P3M')",
-        "P1Y": "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'P1Y')",
-        "P1W/1970-01-03T00:00:00Z": (
+        TimeGrain.SECOND: "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'PT1S')",
+        TimeGrain.FIVE_SECONDS: "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'PT5S')",
+        TimeGrain.THIRTY_SECONDS: "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'PT30S')",
+        TimeGrain.MINUTE: "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'PT1M')",
+        TimeGrain.FIVE_MINUTES: "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'PT5M')",
+        TimeGrain.TEN_MINUTES: "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'PT10M')",
+        TimeGrain.FIFTEEN_MINUTES: "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'PT15M')",
+        TimeGrain.THIRTY_MINUTES: "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'PT30M')",
+        TimeGrain.HOUR: "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'PT1H')",
+        TimeGrain.SIX_HOURS: "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'PT6H')",
+        TimeGrain.DAY: "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'P1D')",
+        TimeGrain.WEEK: "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'P1W')",
+        TimeGrain.MONTH: "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'P1M')",
+        TimeGrain.QUARTER: "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'P3M')",
+        TimeGrain.YEAR: "TIME_FLOOR(CAST({col} AS TIMESTAMP), 'P1Y')",
+        TimeGrain.WEEK_ENDING_SATURDAY: (
             "TIME_SHIFT(TIME_FLOOR(TIME_SHIFT(CAST({col} AS TIMESTAMP), "
             "'P1D', 1), 'P1W'), 'P1D', 5)"
         ),
-        "1969-12-28T00:00:00Z/P1W": (
+        TimeGrain.WEEK_STARTING_SUNDAY: (
             "TIME_SHIFT(TIME_FLOOR(TIME_SHIFT(CAST({col} AS TIMESTAMP), "
             "'P1D', 1), 'P1W'), 'P1D', -1)"
         ),
     }
 
     @classmethod
-    def alter_new_orm_column(cls, orm_col: "TableColumn") -> None:
+    def alter_new_orm_column(cls, orm_col: TableColumn) -> None:
         if orm_col.column_name == "__time":
             orm_col.is_dttm = True
 
     @staticmethod
-    def get_extra_params(database: "Database") -> Dict[str, Any]:
+    def get_extra_params(
+        database: Database, source: QuerySource | None = None
+    ) -> dict[str, Any]:
         """
         For Druid, the path to a SSL certificate is placed in `connect_args`.
 
         :param database: database instance from which to extract extras
+        :param source: in which context is the connection needed
         :raises CertificateException: If certificate is not valid/unparseable
         :raises SupersetException: If database extra json payload is unparseable
         """
@@ -96,11 +190,14 @@ class DruidEngineSpec(BaseEngineSpec):
         return extra
 
     @classmethod
-    def convert_dttm(cls, target_type: str, dttm: datetime) -> Optional[str]:
-        tt = target_type.upper()
-        if tt == utils.TemporalType.DATE:
+    def convert_dttm(
+        cls, target_type: str, dttm: datetime, db_extra: dict[str, Any] | None = None
+    ) -> str | None:
+        sqla_type = cls.get_sqla_column_type(target_type)
+
+        if isinstance(sqla_type, types.Date):
             return f"CAST(TIME_PARSE('{dttm.date().isoformat()}') AS DATE)"
-        if tt in (utils.TemporalType.DATETIME, utils.TemporalType.TIMESTAMP):
+        if isinstance(sqla_type, (types.DateTime, types.TIMESTAMP)):
             return f"""TIME_PARSE('{dttm.isoformat(timespec="seconds")}')"""
         return None
 
@@ -117,3 +214,35 @@ class DruidEngineSpec(BaseEngineSpec):
         Convert from number of milliseconds since the epoch to a timestamp.
         """
         return "MILLIS_TO_TIMESTAMP({col})"
+
+    @classmethod
+    def get_dbapi_exception_mapping(cls) -> dict[type[Exception], type[Exception]]:
+        # pylint: disable=import-outside-toplevel
+        from requests import exceptions as requests_exceptions
+
+        return {
+            requests_exceptions.ConnectionError: SupersetDBAPIConnectionError,
+        }
+
+    @classmethod
+    def normalize_column_values(cls, col_values: list[Any]) -> list[Any]:
+        # pydruid emits NaN, Infinity, and -Infinity as JSON strings because
+        # the JSON spec does not support those values.  Replace them with None
+        # so PyArrow can keep the column numeric after the initial conversion
+        # attempt fails.
+        return [
+            None if isinstance(v, str) and v in _DRUID_FLOAT_SPECIAL else v
+            for v in col_values
+        ]
+
+    @classmethod
+    def resolve_column_type(
+        cls, cursor_type: str | None, pa_mapped: str | None
+    ) -> str | None:
+        # pydruid infers column types from the first row value.  A None or
+        # special-float-string first value causes the column to be labelled
+        # STRING even when the actual data is numeric.  When PyArrow infers a
+        # more specific type, prefer it over the cursor-description STRING.
+        if cursor_type == "STRING" and pa_mapped is not None and pa_mapped != "STRING":
+            return pa_mapped
+        return cursor_type or pa_mapped

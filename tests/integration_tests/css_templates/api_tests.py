@@ -16,35 +16,41 @@
 # under the License.
 # isort:skip_file
 """Unit tests for Superset"""
-import json
+
 import pytest
-import prison
+import rison
+from datetime import datetime
+from freezegun import freeze_time
 from sqlalchemy.sql import func
 
-import tests.integration_tests.test_app
+import tests.integration_tests.test_app  # noqa: F401
 from superset import db
 from superset.models.core import CssTemplate
-from superset.utils.core import get_example_database
+from superset.utils.database import get_example_database  # noqa: F401
+from superset.utils import json
 
 from tests.integration_tests.base_tests import SupersetTestCase
-
+from tests.integration_tests.constants import ADMIN_USERNAME
 
 CSS_TEMPLATES_FIXTURE_COUNT = 5
 
 
 class TestCssTemplateApi(SupersetTestCase):
     def insert_css_template(
-        self, template_name: str, css: str, created_by_username: str = "admin",
+        self,
+        template_name: str,
+        css: str,
+        created_by_username: str = "admin",
     ) -> CssTemplate:
         admin = self.get_user(created_by_username)
         css_template = CssTemplate(
-            template_name=template_name, css=css, created_by=admin
+            template_name=template_name, css=css, created_by=admin, changed_by=admin
         )
         db.session.add(css_template)
         db.session.commit()
         return css_template
 
-    @pytest.fixture()
+    @pytest.fixture
     def create_css_templates(self):
         with self.create_app().app_context():
             css_templates = []
@@ -68,22 +74,30 @@ class TestCssTemplateApi(SupersetTestCase):
         """
         css_templates = db.session.query(CssTemplate).all()
 
-        self.login(username="admin")
-        uri = f"api/v1/css_template/"
+        self.login(ADMIN_USERNAME)
+        uri = "api/v1/css_template/"  # noqa: F541
         rv = self.get_assert_metric(uri, "get_list")
         assert rv.status_code == 200
         data = json.loads(rv.data.decode("utf-8"))
         assert data["count"] == len(css_templates)
         expected_columns = [
-            "changed_on_delta_humanized",
             "changed_by",
-            "created_on",
+            "changed_on_delta_humanized",
             "created_by",
-            "template_name",
+            "created_on",
             "css",
+            "id",
+            "template_name",
         ]
-        for expected_column in expected_columns:
-            assert expected_column in data["result"][0]
+        result_columns = list(data["result"][0].keys())
+        result_columns.sort()
+        assert expected_columns == result_columns
+        created_by_columns = list(data["result"][0]["created_by"].keys())
+        created_by_columns.sort()
+        assert ["first_name", "id", "last_name"] == created_by_columns
+        changed_by_columns = list(data["result"][0]["changed_by"].keys())
+        changed_by_columns.sort()
+        assert ["first_name", "id", "last_name"] == changed_by_columns
 
     @pytest.mark.usefixtures("create_css_templates")
     def test_get_list_sort_css_template(self):
@@ -95,9 +109,9 @@ class TestCssTemplateApi(SupersetTestCase):
             .order_by(CssTemplate.template_name.asc())
             .all()
         )
-        self.login(username="admin")
+        self.login(ADMIN_USERNAME)
         query_string = {"order_column": "template_name", "order_direction": "asc"}
-        uri = f"api/v1/css_template/?q={prison.dumps(query_string)}"
+        uri = f"api/v1/css_template/?q={rison.dumps(query_string)}"
         rv = self.get_assert_metric(uri, "get_list")
         assert rv.status_code == 200
         data = json.loads(rv.data.decode("utf-8"))
@@ -110,7 +124,7 @@ class TestCssTemplateApi(SupersetTestCase):
         """
         CSS Template API: Test get list and custom filter
         """
-        self.login(username="admin")
+        self.login(ADMIN_USERNAME)
 
         all_css_templates = (
             db.session.query(CssTemplate).filter(CssTemplate.css.ilike("%css2%")).all()
@@ -124,7 +138,7 @@ class TestCssTemplateApi(SupersetTestCase):
                 }
             ],
         }
-        uri = f"api/v1/css_template/?q={prison.dumps(query_string)}"
+        uri = f"api/v1/css_template/?q={rison.dumps(query_string)}"
         rv = self.get_assert_metric(uri, "get_list")
         assert rv.status_code == 200
         data = json.loads(rv.data.decode("utf-8"))
@@ -144,7 +158,7 @@ class TestCssTemplateApi(SupersetTestCase):
                 }
             ],
         }
-        uri = f"api/v1/css_template/?q={prison.dumps(query_string)}"
+        uri = f"api/v1/css_template/?q={rison.dumps(query_string)}"
         rv = self.get_assert_metric(uri, "get_list")
         assert rv.status_code == 200
         data = json.loads(rv.data.decode("utf-8"))
@@ -154,8 +168,8 @@ class TestCssTemplateApi(SupersetTestCase):
         """
         CssTemplate API: Test info
         """
-        self.login(username="admin")
-        uri = f"api/v1/css_template/_info"
+        self.login(ADMIN_USERNAME)
+        uri = "api/v1/css_template/_info"  # noqa: F541
         rv = self.get_assert_metric(uri, "info")
         assert rv.status_code == 200
 
@@ -163,9 +177,9 @@ class TestCssTemplateApi(SupersetTestCase):
         """
         CssTemplate API: Test info security
         """
-        self.login(username="admin")
+        self.login(ADMIN_USERNAME)
         params = {"keys": ["permissions"]}
-        uri = f"api/v1/css_template/_info?q={prison.dumps(params)}"
+        uri = f"api/v1/css_template/_info?q={rison.dumps(params)}"
         rv = self.get_assert_metric(uri, "info")
         data = json.loads(rv.data.decode("utf-8"))
         assert rv.status_code == 200
@@ -178,20 +192,27 @@ class TestCssTemplateApi(SupersetTestCase):
         """
         CSS Template API: Test get CSS Template
         """
-        css_template = (
-            db.session.query(CssTemplate)
-            .filter(CssTemplate.template_name == "template_name1")
-            .one_or_none()
-        )
-        self.login(username="admin")
-        uri = f"api/v1/css_template/{css_template.id}"
-        rv = self.get_assert_metric(uri, "get")
+        with freeze_time(datetime.now()):
+            css_template = (
+                db.session.query(CssTemplate)
+                .filter(CssTemplate.template_name == "template_name1")
+                .one_or_none()
+            )
+            self.login(ADMIN_USERNAME)
+            uri = f"api/v1/css_template/{css_template.id}"
+            rv = self.get_assert_metric(uri, "get")
         assert rv.status_code == 200
 
         expected_result = {
             "id": css_template.id,
             "template_name": "template_name1",
             "css": "css1",
+            "changed_by": {
+                "first_name": css_template.created_by.first_name,
+                "id": css_template.created_by.id,
+                "last_name": css_template.created_by.last_name,
+            },
+            "changed_on_delta_humanized": "now",
             "created_by": {
                 "first_name": css_template.created_by.first_name,
                 "id": css_template.created_by.id,
@@ -208,7 +229,7 @@ class TestCssTemplateApi(SupersetTestCase):
         CSS Template API: Test get CSS Template not found
         """
         max_id = db.session.query(func.max(CssTemplate.id)).scalar()
-        self.login(username="admin")
+        self.login(ADMIN_USERNAME)
         uri = f"api/v1/css_template/{max_id + 1}"
         rv = self.get_assert_metric(uri, "get")
         assert rv.status_code == 404
@@ -222,8 +243,8 @@ class TestCssTemplateApi(SupersetTestCase):
             "css": "css_create",
         }
 
-        self.login(username="admin")
-        uri = f"api/v1/css_template/"
+        self.login(ADMIN_USERNAME)
+        uri = "api/v1/css_template/"  # noqa: F541
         rv = self.post_assert_metric(uri, post_data, "post")
         data = json.loads(rv.data.decode("utf-8"))
         assert rv.status_code == 201
@@ -253,7 +274,7 @@ class TestCssTemplateApi(SupersetTestCase):
             "css": "css_changed",
         }
 
-        self.login(username="admin")
+        self.login(ADMIN_USERNAME)
         uri = f"api/v1/css_template/{css_template.id}"
         rv = self.put_assert_metric(uri, put_data, "put")
         assert rv.status_code == 200
@@ -268,7 +289,7 @@ class TestCssTemplateApi(SupersetTestCase):
         CSS Template API: Test update not found
         """
         max_id = db.session.query(func.max(CssTemplate.id)).scalar()
-        self.login(username="admin")
+        self.login(ADMIN_USERNAME)
 
         put_data = {
             "template_name": "template_name_changed",
@@ -290,7 +311,7 @@ class TestCssTemplateApi(SupersetTestCase):
             .one_or_none()
         )
 
-        self.login(username="admin")
+        self.login(ADMIN_USERNAME)
         uri = f"api/v1/css_template/{css_template.id}"
         rv = self.delete_assert_metric(uri, "delete")
         assert rv.status_code == 200
@@ -304,7 +325,7 @@ class TestCssTemplateApi(SupersetTestCase):
         CSS Template API: Test delete not found
         """
         max_id = db.session.query(func.max(CssTemplate.id)).scalar()
-        self.login(username="admin")
+        self.login(ADMIN_USERNAME)
         uri = f"api/v1/css_template/{max_id + 1}"
         rv = self.delete_assert_metric(uri, "delete")
         assert rv.status_code == 404
@@ -317,8 +338,8 @@ class TestCssTemplateApi(SupersetTestCase):
         css_templates = db.session.query(CssTemplate).all()
         css_template_ids = [css_template.id for css_template in css_templates]
 
-        self.login(username="admin")
-        uri = f"api/v1/css_template/?q={prison.dumps(css_template_ids)}"
+        self.login(ADMIN_USERNAME)
+        uri = f"api/v1/css_template/?q={rison.dumps(css_template_ids)}"
         rv = self.delete_assert_metric(uri, "bulk_delete")
         assert rv.status_code == 200
         response = json.loads(rv.data.decode("utf-8"))
@@ -337,8 +358,8 @@ class TestCssTemplateApi(SupersetTestCase):
         css_template = db.session.query(CssTemplate).first()
         css_template_ids = [css_template.id]
 
-        self.login(username="admin")
-        uri = f"api/v1/css_template/?q={prison.dumps(css_template_ids)}"
+        self.login(ADMIN_USERNAME)
+        uri = f"api/v1/css_template/?q={rison.dumps(css_template_ids)}"
         rv = self.delete_assert_metric(uri, "bulk_delete")
         assert rv.status_code == 200
         response = json.loads(rv.data.decode("utf-8"))
@@ -352,8 +373,8 @@ class TestCssTemplateApi(SupersetTestCase):
         CSS Template API: Test delete bulk bad request
         """
         css_template_ids = [1, "a"]
-        self.login(username="admin")
-        uri = f"api/v1/css_template/?q={prison.dumps(css_template_ids)}"
+        self.login(ADMIN_USERNAME)
+        uri = f"api/v1/css_template/?q={rison.dumps(css_template_ids)}"
         rv = self.delete_assert_metric(uri, "bulk_delete")
         assert rv.status_code == 400
 
@@ -365,7 +386,7 @@ class TestCssTemplateApi(SupersetTestCase):
         max_id = db.session.query(func.max(CssTemplate.id)).scalar()
 
         css_template_ids = [max_id + 1, max_id + 2]
-        self.login(username="admin")
-        uri = f"api/v1/css_template/?q={prison.dumps(css_template_ids)}"
+        self.login(ADMIN_USERNAME)
+        uri = f"api/v1/css_template/?q={rison.dumps(css_template_ids)}"
         rv = self.delete_assert_metric(uri, "bulk_delete")
         assert rv.status_code == 404

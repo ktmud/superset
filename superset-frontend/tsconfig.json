@@ -1,53 +1,111 @@
 {
   "compilerOptions": {
-    "allowJs": true,
-    "allowSyntheticDefaultImports": true,
-    "baseUrl": ".",
-    "esModuleInterop": false,
-    "forceConsistentCasingInFileNames": true,
-    "importHelpers": false,
-    "jsx": "preserve",
-    "lib": ["dom", "dom.iterable", "esnext"],
-    "module": "esnext",
-    "moduleResolution": "node",
+    /* Type Checking */
     "noImplicitAny": true,
     "noImplicitReturns": true,
     "noImplicitThis": true,
     "noUnusedLocals": true,
-    "outDir": "./dist",
-    "pretty": true,
-    "paths": {
-      "@superset-ui/core": [
-        "./node_modules/@superset-ui/core/src",
-        "./node_modules/@superset-ui/core"
-      ],
-      "@superset-ui/chart-controls": [
-        "./node_modules/@superset-ui/chart-controls/src",
-        "./node_modules/@superset-ui/chart-controls"
-      ],
-      // for supressing errors caused by incompatible @types/react when `npm link`
-      // Ref: https://github.com/Microsoft/typescript/issues/6496#issuecomment-384786222
-      "react": ["./node_modules/@types/react", "react"]
-    },
-    "skipLibCheck": true,
-    "sourceMap": true,
     "strictNullChecks": true,
-    "suppressImplicitAnyIndexErrors": true,
-    "target": "esnext",
-    "types": [
-      "@emotion/react/types/css-prop",
-      "jest",
-      "@testing-library/jest-dom"
-    ]
+    "module": "esnext",
+    "moduleResolution": "bundler",
+
+    /* Keep strict mode disabled to keep pre-TS6 status quo */
+    "strict": false,
+
+    "types": ["jest", "node"],
+    "typeRoots": ["src/types", "node_modules/@types"],
+
+    /* Emit */
+    "declaration": true,
+    "declarationMap": true,
+    "importHelpers": false,
+    "noEmitOnError": true,
+    "outDir": "./dist",
+    "rootDir": ".",
+    "declarationDir": "lib",
+    "sourceMap": true,
+
+    /* JavaScript Support */
+    "allowJs": true,
+
+    /* Interop Constraints */
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "forceConsistentCasingInFileNames": true,
+
+    /* Language and Environment */
+    "target": "es2020",
+    "jsx": "react-jsx",
+    "jsxImportSource": "@emotion/react",
+    "lib": ["dom", "dom.iterable", "esnext"],
+
+    /* Projects */
+    "composite": true,
+
+    /* Completeness */
+    "skipLibCheck": true,
+    "paths": {
+      "@storybook-shared": ["./.storybook/shared"],
+      "@superset-ui/core": ["./packages/superset-ui-core/src"],
+      "@superset-ui/core/*": ["./packages/superset-ui-core/src/*"],
+      "@superset-ui/chart-controls": [
+        "./packages/superset-ui-chart-controls/src"
+      ],
+      "@superset-ui/chart-controls/*": [
+        "./packages/superset-ui-chart-controls/src/*"
+      ],
+      "@superset-ui/switchboard": ["./packages/superset-ui-switchboard/src"],
+      "@apache-superset/core": ["./packages/superset-core/src"],
+      "@apache-superset/core/*": ["./packages/superset-core/src/*"],
+      "@superset-ui/plugin-chart-*": ["./plugins/plugin-chart-*/src"],
+      "@superset-ui/preset-chart-*": ["./plugins/preset-chart-*/src"],
+      "echarts/types/src/*": ["./node_modules/echarts/types/src/*"],
+      "*": ["./*"]
+    }
   },
   "include": [
     "./src/**/*",
+    "./custom-lint-rules/**/*",
     "./spec/**/*",
-    // include the source code of each plugin
-    "./node_modules/*superset-ui*/**/src/**/*",
-    "./node_modules/*superset-ui*/**/types/**/*",
-    // and the type defs of their dependencies
-    "./node_modules/*superset-ui*/**/node_modules/**/*.d.ts"
+    "./plugins/**/*",
+    "./packages/**/*",
+    "./scripts/**/*",
+    "./.storybook/**/*",
+    "./webpack.config.js",
+    "./webpack*.js",
+    "./package.json"
   ],
-  "exclude": ["./node_modules/*superset-ui*/**/node_modules/@superset-ui/**/*"]
+  "references": [
+    { "path": "./packages/superset-core" },
+    { "path": "./packages/superset-ui-core" },
+    { "path": "./packages/superset-ui-chart-controls" },
+    { "path": "./packages/superset-ui-switchboard" },
+    { "path": "./plugins/plugin-chart-calendar" },
+    { "path": "./plugins/plugin-chart-chord" },
+    { "path": "./plugins/plugin-chart-country-map" },
+    { "path": "./plugins/plugin-chart-horizon" },
+    { "path": "./plugins/plugin-chart-paired-t-test" },
+    { "path": "./plugins/plugin-chart-parallel-coordinates" },
+    { "path": "./plugins/plugin-chart-partition" },
+    { "path": "./plugins/plugin-chart-world-map" },
+    { "path": "./plugins/plugin-chart-ag-grid-table" },
+    { "path": "./plugins/plugin-chart-cartodiagram" },
+    { "path": "./plugins/preset-chart-deckgl" },
+    { "path": "./plugins/plugin-chart-echarts" },
+    { "path": "./plugins/plugin-chart-point-cluster-map" },
+    { "path": "./plugins/plugin-chart-handlebars" },
+    { "path": "./plugins/plugin-chart-pivot-table" },
+    { "path": "./plugins/plugin-chart-table" },
+    { "path": "./plugins/plugin-chart-word-cloud" }
+  ],
+
+  // Explicitly exclude typechecking for node_modules and built artifacts in plugins/packages
+  "exclude": [
+    "node_modules",
+    "packages/**/lib/**/*",
+    "packages/**/esm/**/*",
+    "plugins/**/lib/**/*",
+    "plugins/**/esm/**/*"
+  ]
 }

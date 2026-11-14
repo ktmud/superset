@@ -14,40 +14,59 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-import itertools
-import json
-from unittest.mock import MagicMock, patch
+from copy import deepcopy
+from unittest.mock import MagicMock, patch  # noqa: F401
+from uuid import UUID, uuid4
 
 import pytest
 import yaml
 from werkzeug.utils import secure_filename
 
 from superset import db, security_manager
-from superset.commands.exceptions import CommandInvalidError
-from superset.commands.importers.exceptions import IncorrectVersionError
-from superset.connectors.sqla.models import SqlaTable
-from superset.dashboards.commands.exceptions import DashboardNotFoundError
-from superset.dashboards.commands.export import (
+from superset.commands.dashboard.copy import CopyDashboardCommand
+from superset.commands.dashboard.delete import DeleteEmbeddedDashboardCommand
+from superset.commands.dashboard.exceptions import (
+    DashboardAccessDeniedError,
+    DashboardInvalidError,
+    DashboardNotFoundError,
+)
+from superset.commands.dashboard.export import (
     append_charts,
     ExportDashboardsCommand,
     get_default_position,
 )
-from superset.dashboards.commands.importers import v0, v1
+from superset.commands.dashboard.fave import AddFavoriteDashboardCommand
+from superset.commands.dashboard.importers import v0, v1
+from superset.commands.dashboard.unfave import DelFavoriteDashboardCommand
+from superset.commands.dataset.importers.v1 import ImportDatasetsCommand
+from superset.commands.exceptions import CommandInvalidError
+from superset.commands.importers.exceptions import IncorrectVersionError
+from superset.connectors.sqla.models import SqlaTable
+from superset.daos.dashboard import DashboardDAO
+from superset.models.annotations import Annotation, AnnotationLayer
 from superset.models.core import Database
 from superset.models.dashboard import Dashboard
+from superset.models.embedded_dashboard import EmbeddedDashboard
 from superset.models.slice import Slice
-from tests.integration_tests.base_tests import SupersetTestCase
+from superset.utils import json
+from superset.utils.core import override_user
+from tests.integration_tests.base_tests import SupersetTestCase, user_is_editor
 from tests.integration_tests.fixtures.importexport import (
     chart_config,
+    dashboard_annotation_layer_config,
+    dashboard_chart_config,
     dashboard_config,
+    dashboard_config_for_charts,
     dashboard_export,
+    dashboard_import_bundle,
     dashboard_metadata_config,
     database_config,
     dataset_config,
     dataset_metadata_config,
 )
 from tests.integration_tests.fixtures.world_bank_dashboard import (
-    load_world_bank_dashboard_with_slices,
+    load_world_bank_dashboard_with_slices,  # noqa: F401
+    load_world_bank_data,  # noqa: F401
 )
 
 
@@ -67,16 +86,22 @@ class TestExportDashboardsCommand(SupersetTestCase):
 
         expected_paths = {
             "metadata.yaml",
-            "dashboards/World_Banks_Data.yaml",
-            "datasets/examples/wb_health_population.yaml",
+            f"dashboards/World_Banks_Data_{example_dashboard.id}.yaml",
             "databases/examples.yaml",
+            "tags.yaml",
         }
         for chart in example_dashboard.slices:
             chart_slug = secure_filename(chart.slice_name)
             expected_paths.add(f"charts/{chart_slug}_{chart.id}.yaml")
+            dataset_slug = secure_filename(chart.table.table_name)
+            expected_paths.add(
+                f"datasets/examples/{dataset_slug}_{chart.table.id}.yaml"
+            )
         assert expected_paths == set(contents.keys())
 
-        metadata = yaml.safe_load(contents["dashboards/World_Banks_Data.yaml"])
+        metadata = yaml.safe_load(
+            contents[f"dashboards/World_Banks_Data_{example_dashboard.id}.yaml"]()
+        )
 
         # remove chart UUIDs from metadata so we can compare
         for chart_info in metadata["position"].values():
@@ -89,19 +114,16 @@ class TestExportDashboardsCommand(SupersetTestCase):
             "description": None,
             "css": None,
             "slug": "world_health",
+            "certified_by": None,
+            "certification_details": None,
+            "published": False,
             "uuid": str(example_dashboard.uuid),
             "position": {
-                "CHART-36bfc934": {
-                    "children": [],
-                    "id": "CHART-36bfc934",
-                    "meta": {"height": 25, "sliceName": "Region Filter", "width": 2},
-                    "type": "CHART",
-                },
                 "CHART-37982887": {
                     "children": [],
                     "id": "CHART-37982887",
                     "meta": {
-                        "height": 25,
+                        "height": 52,
                         "sliceName": "World's Population",
                         "width": 2,
                     },
@@ -167,12 +189,6 @@ class TestExportDashboardsCommand(SupersetTestCase):
                     "meta": {"height": 50, "sliceName": "Treemap", "width": 8},
                     "type": "CHART",
                 },
-                "CHART-3nc0d8sk": {
-                    "children": [],
-                    "id": "CHART-3nc0d8sk",
-                    "meta": {"height": 50, "sliceName": "Treemap", "width": 8},
-                    "type": "CHART",
-                },
                 "COLUMN-071bbbad": {
                     "children": ["ROW-1e064e3c", "ROW-afdefba9"],
                     "id": "COLUMN-071bbbad",
@@ -180,7 +196,7 @@ class TestExportDashboardsCommand(SupersetTestCase):
                     "type": "COLUMN",
                 },
                 "COLUMN-fe3914b8": {
-                    "children": ["CHART-36bfc934", "CHART-37982887"],
+                    "children": ["CHART-37982887"],
                     "id": "COLUMN-fe3914b8",
                     "meta": {"background": "BACKGROUND_TRANSPARENT", "width": 2},
                     "type": "COLUMN",
@@ -230,7 +246,54 @@ class TestExportDashboardsCommand(SupersetTestCase):
             },
             "metadata": {"mock_key": "mock_value"},
             "version": "1.0.0",
+            "theme_uuid": None,
+            "tags": [],
         }
+
+    # @pytest.mark.usefixtures("load_covid_dashboard")
+    @pytest.mark.skip(reason="missing covid fixture")
+    @patch("superset.security.manager.g")
+    @patch("superset.views.base.g")
+    def test_export_dashboard_command_dataset_references(self, mock_g1, mock_g2):
+        mock_g1.user = security_manager.find_user("admin")
+        mock_g2.user = security_manager.find_user("admin")
+
+        example_dashboard = (
+            db.session.query(Dashboard)
+            .filter_by(uuid="f4065089-110a-41fa-8dd7-9ce98a65e250")
+            .one()
+        )
+        command = ExportDashboardsCommand([example_dashboard.id])
+        contents = dict(command.run())
+
+        expected_paths = {
+            "metadata.yaml",
+            f"dashboards/COVID_Vaccine_Dashboard_{example_dashboard.id}.yaml",
+            "datasets/examples/covid_vaccines.yaml",  # referenced dataset needs to be exported  # noqa: E501
+            "databases/examples.yaml",
+        }
+        for chart in example_dashboard.slices:
+            chart_slug = secure_filename(chart.slice_name)
+            expected_paths.add(f"charts/{chart_slug}_{chart.id}.yaml")
+        assert expected_paths == set(contents.keys())
+
+        metadata = yaml.safe_load(
+            contents[f"dashboards/World_Banks_Data_{example_dashboard.id}.yaml"]()
+        )
+
+        # find the dataset references in native filter and check if they are correct
+        assert "native_filter_configuration" in metadata["metadata"]
+
+        for filter_config in metadata["metadata"][
+            "native_filter_configuration"
+        ].values():
+            assert "targets" in filter_config
+            targets = filter_config["targets"]
+
+            for column in targets:
+                # we need to find the correct datasetUuid (not datasetId)
+                assert "datasetUuid" in column
+                assert column["datasetUuid"] == "974b7a1c-22ea-49cb-9214-97b7dbd511e0"
 
     @pytest.mark.usefixtures("load_world_bank_dashboard_with_slices")
     @patch("superset.security.manager.g")
@@ -245,7 +308,7 @@ class TestExportDashboardsCommand(SupersetTestCase):
         )
         command = ExportDashboardsCommand([example_dashboard.id])
         contents = command.run()
-        with self.assertRaises(DashboardNotFoundError):
+        with self.assertRaises(DashboardNotFoundError):  # noqa: PT027
             next(contents)
 
     @pytest.mark.usefixtures("load_world_bank_dashboard_with_slices")
@@ -257,14 +320,14 @@ class TestExportDashboardsCommand(SupersetTestCase):
         mock_g2.user = security_manager.find_user("admin")
         command = ExportDashboardsCommand([-1])
         contents = command.run()
-        with self.assertRaises(DashboardNotFoundError):
+        with self.assertRaises(DashboardNotFoundError):  # noqa: PT027
             next(contents)
 
     @pytest.mark.usefixtures("load_world_bank_dashboard_with_slices")
     @patch("superset.security.manager.g")
     @patch("superset.views.base.g")
-    def test_export_dashboard_command_key_order(self, mock_g1, mock_g2):
-        """Test that they keys in the YAML have the same order as export_fields"""
+    def test_export_dashboard_command_required_fields(self, mock_g1, mock_g2):
+        """Test that all required keys are present in the exported YAML"""
         mock_g1.user = security_manager.find_user("admin")
         mock_g2.user = security_manager.find_user("admin")
 
@@ -274,33 +337,41 @@ class TestExportDashboardsCommand(SupersetTestCase):
         command = ExportDashboardsCommand([example_dashboard.id])
         contents = dict(command.run())
 
-        metadata = yaml.safe_load(contents["dashboards/World_Banks_Data.yaml"])
-        assert list(metadata.keys()) == [
+        metadata = yaml.safe_load(
+            contents[f"dashboards/World_Banks_Data_{example_dashboard.id}.yaml"]()
+        )
+        assert set(metadata.keys()) == {
             "dashboard_title",
             "description",
             "css",
+            "theme_uuid",
             "slug",
+            "certified_by",
+            "certification_details",
+            "published",
             "uuid",
             "position",
             "metadata",
             "version",
-        ]
+            "tags",
+        }
 
     @pytest.mark.usefixtures("load_world_bank_dashboard_with_slices")
-    @patch("superset.dashboards.commands.export.suffix")
-    def test_append_charts(self, mock_suffix):
-        """Test that oprhaned charts are added to the dashbaord position"""
-        # return deterministic IDs
-        mock_suffix.side_effect = (str(i) for i in itertools.count(1))
-
+    def test_append_charts(self):
+        """Test that orphaned charts are added to the dashboard position"""
+        # IDs are deterministic: charts are keyed by their UUID and rows are
+        # numbered by their position within the grid.
         position = get_default_position("example")
-        chart_1 = db.session.query(Slice).filter_by(slice_name="Region Filter").one()
+        chart_1 = (
+            db.session.query(Slice).filter_by(slice_name="World's Population").one()
+        )
+        chart_1_key = f"CHART-{chart_1.uuid}"
         new_position = append_charts(position, {chart_1})
         assert new_position == {
             "DASHBOARD_VERSION_KEY": "v2",
             "ROOT_ID": {"children": ["GRID_ID"], "id": "ROOT_ID", "type": "ROOT"},
             "GRID_ID": {
-                "children": ["ROW-N-2"],
+                "children": ["ROW-N-0"],
                 "id": "GRID_ID",
                 "parents": ["ROOT_ID"],
                 "type": "GRID",
@@ -310,37 +381,36 @@ class TestExportDashboardsCommand(SupersetTestCase):
                 "meta": {"text": "example"},
                 "type": "HEADER",
             },
-            "ROW-N-2": {
-                "children": ["CHART-1"],
-                "id": "ROW-N-2",
+            "ROW-N-0": {
+                "children": [chart_1_key],
+                "id": "ROW-N-0",
                 "meta": {"0": "ROOT_ID", "background": "BACKGROUND_TRANSPARENT"},
                 "type": "ROW",
                 "parents": ["ROOT_ID", "GRID_ID"],
             },
-            "CHART-1": {
+            chart_1_key: {
                 "children": [],
-                "id": "CHART-1",
+                "id": chart_1_key,
                 "meta": {
                     "chartId": chart_1.id,
                     "height": 50,
-                    "sliceName": "Region Filter",
+                    "sliceName": "World's Population",
                     "uuid": str(chart_1.uuid),
                     "width": 4,
                 },
                 "type": "CHART",
-                "parents": ["ROOT_ID", "GRID_ID", "ROW-N-2"],
+                "parents": ["ROOT_ID", "GRID_ID", "ROW-N-0"],
             },
         }
 
-        chart_2 = (
-            db.session.query(Slice).filter_by(slice_name="World's Population").one()
-        )
+        chart_2 = db.session.query(Slice).filter_by(slice_name="Growth Rate").one()
+        chart_2_key = f"CHART-{chart_2.uuid}"
         new_position = append_charts(new_position, {chart_2})
         assert new_position == {
             "DASHBOARD_VERSION_KEY": "v2",
             "ROOT_ID": {"children": ["GRID_ID"], "id": "ROOT_ID", "type": "ROOT"},
             "GRID_ID": {
-                "children": ["ROW-N-2", "ROW-N-4"],
+                "children": ["ROW-N-0", "ROW-N-1"],
                 "id": "GRID_ID",
                 "parents": ["ROOT_ID"],
                 "type": "GRID",
@@ -350,70 +420,70 @@ class TestExportDashboardsCommand(SupersetTestCase):
                 "meta": {"text": "example"},
                 "type": "HEADER",
             },
-            "ROW-N-2": {
-                "children": ["CHART-1"],
-                "id": "ROW-N-2",
+            "ROW-N-0": {
+                "children": [chart_1_key],
+                "id": "ROW-N-0",
                 "meta": {"0": "ROOT_ID", "background": "BACKGROUND_TRANSPARENT"},
                 "type": "ROW",
                 "parents": ["ROOT_ID", "GRID_ID"],
             },
-            "ROW-N-4": {
-                "children": ["CHART-3"],
-                "id": "ROW-N-4",
+            "ROW-N-1": {
+                "children": [chart_2_key],
+                "id": "ROW-N-1",
                 "meta": {"0": "ROOT_ID", "background": "BACKGROUND_TRANSPARENT"},
                 "type": "ROW",
                 "parents": ["ROOT_ID", "GRID_ID"],
             },
-            "CHART-1": {
+            chart_1_key: {
                 "children": [],
-                "id": "CHART-1",
+                "id": chart_1_key,
                 "meta": {
                     "chartId": chart_1.id,
                     "height": 50,
-                    "sliceName": "Region Filter",
+                    "sliceName": "World's Population",
                     "uuid": str(chart_1.uuid),
                     "width": 4,
                 },
                 "type": "CHART",
-                "parents": ["ROOT_ID", "GRID_ID", "ROW-N-2"],
+                "parents": ["ROOT_ID", "GRID_ID", "ROW-N-0"],
             },
-            "CHART-3": {
+            chart_2_key: {
                 "children": [],
-                "id": "CHART-3",
+                "id": chart_2_key,
                 "meta": {
                     "chartId": chart_2.id,
                     "height": 50,
-                    "sliceName": "World's Population",
+                    "sliceName": "Growth Rate",
                     "uuid": str(chart_2.uuid),
                     "width": 4,
                 },
                 "type": "CHART",
-                "parents": ["ROOT_ID", "GRID_ID", "ROW-N-4"],
+                "parents": ["ROOT_ID", "GRID_ID", "ROW-N-1"],
             },
         }
 
         position = {"DASHBOARD_VERSION_KEY": "v2"}
         new_position = append_charts(position, [chart_1, chart_2])
         assert new_position == {
-            "CHART-5": {
+            chart_1_key: {
                 "children": [],
-                "id": "CHART-5",
+                "id": chart_1_key,
                 "meta": {
                     "chartId": chart_1.id,
                     "height": 50,
-                    "sliceName": "Region Filter",
+                    "sliceName": "World's Population",
                     "uuid": str(chart_1.uuid),
                     "width": 4,
                 },
                 "type": "CHART",
             },
-            "CHART-6": {
+            chart_2_key: {
                 "children": [],
-                "id": "CHART-6",
+                "id": chart_2_key,
                 "meta": {
                     "chartId": chart_2.id,
                     "height": 50,
-                    "sliceName": "World's Population",
+                    "sliceName": "Growth Rate",
                     "uuid": str(chart_2.uuid),
                     "width": 4,
                 },
@@ -421,6 +491,162 @@ class TestExportDashboardsCommand(SupersetTestCase):
             },
             "DASHBOARD_VERSION_KEY": "v2",
         }
+
+    @pytest.mark.usefixtures("load_world_bank_dashboard_with_slices")
+    @patch("superset.security.manager.g")
+    @patch("superset.views.base.g")
+    def test_export_dashboard_command_no_related(self, mock_g1, mock_g2):
+        """
+        Test that only the dashboard is exported when export_related=False.
+        """
+        mock_g1.user = security_manager.find_user("admin")
+        mock_g2.user = security_manager.find_user("admin")
+
+        example_dashboard = (
+            db.session.query(Dashboard).filter_by(slug="world_health").one()
+        )
+        command = ExportDashboardsCommand([example_dashboard.id], export_related=False)
+        contents = dict(command.run())
+
+        expected_paths = {
+            "metadata.yaml",
+            f"dashboards/World_Banks_Data_{example_dashboard.id}.yaml",
+        }
+        assert expected_paths == set(contents.keys())
+
+    @pytest.mark.usefixtures("load_world_bank_dashboard_with_slices")
+    @patch("superset.security.manager.g")
+    @patch("superset.views.base.g")
+    def test_export_dashboard_command_unicode_chars(self, mock_g1, mock_g2):
+        mock_g1.user = security_manager.find_user("admin")
+        mock_g2.user = security_manager.find_user("admin")
+        db.session.query(Dashboard).filter_by(slug="world_health").update(
+            {"dashboard_title": "中文"},
+        )
+        try:
+            example_dashboard = (
+                db.session.query(Dashboard).filter_by(dashboard_title="中文").one()
+            )
+
+            command = ExportDashboardsCommand([example_dashboard.id])
+            contents = dict(command.run())
+
+            path = f"dashboards/{example_dashboard.id}.yaml"
+            assert path in set(contents.keys())
+            yaml_content = contents[path]()
+            metadata = yaml.safe_load(yaml_content)
+            assert metadata["dashboard_title"] == "中文"
+            assert "dashboard_title: 中文" in yaml_content
+        finally:
+            # restore the shared fixture title so later tests that rely on it
+            # (e.g. test_export_dashboard_command_no_related) are not affected
+            db.session.query(Dashboard).filter_by(slug="world_health").update(
+                {"dashboard_title": "World Bank's Data"},
+            )
+
+    @pytest.mark.usefixtures("load_world_bank_dashboard_with_slices")
+    @patch("superset.security.manager.g")
+    @patch("superset.views.base.g")
+    def test_export_dashboard_cross_database_charts(self, mock_g1, mock_g2):
+        """
+        Test that dashboards with charts from multiple databases export correctly.
+        This reproduces issue #37113 where charts from different databases were missing.
+        """
+        mock_g1.user = security_manager.find_user("admin")
+        mock_g2.user = security_manager.find_user("admin")
+
+        # Create a second database for testing
+        second_db = Database(database_name="test_db_2", sqlalchemy_uri="sqlite://")
+        db.session.add(second_db)
+
+        # Create a dataset in the second database
+        second_dataset = SqlaTable(
+            table_name="second_dataset",
+            database=second_db,
+            database_id=second_db.id,
+            columns=[],
+        )
+        db.session.add(second_dataset)
+        # Flush so `second_dataset.id` is populated before it's read below;
+        # otherwise the chart would be constructed with `datasource_id=None`
+        # and never actually link back to this dataset.
+        db.session.flush()
+
+        # Create a chart using the second database's dataset
+        chart_from_second_db = Slice(
+            slice_name="Chart from Second Database",
+            datasource_type="table",
+            datasource_id=second_dataset.id,
+            datasource_name=second_dataset.table_name,
+            viz_type="bar",
+            params=json.dumps({"viz_type": "bar"}),
+        )
+        db.session.add(chart_from_second_db)
+
+        # Get the example dashboard and add the new chart
+        example_dashboard = (
+            db.session.query(Dashboard).filter_by(slug="world_health").one()
+        )
+
+        # Store original charts count
+        original_charts_count = len(example_dashboard.slices)
+
+        # Add the new chart from different database to the dashboard
+        example_dashboard.slices.append(chart_from_second_db)
+        db.session.commit()
+
+        try:
+            # Export the dashboard
+            command = ExportDashboardsCommand([example_dashboard.id])
+            contents = dict(command.run())
+
+            # Verify all databases are exported
+            db_files = [key for key in contents.keys() if key.startswith("databases/")]
+            assert len(db_files) >= 2, (
+                f"Expected at least 2 database files, got {db_files}"
+            )
+
+            # Verify the second database is included
+            assert "databases/test_db_2.yaml" in contents.keys(), (
+                f"Second database not found in export. Keys: {list(contents.keys())}"
+            )
+
+            # Verify all charts are exported (original + new one)
+            chart_files = [key for key in contents.keys() if key.startswith("charts/")]
+            assert len(chart_files) == original_charts_count + 1, (
+                f"Expected {original_charts_count + 1} charts, got {len(chart_files)}"
+            )
+
+            # Verify the new chart from second database is included
+            chart_from_second_db_file = None
+            for key in chart_files:
+                if f"Chart_from_Second_Database_{chart_from_second_db.id}" in key:
+                    chart_from_second_db_file = key
+                    break
+
+            assert chart_from_second_db_file is not None, (
+                f"Chart from second database not found in export. "
+                f"Chart files: {chart_files}"
+            )
+
+            # Verify the dataset from second database is included
+            dataset_files = [
+                key for key in contents.keys() if key.startswith("datasets/")
+            ]
+            second_dataset_file = (
+                f"datasets/test_db_2/second_dataset_{second_dataset.id}.yaml"
+            )
+            assert second_dataset_file in contents.keys(), (
+                f"Second dataset not found. Dataset files: {dataset_files}"
+            )
+        finally:
+            # Clean up, even if an assertion above failed, so a failing run
+            # doesn't leave extra Database/Slice/SqlaTable rows for later tests.
+            example_dashboard.slices.remove(chart_from_second_db)
+            db.session.delete(chart_from_second_db)
+            db.session.delete(second_dataset)
+            db.session.delete(second_db)
+            db.session.commit()
 
 
 class TestImportDashboardsCommand(SupersetTestCase):
@@ -463,10 +689,12 @@ class TestImportDashboardsCommand(SupersetTestCase):
         db.session.delete(dataset)
         db.session.commit()
 
-    @patch("superset.dashboards.commands.importers.v1.utils.g")
-    def test_import_v1_dashboard(self, mock_g):
+    @patch("superset.utils.core.g")
+    @patch("superset.security.manager.g")
+    @patch("superset.commands.database.importers.v1.utils.add_permissions")
+    def test_import_v1_dashboard(self, mock_add_permissions, sm_g, utils_g):
         """Test that we can import a dashboard"""
-        mock_g.user = security_manager.find_user("admin")
+        admin = sm_g.user = utils_g.user = security_manager.find_user("admin")
         contents = {
             "metadata.yaml": yaml.safe_dump(dashboard_metadata_config),
             "databases/imported_database.yaml": yaml.safe_dump(database_config),
@@ -527,14 +755,10 @@ class TestImportDashboardsCommand(SupersetTestCase):
         }
         assert json.loads(dashboard.json_metadata) == {
             "color_scheme": None,
-            "default_filters": "{}",
             "expanded_slices": {str(new_chart_id): True},
-            "filter_scopes": {
-                str(new_chart_id): {
-                    "region": {"scope": ["ROOT_ID"], "immune": [new_chart_id]}
-                },
-            },
+            "expand_all_slices": False,
             "import_time": 1604342885,
+            "native_filter_configuration": [],
             "refresh_frequency": 0,
             "remote_id": 7,
             "timed_refresh_immune_slices": [new_chart_id],
@@ -543,23 +767,49 @@ class TestImportDashboardsCommand(SupersetTestCase):
         dataset = chart.table
         assert str(dataset.uuid) == dataset_config["uuid"]
 
+        assert json.loads(chart.query_context) == {
+            "datasource": {"id": dataset.id, "type": "table"},
+            "force": False,
+            "queries": [
+                {
+                    "annotation_layers": [],
+                    "applied_time_extras": {},
+                    "columns": [],
+                    "custom_form_data": {},
+                    "custom_params": {},
+                    "extras": {"having": "", "time_grain_sqla": None, "where": ""},
+                    "filters": [],
+                    "metrics": [],
+                    "order_desc": True,
+                    "row_limit": 5000,
+                    "time_range": " : ",
+                    "timeseries_limit": 0,
+                    "url_params": {},
+                }
+            ],
+            "result_format": "json",
+            "result_type": "full",
+        }
+        assert json.loads(chart.params)["datasource"] == dataset.uid
+
         database = dataset.database
         assert str(database.uuid) == database_config["uuid"]
 
-        assert dashboard.owners == [mock_g.user]
+        assert len(dashboard.editors) == 1
+        assert user_is_editor(admin, dashboard)
 
-        dashboard.owners = []
-        chart.owners = []
-        dataset.owners = []
-        database.owners = []
         db.session.delete(dashboard)
         db.session.delete(chart)
         db.session.delete(dataset)
         db.session.delete(database)
         db.session.commit()
 
-    def test_import_v1_dashboard_multiple(self):
+    @patch("superset.security.manager.g")
+    @patch("superset.commands.database.importers.v1.utils.add_permissions")
+    def test_import_v1_dashboard_multiple(self, mock_add_permissions, mock_g):
         """Test that a dashboard can be imported multiple times"""
+        mock_g.user = security_manager.find_user("admin")
+
         num_dashboards = db.session.query(Dashboard).count()
 
         contents = {
@@ -570,7 +820,6 @@ class TestImportDashboardsCommand(SupersetTestCase):
             "dashboards/imported_dashboard.yaml": yaml.safe_dump(dashboard_config),
         }
         command = v1.ImportDashboardsCommand(contents, overwrite=True)
-        command.run()
         command.run()
 
         new_num_dashboards = db.session.query(Dashboard).count()
@@ -621,7 +870,7 @@ class TestImportDashboardsCommand(SupersetTestCase):
         command = v1.ImportDashboardsCommand(contents)
         with pytest.raises(CommandInvalidError) as excinfo:
             command.run()
-        assert str(excinfo.value) == "Error importing dashboard"
+        assert str(excinfo.value).startswith("Error importing dashboard")
         assert excinfo.value.normalized_messages() == {
             "metadata.yaml": {"type": ["Must be equal to Dashboard."]}
         }
@@ -634,9 +883,721 @@ class TestImportDashboardsCommand(SupersetTestCase):
         command = v1.ImportDashboardsCommand(contents)
         with pytest.raises(CommandInvalidError) as excinfo:
             command.run()
-        assert str(excinfo.value) == "Error importing dashboard"
+        assert str(excinfo.value).startswith("Error importing dashboard")
         assert excinfo.value.normalized_messages() == {
             "datasets/imported_dataset.yaml": {
                 "table_name": ["Missing data for required field."],
             }
         }
+
+
+class TestCopyDashboardCommand(SupersetTestCase):
+    @pytest.mark.usefixtures("load_world_bank_dashboard_with_slices")
+    def test_copy_dashboard_command(self):
+        """Test that an admin user can copy a dashboard"""
+        with self.client.application.test_request_context():
+            example_dashboard = (
+                db.session.query(Dashboard).filter_by(slug="world_health").one()
+            )
+            copy_data = {"dashboard_title": "Copied Dashboard", "json_metadata": "{}"}
+
+            with override_user(security_manager.find_user("admin")):
+                command = CopyDashboardCommand(example_dashboard, copy_data)
+                copied_dashboard = command.run()
+
+            assert copied_dashboard.dashboard_title == "Copied Dashboard"
+            assert copied_dashboard.slug != example_dashboard.slug
+            assert set(copied_dashboard.slices) == set(example_dashboard.slices)
+
+            db.session.delete(copied_dashboard)
+            db.session.commit()
+
+    @pytest.mark.usefixtures("load_world_bank_dashboard_with_slices")
+    def test_copy_dashboard_command_invalid_data(self):
+        """Test that invalid data raises a DashboardInvalidError"""
+        with self.client.application.test_request_context():
+            example_dashboard = (
+                db.session.query(Dashboard).filter_by(slug="world_health").one()
+            )
+        invalid_copy_data = {"dashboard_title": "", "json_metadata": "{}"}
+
+        with override_user(security_manager.find_user("admin")):
+            command = CopyDashboardCommand(example_dashboard, invalid_copy_data)
+            with self.assertRaises(DashboardInvalidError):  # noqa: PT027
+                command.run()
+
+
+class TestDeleteEmbeddedDashboardCommand(SupersetTestCase):
+    @pytest.mark.usefixtures("load_world_bank_dashboard_with_slices")
+    def test_delete_embedded_dashboard_command(self):
+        """Test that an admin user can add and then delete an embedded dashboard"""
+        with self.client.application.test_request_context():
+            example_dashboard = (
+                db.session.query(Dashboard).filter_by(slug="world_health").one()
+            )
+
+            # Step 1: Add an embedded dashboard
+            new_embedded_dashboard = EmbeddedDashboard(
+                dashboard_id=example_dashboard.id
+            )
+            db.session.add(new_embedded_dashboard)
+            db.session.commit()
+
+            # Step 2: Assert that the embedded dashboard was added
+            embedded_dashboards = example_dashboard.embedded
+            assert len(embedded_dashboards) > 0
+            assert new_embedded_dashboard in embedded_dashboards
+
+            # Step 3: Delete the embedded dashboard
+            with override_user(security_manager.find_user("admin")):
+                command = DeleteEmbeddedDashboardCommand(example_dashboard)
+                command.run()
+
+            # Step 4: Assert that the embedded dashboard was deleted
+            deleted_embedded_dashboard = (
+                db.session.query(EmbeddedDashboard)
+                .filter_by(uuid=new_embedded_dashboard.uuid)
+                .one_or_none()
+            )
+            assert deleted_embedded_dashboard is None
+
+
+class TestFavoriteDashboardCommand(SupersetTestCase):
+    @pytest.mark.usefixtures("load_world_bank_dashboard_with_slices")
+    def test_fave_unfave_dashboard_command(self):
+        """Test that a user can fave/unfave a dashboard"""
+        with self.client.application.test_request_context():
+            example_dashboard = (
+                db.session.query(Dashboard).filter_by(slug="world_health").one()
+            )
+
+            # Assert that the dashboard exists
+            assert example_dashboard is not None
+
+            with override_user(security_manager.find_user("admin")):
+                with patch(
+                    "superset.daos.dashboard.DashboardDAO.get_by_id_or_slug",
+                    return_value=example_dashboard,
+                ):
+                    AddFavoriteDashboardCommand(example_dashboard.id).run()
+
+                    # Assert that the dashboard was faved
+                    ids = DashboardDAO.favorited_ids([example_dashboard])
+                    assert example_dashboard.id in ids
+
+                    DelFavoriteDashboardCommand(example_dashboard.id).run()
+
+                    # Assert that the dashboard was unfaved
+                    ids = DashboardDAO.favorited_ids([example_dashboard])
+                    assert example_dashboard.id not in ids
+
+    @pytest.mark.usefixtures("load_world_bank_dashboard_with_slices")
+    def test_fave_unfave_dashboard_command_not_found(self):
+        """Test that faving / unfaving a non-existing dashboard raises an exception"""
+        with self.client.application.test_request_context():
+            example_dashboard_id = 1234
+
+            with override_user(security_manager.find_user("admin")):
+                with self.assertRaises(DashboardNotFoundError):  # noqa: PT027
+                    AddFavoriteDashboardCommand(example_dashboard_id).run()
+
+                with self.assertRaises(DashboardNotFoundError):  # noqa: PT027
+                    DelFavoriteDashboardCommand(example_dashboard_id).run()
+
+    @pytest.mark.usefixtures("load_world_bank_dashboard_with_slices")
+    @patch("superset.models.dashboard.Dashboard.get")
+    def test_fave_unfave_dashboard_command_forbidden(self, mock_get):
+        """Test that faving / unfaving raises an exception for a dashboard the user doesn't own"""  # noqa: E501
+        with self.client.application.test_request_context():
+            example_dashboard = (
+                db.session.query(Dashboard).filter_by(slug="world_health").one()
+            )
+
+            mock_get.return_value = example_dashboard
+
+            # Assert that the dashboard exists
+            assert example_dashboard is not None
+
+            with override_user(security_manager.find_user("gamma")):
+                with self.assertRaises(DashboardAccessDeniedError):  # noqa: PT027
+                    AddFavoriteDashboardCommand(example_dashboard.uuid).run()
+
+                with self.assertRaises(DashboardAccessDeniedError):  # noqa: PT027
+                    DelFavoriteDashboardCommand(example_dashboard.uuid).run()
+
+
+def _cleanup_dashboard_annotation_import(chart_uuids, layer_uuids, dashboard_uuid):
+    dashboard = db.session.query(Dashboard).filter_by(uuid=dashboard_uuid).one_or_none()
+    if dashboard:
+        db.session.delete(dashboard)
+    for chart_uuid in chart_uuids:
+        chart = db.session.query(Slice).filter_by(uuid=chart_uuid).one_or_none()
+        if chart:
+            db.session.delete(chart)
+    for layer_uuid in layer_uuids:
+        layer = (
+            db.session.query(AnnotationLayer).filter_by(uuid=layer_uuid).one_or_none()
+        )
+        if layer:
+            db.session.query(Annotation).filter(
+                Annotation.layer_id == layer.id
+            ).delete()
+            db.session.delete(layer)
+    dataset = (
+        db.session.query(SqlaTable).filter_by(uuid=dataset_config["uuid"]).one_or_none()
+    )
+    if dataset:
+        db.session.delete(dataset)
+    database = (
+        db.session.query(Database).filter_by(uuid=database_config["uuid"]).one_or_none()
+    )
+    if database:
+        db.session.delete(database)
+    db.session.commit()
+
+
+class TestImportDashboardsAnnotationLayers(SupersetTestCase):
+    """Dashboard-level annotation layer dependency coverage for import."""
+
+    @patch("superset.utils.core.g")
+    @patch("superset.security.manager.g")
+    @patch("superset.commands.database.importers.v1.utils.add_permissions")
+    def test_import_dashboard_native_annotation_dependency_chain(
+        self, mock_add_permissions, sm_g, utils_g
+    ):
+        """Import dashboard, chart, native layer, and child annotations."""
+        sm_g.user = utils_g.user = security_manager.find_user("admin")
+        dashboard_uuid = str(uuid4())
+        chart_uuid = str(uuid4())
+        layer_uuid = str(uuid4())
+        chart_cfg = dashboard_chart_config(chart_uuid, "Dashboard Native Main")
+        chart_cfg["params"]["annotation_layers"] = [
+            {
+                "name": "Native Layer",
+                "annotationType": "EVENT",
+                "sourceType": "NATIVE",
+                "value": layer_uuid,
+                "show": True,
+                "style": "solid",
+            }
+        ]
+        dash_cfg = dashboard_config_for_charts(
+            dashboard_uuid,
+            "Dashboard Native Test",
+            [("CHART-1", chart_uuid, chart_cfg["slice_name"])],
+        )
+        contents = dashboard_import_bundle(
+            dash_cfg,
+            {"main_chart.yaml": chart_cfg},
+            {
+                "native_layer.yaml": dashboard_annotation_layer_config(
+                    layer_uuid,
+                    "Native Layer",
+                    [
+                        {
+                            "uuid": str(uuid4()),
+                            "short_descr": "child-a",
+                            "long_descr": "child annotation",
+                            "json_metadata": {"flag": "a"},
+                        },
+                        {
+                            "uuid": str(uuid4()),
+                            "short_descr": "child-b",
+                            "long_descr": "child annotation 2",
+                            "json_metadata": {"flag": "b"},
+                        },
+                    ],
+                    descr="native layer descr",
+                )
+            },
+        )
+        try:
+            v1.ImportDashboardsCommand(contents, overwrite=True).run()
+
+            dashboard = db.session.query(Dashboard).filter_by(uuid=dashboard_uuid).one()
+            chart = db.session.query(Slice).filter_by(uuid=chart_uuid).one()
+            layer = db.session.query(AnnotationLayer).filter_by(uuid=layer_uuid).one()
+            annotations = (
+                db.session.query(Annotation).filter_by(layer_id=layer.id).all()
+            )
+
+            assert chart in dashboard.slices
+            imported_layers = json.loads(chart.params)["annotation_layers"]
+            assert len(imported_layers) == 1
+            assert imported_layers[0]["sourceType"] == "NATIVE"
+            assert imported_layers[0]["value"] == layer.id
+            assert imported_layers[0]["show"] is True
+            assert imported_layers[0]["style"] == "solid"
+            assert layer.name == "Native Layer"
+            assert layer.descr == "native layer descr"
+            assert {annotation.short_descr for annotation in annotations} == {
+                "child-a",
+                "child-b",
+            }
+            assert all(annotation.layer_id == layer.id for annotation in annotations)
+        finally:
+            _cleanup_dashboard_annotation_import(
+                [chart_uuid], [layer_uuid], dashboard_uuid
+            )
+
+    @patch("superset.utils.core.g")
+    @patch("superset.security.manager.g")
+    @patch("superset.commands.database.importers.v1.utils.add_permissions")
+    def test_import_dashboard_annotation_dependency_graph(
+        self, mock_add_permissions, sm_g, utils_g
+    ):
+        """Import dashboard with two native layers and chart dependency."""
+        sm_g.user = utils_g.user = security_manager.find_user("admin")
+        dashboard_uuid = str(uuid4())
+        main_chart_uuid = str(uuid4())
+        ref_chart_uuid = str(uuid4())
+        layer_a_uuid = str(uuid4())
+        layer_b_uuid = str(uuid4())
+
+        ref_chart_cfg = dashboard_chart_config(ref_chart_uuid, "Dashboard Ref Chart")
+        main_chart_cfg = dashboard_chart_config(main_chart_uuid, "Dashboard Main Chart")
+        main_chart_cfg["params"]["annotation_layers"] = [
+            {
+                "name": "Native Layer A",
+                "annotationType": "EVENT",
+                "sourceType": "NATIVE",
+                "value": layer_a_uuid,
+                "show": True,
+                "style": "solid",
+            },
+            {
+                "name": "Native Layer B",
+                "annotationType": "EVENT",
+                "sourceType": "NATIVE",
+                "value": layer_b_uuid,
+                "show": False,
+                "style": "dashed",
+            },
+            {
+                "name": "Table Annotation",
+                "annotationType": "EVENT",
+                "sourceType": "table",
+                "value": ref_chart_uuid,
+                "show": True,
+                "style": "solid",
+            },
+        ]
+        dash_cfg = dashboard_config_for_charts(
+            dashboard_uuid,
+            "Dashboard Dependency Graph Test",
+            [
+                ("CHART-1", main_chart_uuid, main_chart_cfg["slice_name"]),
+                ("CHART-2", ref_chart_uuid, ref_chart_cfg["slice_name"]),
+            ],
+        )
+        contents = dashboard_import_bundle(
+            dash_cfg,
+            {
+                "main_chart.yaml": main_chart_cfg,
+                "ref_chart.yaml": ref_chart_cfg,
+            },
+            {
+                "layer_a.yaml": dashboard_annotation_layer_config(
+                    layer_a_uuid,
+                    "Layer A",
+                    [
+                        {
+                            "uuid": str(uuid4()),
+                            "short_descr": "A1",
+                            "long_descr": "A1 long",
+                            "json_metadata": {"layer": "A"},
+                        },
+                        {
+                            "uuid": str(uuid4()),
+                            "short_descr": "A2",
+                            "long_descr": "A2 long",
+                            "json_metadata": {"layer": "A", "index": 2},
+                        },
+                    ],
+                ),
+                "layer_b.yaml": dashboard_annotation_layer_config(
+                    layer_b_uuid,
+                    "Layer B",
+                    [
+                        {
+                            "uuid": str(uuid4()),
+                            "short_descr": "B1",
+                            "long_descr": "B1 long",
+                            "json_metadata": {"layer": "B"},
+                        },
+                        {
+                            "uuid": str(uuid4()),
+                            "short_descr": "B2",
+                            "long_descr": "B2 long",
+                            "json_metadata": {"layer": "B", "index": 2},
+                        },
+                    ],
+                ),
+            },
+        )
+        try:
+            v1.ImportDashboardsCommand(contents, overwrite=True).run()
+
+            dashboard = db.session.query(Dashboard).filter_by(uuid=dashboard_uuid).one()
+            main_chart = db.session.query(Slice).filter_by(uuid=main_chart_uuid).one()
+            ref_chart = db.session.query(Slice).filter_by(uuid=ref_chart_uuid).one()
+            layer_a = (
+                db.session.query(AnnotationLayer).filter_by(uuid=layer_a_uuid).one()
+            )
+            layer_b = (
+                db.session.query(AnnotationLayer).filter_by(uuid=layer_b_uuid).one()
+            )
+            assert {str(chart.uuid) for chart in dashboard.slices} == {
+                main_chart_uuid,
+                ref_chart_uuid,
+            }
+
+            imported_layers = json.loads(main_chart.params)["annotation_layers"]
+            assert [layer_cfg["sourceType"] for layer_cfg in imported_layers] == [
+                "NATIVE",
+                "NATIVE",
+                "table",
+            ]
+            assert [layer_cfg["value"] for layer_cfg in imported_layers] == [
+                layer_a.id,
+                layer_b.id,
+                ref_chart.id,
+            ]
+
+            a_annotations = (
+                db.session.query(Annotation).filter_by(layer_id=layer_a.id).all()
+            )
+            b_annotations = (
+                db.session.query(Annotation).filter_by(layer_id=layer_b.id).all()
+            )
+            assert {annotation.short_descr for annotation in a_annotations} == {
+                "A1",
+                "A2",
+            }
+            assert {annotation.short_descr for annotation in b_annotations} == {
+                "B1",
+                "B2",
+            }
+            assert all(
+                annotation.layer_id == layer_a.id for annotation in a_annotations
+            )
+            assert all(
+                annotation.layer_id == layer_b.id for annotation in b_annotations
+            )
+        finally:
+            _cleanup_dashboard_annotation_import(
+                [main_chart_uuid, ref_chart_uuid],
+                [layer_a_uuid, layer_b_uuid],
+                dashboard_uuid,
+            )
+
+    @patch("superset.utils.core.g")
+    @patch("superset.security.manager.g")
+    @patch("superset.commands.database.importers.v1.utils.add_permissions")
+    def test_import_dashboard_existing_annotation_layer_reuses_existing_layer(
+        self, mock_add_permissions, sm_g, utils_g
+    ):
+        """Reuse existing native layer during dashboard import."""
+        sm_g.user = utils_g.user = security_manager.find_user("admin")
+        dashboard_uuid = str(uuid4())
+        chart_uuid = str(uuid4())
+        layer_uuid = str(uuid4())
+
+        existing_layer = AnnotationLayer(name="existing-layer", descr="before")
+        existing_layer.uuid = layer_uuid
+        db.session.add(existing_layer)
+        db.session.commit()
+        existing_layer_id = existing_layer.id
+        db.session.add(
+            Annotation(
+                layer=existing_layer, short_descr="existing-child", json_metadata=None
+            )
+        )
+        db.session.commit()
+
+        chart_cfg = dashboard_chart_config(chart_uuid, "Dashboard Existing Layer")
+        chart_cfg["params"]["annotation_layers"] = [
+            {
+                "name": "Native",
+                "annotationType": "EVENT",
+                "sourceType": "NATIVE",
+                "value": layer_uuid,
+                "show": True,
+                "style": "solid",
+            }
+        ]
+        dash_cfg = dashboard_config_for_charts(
+            dashboard_uuid,
+            "Dashboard Existing Layer Test",
+            [("CHART-1", chart_uuid, chart_cfg["slice_name"])],
+        )
+        contents = dashboard_import_bundle(
+            dash_cfg,
+            {"chart.yaml": chart_cfg},
+            {
+                "layer.yaml": dashboard_annotation_layer_config(
+                    layer_uuid,
+                    "incoming-layer-name",
+                    [
+                        {
+                            "uuid": str(uuid4()),
+                            "short_descr": "incoming-child",
+                            "long_descr": "incoming",
+                            "json_metadata": {"incoming": True},
+                        }
+                    ],
+                    descr="incoming-descr",
+                )
+            },
+        )
+        try:
+            v1.ImportDashboardsCommand(contents, overwrite=True).run()
+
+            chart = db.session.query(Slice).filter_by(uuid=chart_uuid).one()
+            layer = db.session.query(AnnotationLayer).filter_by(uuid=layer_uuid).one()
+            annotations = (
+                db.session.query(Annotation).filter_by(layer_id=layer.id).all()
+            )
+            assert layer.id == existing_layer_id
+            assert layer.name == "existing-layer"
+            assert layer.descr == "before"
+            assert len(annotations) == 1
+            assert annotations[0].short_descr == "existing-child"
+            assert json.loads(chart.params)["annotation_layers"][0]["value"] == layer.id
+        finally:
+            _cleanup_dashboard_annotation_import(
+                [chart_uuid], [layer_uuid], dashboard_uuid
+            )
+
+    @patch("superset.utils.core.g")
+    @patch("superset.security.manager.g")
+    @patch("superset.commands.database.importers.v1.utils.add_permissions")
+    def test_import_dashboard_annotation_source_chart_on_other_database(
+        self, mock_add_permissions, sm_g, utils_g
+    ) -> None:
+        """Import an annotation source chart that isn't in the layout."""
+        sm_g.user = utils_g.user = security_manager.find_user("admin")
+        dashboard_uuid = str(uuid4())
+        main_chart_uuid = str(uuid4())
+        source_chart_uuid = str(uuid4())
+        source_database_config = {
+            **deepcopy(database_config),
+            "uuid": str(uuid4()),
+            "database_name": f"annotation_source_db_{uuid4().hex[:8]}",
+            "sqlalchemy_uri": "postgresql://user:pass@host2",
+        }
+        source_dataset_config = {
+            **deepcopy(dataset_config),
+            "uuid": str(uuid4()),
+            "table_name": "annotation_source_dataset",
+            "database_uuid": source_database_config["uuid"],
+        }
+        source_chart_cfg = dashboard_chart_config(
+            source_chart_uuid, "Annotation Source Chart"
+        )
+        source_chart_cfg["dataset_uuid"] = source_dataset_config["uuid"]
+        main_chart_cfg = dashboard_chart_config(main_chart_uuid, "Annotated Chart")
+        main_chart_cfg["params"]["annotation_layers"] = [
+            {
+                "name": "Source",
+                "annotationType": "EVENT",
+                "sourceType": "table",
+                "value": source_chart_uuid,
+            }
+        ]
+        dash_cfg = dashboard_config_for_charts(
+            dashboard_uuid,
+            "Dashboard Cross Database Annotation",
+            [("CHART-1", main_chart_uuid, main_chart_cfg["slice_name"])],
+        )
+        contents = dashboard_import_bundle(
+            dash_cfg,
+            {"main_chart.yaml": main_chart_cfg, "source_chart.yaml": source_chart_cfg},
+        )
+        contents["databases/source_database.yaml"] = yaml.safe_dump(
+            source_database_config
+        )
+        contents["datasets/source_dataset.yaml"] = yaml.safe_dump(source_dataset_config)
+        try:
+            v1.ImportDashboardsCommand(contents, overwrite=True).run()
+
+            main_chart = db.session.query(Slice).filter_by(uuid=main_chart_uuid).one()
+            source_chart = (
+                db.session.query(Slice).filter_by(uuid=source_chart_uuid).one()
+            )
+            assert source_chart.table.database.uuid == UUID(
+                source_database_config["uuid"]
+            )
+            assert [
+                layer["value"]
+                for layer in json.loads(main_chart.params)["annotation_layers"]
+            ] == [source_chart.id]
+        finally:
+            _cleanup_dashboard_annotation_import(
+                [main_chart_uuid, source_chart_uuid], [], dashboard_uuid
+            )
+            source_dataset = (
+                db.session.query(SqlaTable)
+                .filter_by(uuid=source_dataset_config["uuid"])
+                .one_or_none()
+            )
+            if source_dataset:
+                db.session.delete(source_dataset)
+            source_database = (
+                db.session.query(Database)
+                .filter_by(uuid=source_database_config["uuid"])
+                .one_or_none()
+            )
+            if source_database:
+                db.session.delete(source_database)
+            db.session.commit()
+
+    @patch("superset.utils.core.g")
+    @patch("superset.security.manager.g")
+    @patch("superset.commands.database.importers.v1.utils.add_permissions")
+    def test_import_dashboard_gamma_overwrite_keeps_existing_annotation_layer(
+        self, mock_add_permissions, sm_g, utils_g
+    ) -> None:
+        """Gamma's overwrite dashboard import reuses a layer without changing it."""
+        sm_g.user = utils_g.user = security_manager.find_user("admin")
+        layer = AnnotationLayer(name=f"Gamma Dash Kept {uuid4()}", descr="original")
+        db.session.add(layer)
+        db.session.flush()
+        db.session.add(Annotation(layer_id=layer.id, short_descr="original-child"))
+        db.session.commit()
+        layer_uuid = str(layer.uuid)
+        layer_name = layer.name
+        dashboard_uuid = str(uuid4())
+        chart_uuid = str(uuid4())
+        chart_cfg = dashboard_chart_config(chart_uuid, "Gamma Dashboard Chart")
+        chart_cfg["params"]["annotation_layers"] = [
+            {
+                "name": "Native",
+                "annotationType": "EVENT",
+                "sourceType": "NATIVE",
+                "value": layer_uuid,
+            }
+        ]
+        dash_cfg = dashboard_config_for_charts(
+            dashboard_uuid,
+            "Gamma Dashboard",
+            [("CHART-1", chart_uuid, chart_cfg["slice_name"])],
+        )
+        contents = dashboard_import_bundle(
+            dash_cfg,
+            {"main_chart.yaml": chart_cfg},
+            {
+                "layer.yaml": dashboard_annotation_layer_config(
+                    layer_uuid, "renamed-by-gamma", [], descr="changed"
+                )
+            },
+        )
+        try:
+            # the database and dataset have to exist: Gamma can't create them
+            ImportDatasetsCommand(
+                {
+                    "metadata.yaml": yaml.safe_dump(dataset_metadata_config),
+                    "databases/imported_database.yaml": yaml.safe_dump(database_config),
+                    "datasets/imported_dataset.yaml": yaml.safe_dump(dataset_config),
+                },
+                overwrite=True,
+            ).run()
+
+            sm_g.user = utils_g.user = security_manager.find_user("gamma")
+            v1.ImportDashboardsCommand(
+                contents, overwrite=True, overwrite_all=True
+            ).run()
+
+            db.session.expire_all()
+            reloaded = (
+                db.session.query(AnnotationLayer).filter_by(uuid=layer_uuid).one()
+            )
+            children = db.session.query(Annotation).filter_by(layer_id=reloaded.id)
+            chart = db.session.query(Slice).filter_by(uuid=chart_uuid).one()
+            assert reloaded.name == layer_name
+            assert reloaded.descr == "original"
+            assert [child.short_descr for child in children] == ["original-child"]
+            assert [
+                annotation["value"]
+                for annotation in json.loads(chart.params)["annotation_layers"]
+            ] == [reloaded.id]
+        finally:
+            _cleanup_dashboard_annotation_import(
+                [chart_uuid], [layer_uuid], dashboard_uuid
+            )
+
+
+class TestExportDashboardsAnnotationLayer(SupersetTestCase):
+    """Dashboard export coverage for chart-native annotation layer dependencies."""
+
+    @pytest.mark.usefixtures("load_world_bank_dashboard_with_slices")
+    @patch("superset.security.manager.g")
+    @patch("superset.views.base.g")
+    def test_export_dashboard_includes_native_annotation_layer_with_children(
+        self, mock_g1, mock_g2
+    ):
+        """Export dashboard with chart-native layer and child annotations."""
+        mock_g1.user = security_manager.find_user("admin")
+        mock_g2.user = security_manager.find_user("admin")
+        dashboard = db.session.query(Dashboard).filter_by(slug="world_health").one()
+        chart = dashboard.slices[0]
+        original_params = json.loads(chart.params or "{}")
+        layer = AnnotationLayer(
+            name=f"dashboard-export-layer-{uuid4()}", descr="export"
+        )
+        db.session.add(layer)
+        db.session.commit()
+        db.session.add(
+            Annotation(
+                layer=layer,
+                short_descr="export-child",
+                long_descr="export-child-long",
+                json_metadata='{"source": "dashboard"}',
+            )
+        )
+        db.session.commit()
+        try:
+            chart.params = json.dumps(
+                {
+                    **original_params,
+                    "annotation_layers": [
+                        {
+                            "name": "Native",
+                            "annotationType": "EVENT",
+                            "sourceType": "NATIVE",
+                            "value": layer.id,
+                            "show": True,
+                            "style": "solid",
+                        }
+                    ],
+                }
+            )
+            db.session.commit()
+
+            contents = dict(ExportDashboardsCommand([dashboard.id]).run())
+            chart_path = f"charts/{secure_filename(chart.slice_name)}_{chart.id}.yaml"
+            assert chart_path in contents
+            exported_chart = yaml.safe_load(contents[chart_path]())
+            exported_layers = exported_chart["params"]["annotation_layers"]
+            assert exported_layers[0]["sourceType"] == "NATIVE"
+            assert exported_layers[0]["value"] == str(layer.uuid)
+
+            layer_payloads = [
+                yaml.safe_load(factory())
+                for path, factory in contents.items()
+                if path.startswith("annotation_layers/")
+            ]
+            assert len(layer_payloads) == 1
+            assert layer_payloads[0]["uuid"] == str(layer.uuid)
+            assert layer_payloads[0]["annotation"][0]["short_descr"] == "export-child"
+            assert layer_payloads[0]["annotation"][0]["json_metadata"] == {
+                "source": "dashboard"
+            }
+        finally:
+            chart.params = json.dumps(original_params)
+            db.session.commit()
+            db.session.query(Annotation).filter(
+                Annotation.layer_id == layer.id
+            ).delete()
+            db.session.delete(layer)
+            db.session.commit()

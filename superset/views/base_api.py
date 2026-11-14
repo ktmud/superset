@@ -14,32 +14,45 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+from __future__ import annotations
+
 import functools
 import logging
-from typing import Any, Callable, cast, Dict, List, Optional, Set, Tuple, Type, Union
+from typing import Any, Callable, cast, Optional, overload
 
-from apispec import APISpec
-from apispec.exceptions import DuplicateComponentNameError
-from flask import Blueprint, g, Response
-from flask_appbuilder import AppBuilder, Model, ModelRestApi
-from flask_appbuilder.api import expose, protect, rison, safe
+from flask import current_app, request, Response
+from flask_appbuilder import Model, ModelRestApi
+from flask_appbuilder.api import (
+    BaseApi,
+    expose,
+    protect,
+    rison as parse_rison,
+    safe,
+)
+from flask_appbuilder.const import API_FILTERS_RIS_KEY
 from flask_appbuilder.models.filters import BaseFilter, Filters
 from flask_appbuilder.models.sqla.filters import FilterStartsWith
 from flask_appbuilder.models.sqla.interface import SQLAInterface
+from flask_appbuilder.security.decorators import permission_name
 from flask_babel import lazy_gettext as _
+from flask_jwt_extended import verify_jwt_in_request
+from flask_login import current_user
 from marshmallow import fields, Schema
 from sqlalchemy import and_, distinct, func
 from sqlalchemy.orm.query import Query
 
-from superset.extensions import db, event_logger, security_manager
+from superset import is_feature_enabled
+from superset.exceptions import InvalidPayloadFormatError
+from superset.extensions import db, event_logger, security_manager, stats_logger_manager
 from superset.models.core import FavStar
 from superset.models.dashboard import Dashboard
 from superset.models.slice import Slice
 from superset.schemas import error_payload_content
 from superset.sql_lab import Query as SqllabQuery
-from superset.stats_logger import BaseStatsLogger
-from superset.typing import FlaskResponse
-from superset.utils.core import time_function
+from superset.superset_typing import FlaskResponse
+from superset.utils import json
+from superset.utils.core import get_user_id, time_function
+from superset.views.error_handling import handle_api_exception, json_error_response
 
 logger = logging.getLogger(__name__)
 get_related_schema = {
@@ -53,47 +66,245 @@ get_related_schema = {
 }
 
 
+def protect_read(
+    *view_names: str,
+) -> Callable[[Callable[..., FlaskResponse]], Callable[..., FlaskResponse]]:
+    """Protect a combined read API using independently granted FAB view permissions.
+
+    Preserve FAB's public, API-key, browser-session and JWT authentication paths.
+    Public grants are checked per resource name, not the API class: public
+    ``can_read Dataset`` admits anonymous callers to ``/api/v1/datasource/``,
+    without granting SemanticView read or bypassing row-level filters.
+    Callers must still scope each result source to its own permission and apply
+    object-level filters; passing this gate never grants access to every source.
+    The decorated method must map to ``read`` in ``method_permission_name``.
+    """
+
+    def decorate(
+        function: Callable[..., FlaskResponse],
+    ) -> Callable[..., FlaskResponse]:
+        @functools.wraps(function)
+        @permission_name("read")
+        def wrapped(self: BaseApi, *args: Any, **kwargs: Any) -> FlaskResponse:
+            if "can_read" not in self.base_permissions:
+                return self.response_403()
+            if any(
+                security_manager.is_item_public("can_read", name) for name in view_names
+            ):
+                return function(self, *args, **kwargs)
+
+            api_key: str | None
+            if (
+                current_app.config.get("FAB_API_KEY_ENABLED", False)
+                and (api_key := security_manager.extract_api_key_from_request())
+                is not None
+            ):
+                if not security_manager.validate_api_key(api_key):
+                    return self.response_401()
+                if any(
+                    security_manager.has_access("can_read", name) for name in view_names
+                ):
+                    return function(self, *args, **kwargs)
+                logger.warning(
+                    "Access denied: can_read on one of %s", ", ".join(view_names)
+                )
+                return self.response_403()
+
+            if not self.allow_browser_login or not current_user.is_authenticated:
+                verify_jwt_in_request()
+            if any(
+                security_manager.has_access("can_read", name) for name in view_names
+            ):
+                return function(self, *args, **kwargs)
+            logger.warning(
+                "Access denied: can_read on one of %s", ", ".join(view_names)
+            )
+            return self.response_403()
+
+        return wrapped
+
+    return decorate
+
+
 class RelatedResultResponseSchema(Schema):
-    value = fields.Integer(description="The related item identifier")
-    text = fields.String(description="The related item string representation")
+    value = fields.Integer(metadata={"description": "The related item identifier"})
+    text = fields.String(
+        metadata={"description": "The related item string representation"}
+    )
+    extra = fields.Dict(metadata={"description": "The extra metadata for related item"})
 
 
 class RelatedResponseSchema(Schema):
-    count = fields.Integer(description="The total number of related values")
+    count = fields.Integer(
+        metadata={"description": "The total number of related values"}
+    )
     result = fields.List(fields.Nested(RelatedResultResponseSchema))
 
 
 class DistinctResultResponseSchema(Schema):
-    text = fields.String(description="The distinct item")
+    text = fields.String(metadata={"description": "The distinct item"})
 
 
 class DistincResponseSchema(Schema):
-    count = fields.Integer(description="The total number of distinct values")
+    count = fields.Integer(
+        metadata={"description": "The total number of distinct values"}
+    )
     result = fields.List(fields.Nested(DistinctResultResponseSchema))
 
 
-def statsd_metrics(f: Callable[..., Any]) -> Callable[..., Any]:
+def requires_json(f: Callable[..., Any]) -> Callable[..., Any]:
     """
-    Handle sending all statsd metrics from the REST API
+    Require JSON-like formatted request to the REST API.
+
+    Returns the structured 400 RESPONSE directly instead of raising:
+    most call sites stack FAB's ``@safe`` outside this decorator, and
+    ``safe`` converts any non-``BadRequest`` exception — including a
+    status-400 ``SupersetErrorException`` — into a generic 500 "Fatal
+    error" before the app-level error handler can render it (sc-120966:
+    every body-less POST to such an endpoint 500'd). Building the
+    response with the same serializer the app handler uses keeps the
+    error envelope byte-identical for the call sites without ``@safe``.
     """
 
-    def wraps(self: "BaseSupersetModelRestApi", *args: Any, **kwargs: Any) -> Response:
-        try:
-            duration, response = time_function(f, self, *args, **kwargs)
-        except Exception as ex:
-            self.incr_stats("error", f.__name__)
-            raise ex
-
-        self.send_stats_metrics(response, f.__name__, duration)
-        return response
+    def wraps(self: BaseSupersetModelRestApi, *args: Any, **kwargs: Any) -> Response:
+        if not request.is_json:
+            ex: InvalidPayloadFormatError = InvalidPayloadFormatError(
+                message="Request is not JSON"
+            )
+            return json_error_response([ex.error], status=ex.status)
+        return f(self, *args, **kwargs)
 
     return functools.update_wrapper(wraps, f)
+
+
+def requires_form_data(f: Callable[..., Any]) -> Callable[..., Any]:
+    """
+    Require 'multipart/form-data' as request MIME type
+    """
+
+    def wraps(self: BaseSupersetApiMixin, *args: Any, **kwargs: Any) -> Response:
+        if not request.mimetype == "multipart/form-data":
+            raise InvalidPayloadFormatError(
+                message="Request MIME type is not 'multipart/form-data'"
+            )
+        return f(self, *args, **kwargs)
+
+    return functools.update_wrapper(wraps, f)
+
+
+def parse_json_form_field(name: str) -> dict[str, Any] | None:
+    """
+    Parse an optional JSON object from a multipart form field.
+
+    :param name: the form field name
+    :returns: the parsed object, or None if the field is absent
+    :raises InvalidPayloadFormatError: if the value is not a valid JSON object
+    """
+    if name not in request.form:
+        return None
+    try:
+        value = json.loads(request.form[name])
+    except json.JSONDecodeError as ex:
+        raise InvalidPayloadFormatError(
+            message=f"Form field '{name}' is not valid JSON"
+        ) from ex
+    if not isinstance(value, dict):
+        raise InvalidPayloadFormatError(
+            message=f"Form field '{name}' must be a JSON object"
+        )
+    return value
+
+
+@overload
+def statsd_metrics(
+    f: Callable[..., Any],
+    *,
+    best_effort: bool = False,
+) -> Callable[..., Any]: ...
+
+
+@overload
+def statsd_metrics(
+    f: None = None,
+    *,
+    best_effort: bool = False,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]: ...
+
+
+def statsd_metrics(
+    f: Callable[..., Any] | None = None,
+    *,
+    best_effort: bool = False,
+) -> Callable[..., Any]:
+    """
+    Handle sending all StatsD metrics from the REST API.
+
+    When ``best_effort`` is true, a metrics backend failure is logged and ignored so
+    it cannot replace the endpoint response or exception.
+    """
+
+    def decorate(func: Callable[..., Any]) -> Callable[..., Any]:
+        def wraps(self: BaseSupersetApiMixin, *args: Any, **kwargs: Any) -> Response:
+            func_name = func.__name__
+
+            def emit_metrics(callback: Callable[[], None]) -> None:
+                try:
+                    callback()
+                except Exception as ex:  # pylint: disable=broad-except
+                    if not best_effort:
+                        raise
+                    logger.warning(
+                        "REST API metrics emission failed: endpoint=%s error_type=%s",
+                        func.__qualname__,
+                        type(ex).__name__,
+                    )
+
+            try:
+                duration, response = time_function(func, self, *args, **kwargs)
+            except Exception as ex:
+                action = (
+                    "warning"
+                    if hasattr(ex, "status") and ex.status < 500  # pylint: disable=no-member
+                    else "error"
+                )
+                emit_metrics(lambda: self.incr_stats(action, func_name))
+                raise
+
+            emit_metrics(lambda: self.send_stats_metrics(response, func_name, duration))
+            return response
+
+        return functools.update_wrapper(wraps, func)
+
+    return decorate(f) if f is not None else decorate
+
+
+def validate_feature_flags(
+    feature_flags: list[str],
+) -> Callable[[Callable[..., Response]], Callable[..., Response]]:
+    """
+    A decorator to check if all given feature flags are enabled.
+
+    :param feature_flags: List of feature flag names to be checked.
+    """
+
+    def decorate(f: Callable[..., Response]) -> Callable[..., Response]:
+        @functools.wraps(f)
+        def wrapper(
+            self: BaseSupersetModelRestApi, *args: Any, **kwargs: Any
+        ) -> Response:
+            if not all(is_feature_enabled(flag) for flag in feature_flags):
+                return self.response_404()
+            return f(self, *args, **kwargs)
+
+        return wrapper
+
+    return decorate
 
 
 class RelatedFieldFilter:
     # data class to specify what filter to use on a /related endpoint
     # pylint: disable=too-few-public-methods
-    def __init__(self, field_name: str, filter_class: Type[BaseFilter]):
+    def __init__(self, field_name: str, filter_class: type[BaseFilter]):
         self.field_name = field_name
         self.filter_class = filter_class
 
@@ -108,7 +319,7 @@ class BaseFavoriteFilter(BaseFilter):  # pylint: disable=too-few-public-methods
     arg_name = ""
     class_name = ""
     """ The FavStar class_name to user """
-    model: Type[Union[Dashboard, Slice, SqllabQuery]] = Dashboard
+    model: type[Dashboard | Slice | SqllabQuery] = Dashboard
     """ The SQLAlchemy model """
 
     def apply(self, query: Query, value: Any) -> Query:
@@ -117,7 +328,7 @@ class BaseFavoriteFilter(BaseFilter):  # pylint: disable=too-few-public-methods
             return query
         users_favorite_query = db.session.query(FavStar.obj_id).filter(
             and_(
-                FavStar.user_id == g.user.get_id(),
+                FavStar.user_id == get_user_id(),
                 FavStar.class_name == self.class_name,
             )
         )
@@ -126,12 +337,94 @@ class BaseFavoriteFilter(BaseFilter):  # pylint: disable=too-few-public-methods
         return query.filter(and_(~self.model.id.in_(users_favorite_query)))
 
 
-class BaseSupersetModelRestApi(ModelRestApi):
+class BaseSupersetApiMixin:
+    csrf_exempt = False
+
+    responses = {
+        "400": {"description": "Bad request", "content": error_payload_content},
+        "401": {"description": "Unauthorized", "content": error_payload_content},
+        "403": {"description": "Forbidden", "content": error_payload_content},
+        "404": {"description": "Not found", "content": error_payload_content},
+        "410": {"description": "Gone", "content": error_payload_content},
+        "422": {
+            "description": "Could not process entity",
+            "content": error_payload_content,
+        },
+        "500": {"description": "Fatal error", "content": error_payload_content},
+    }
+
+    def incr_stats(self, action: str, func_name: str) -> None:
+        """
+        Proxy function for statsd.incr to impose a key structure for REST API's
+        :param action: String with an action name eg: error, success
+        :param func_name: The function name
+        """
+        stats_logger_manager.instance.incr(
+            f"{self.__class__.__name__}.{func_name}.{action}"
+        )
+
+    def log_rejected_field_access(self, func_name: str, column_name: str) -> None:
+        """Emit a security log event when a related/distinct field is rejected.
+
+        The allowlist check itself blocks the request; this records the attempt
+        in the structured log (alongside the existing statsd counter) so that
+        rejected field access is visible to security monitoring and forensics,
+        with the caller's identity, the endpoint, and the attempted value.
+        """
+        # Sanitize the user-supplied column name to a single, bounded token so
+        # it cannot inject newlines or forge extra key=value tokens in the log
+        # line. Restrict to a safe character set (column names are alphanumeric
+        # plus ``_-.``) and replace anything else with ``?``.
+        sanitized_column = "".join(
+            ch if (ch.isalnum() or ch in "_-.") else "?" for ch in str(column_name)
+        )[:200]
+        logger.warning(
+            "Rejected disallowed field access: user_id=%s endpoint=%s.%s column=%s",
+            get_user_id(),
+            self.__class__.__name__,
+            func_name,
+            sanitized_column,
+        )
+
+    def timing_stats(self, action: str, func_name: str, value: float) -> None:
+        """
+        Proxy function for statsd.incr to impose a key structure for REST API's
+        :param action: String with an action name eg: error, success
+        :param func_name: The function name
+        :param value: A float with the time it took for the endpoint to execute
+        """
+        stats_logger_manager.instance.timing(
+            f"{self.__class__.__name__}.{func_name}.{action}", value
+        )
+
+    def send_stats_metrics(
+        self, response: Response, key: str, time_delta: float | None = None
+    ) -> None:
+        """
+        Helper function to handle sending statsd metrics
+        :param response: flask response object, will evaluate if it was an error
+        :param key: The function name
+        :param time_delta: Optional time it took for the endpoint to execute
+        """
+        if 200 <= response.status_code < 400:
+            self.incr_stats("success", key)
+        elif 400 <= response.status_code < 500:
+            self.incr_stats("warning", key)
+        else:
+            self.incr_stats("error", key)
+        if time_delta:
+            self.timing_stats("time", key, time_delta)
+
+
+class BaseSupersetApi(BaseSupersetApiMixin, BaseApi):
+    pass
+
+
+class BaseSupersetModelRestApi(BaseSupersetApiMixin, ModelRestApi):
     """
     Extends FAB's ModelResApi to implement specific superset generic functionality
     """
 
-    csrf_exempt = False
     method_permission_name = {
         "bulk_delete": "delete",
         "data": "list",
@@ -156,7 +449,7 @@ class BaseSupersetModelRestApi(ModelRestApi):
         "viz_types": "list",
     }
 
-    order_rel_fields: Dict[str, Tuple[str, str]] = {}
+    order_rel_fields: dict[str, tuple[str, str]] = {}
     """
     Impose ordering on related fields query::
 
@@ -166,27 +459,33 @@ class BaseSupersetModelRestApi(ModelRestApi):
         }
     """
 
-    related_field_filters: Dict[str, Union[RelatedFieldFilter, str]] = {}
+    base_related_field_filters: dict[str, BaseFilter] = {}
     """
-    Declare the filters for related fields::
+    This is used to specify a base filter for related fields
+    when they are accessed through the '/related/<column_name>' endpoint.
+    When combined with the `related_field_filters` attribute,
+    this filter will be applied in addition to the latest::
+
+        base_related_field_filters = {
+            "<RELATED_FIELD>": "<FILTER>")
+        }
+    """
+
+    related_field_filters: dict[str, RelatedFieldFilter | str] = {}
+    """
+    Specify a filter for related fields when they are accessed
+    through the '/related/<column_name>' endpoint.
+    When combined with the `base_related_field_filters` attribute,
+    this filter will be applied in prior to the latest::
 
         related_fields = {
             "<RELATED_FIELD>": <RelatedFieldFilter>)
         }
     """
-
-    filter_rel_fields: Dict[str, BaseFilter] = {}
-    """
-    Declare the related field base filter::
-
-        filter_rel_fields_field = {
-            "<RELATED_FIELD>": "<FILTER>")
-        }
-    """
-    allowed_rel_fields: Set[str] = set()
+    allowed_rel_fields: set[str] = set()
     # Declare a set of allowed related fields that the `related` endpoint supports.
 
-    text_field_rel_fields: Dict[str, str] = {}
+    text_field_rel_fields: dict[str, str] = {}
     """
     Declare an alternative for the human readable representation of the Model object::
 
@@ -195,63 +494,42 @@ class BaseSupersetModelRestApi(ModelRestApi):
         }
     """
 
-    allowed_distinct_fields: Set[str] = set()
+    extra_fields_rel_fields: dict[str, list[str]] = {}
+    """
+    Declare extra fields for the representation of the Model object::
 
-    openapi_spec_component_schemas: Tuple[Type[Schema], ...] = tuple()
-    # Add extra schemas to the OpenAPI component schemas section.
-    add_columns: List[str]
-    edit_columns: List[str]
-    list_columns: List[str]
-    show_columns: List[str]
+        extra_fields_rel_fields = {
+            "<RELATED_FIELD>": "[<RELATED_OBJECT_FIELD_1>, <RELATED_OBJECT_FIELD_2>]"
+        }
+    """
 
-    responses = {
-        "400": {"description": "Bad request", "content": error_payload_content},
-        "401": {"description": "Unauthorized", "content": error_payload_content},
-        "403": {"description": "Forbidden", "content": error_payload_content},
-        "404": {"description": "Not found", "content": error_payload_content},
-        "422": {
-            "description": "Could not process entity",
-            "content": error_payload_content,
-        },
-        "500": {"description": "Fatal error", "content": error_payload_content},
-    }
+    allowed_distinct_fields: set[str] = set()
+
+    add_columns: list[str]
+    edit_columns: list[str]
+    list_columns: list[str]
+    show_columns: list[str]
 
     def __init__(self) -> None:
-        # Setup statsd
-        self.stats_logger = BaseStatsLogger()
+        super().__init__()
         # Add base API spec base query parameter schemas
         if self.apispec_parameter_schemas is None:  # type: ignore
             self.apispec_parameter_schemas = {}
         self.apispec_parameter_schemas["get_related_schema"] = get_related_schema
-        if self.openapi_spec_component_schemas is None:
-            self.openapi_spec_component_schemas = ()
-        self.openapi_spec_component_schemas = self.openapi_spec_component_schemas + (
-            RelatedResponseSchema,
-            DistincResponseSchema,
+        self.openapi_spec_component_schemas: tuple[type[Schema], ...] = (
+            self.openapi_spec_component_schemas
+            + (
+                RelatedResponseSchema,
+                DistincResponseSchema,
+            )
         )
-        super().__init__()
-
-    def add_apispec_components(self, api_spec: APISpec) -> None:
-        """
-        Adds extra OpenApi schema spec components, these are declared
-        on the `openapi_spec_component_schemas` class property
-        """
-        for schema in self.openapi_spec_component_schemas:
-            try:
-                api_spec.components.schema(
-                    schema.__name__, schema=schema,
-                )
-            except DuplicateComponentNameError:
-                pass
-        super().add_apispec_components(api_spec)
-
-    def create_blueprint(
-        self, appbuilder: AppBuilder, *args: Any, **kwargs: Any
-    ) -> Blueprint:
-        self.stats_logger = self.appbuilder.get_app.config["STATS_LOGGER"]
-        return super().create_blueprint(appbuilder, *args, **kwargs)
 
     def _init_properties(self) -> None:
+        """
+        Lock down initial not configured REST API columns. We want to just expose
+        model ids, if something is misconfigured. By default FAB exposes all available
+        columns on a Model
+        """
         model_id = self.datamodel.get_pk_name()
         if self.list_columns is None and not self.list_model_schema:
             self.list_columns = [model_id]
@@ -263,6 +541,64 @@ class BaseSupersetModelRestApi(ModelRestApi):
             self.add_columns = [model_id]
         super()._init_properties()
 
+    def _get_fields_info(
+        self,
+        cols: list[str],
+        model_schema: Schema,
+        filter_rel_fields: Any,
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        """
+        Describe the add/edit fields exposed by the ``_info`` endpoint.
+
+        Overrides :meth:`flask_appbuilder.api.ModelRestApi._get_fields_info`, which
+        indexes the marshmallow schema with every column in ``add_columns`` /
+        ``edit_columns``. APIs that declare an explicit add/edit schema can list
+        columns the schema does not define (for example a legacy alias handled by a
+        ``pre_load`` hook), and the lookup then fails the whole ``_info`` request with
+        a 500 whenever it is called without a ``keys`` filter. Columns without a
+        schema field cannot be described, so they are skipped.
+
+        :param cols: columns to describe
+        :param model_schema: marshmallow schema used to build the field details
+        :param filter_rel_fields: ``add_query_rel_fields`` or ``edit_query_rel_fields``
+        :param kwargs: rison arguments for related-field pagination
+        :returns: field details for the columns defined by the schema
+        """
+        schema_cols = [col for col in cols if col in model_schema.fields]
+        return super()._get_fields_info(
+            schema_cols, model_schema, filter_rel_fields, **kwargs
+        )
+
+    def _handle_filters_args(self, rison_args: dict[str, Any]) -> Filters:
+        """
+        Build a request-scoped ``Filters`` instance from Rison-encoded args.
+
+        Overrides :meth:`flask_appbuilder.api.ModelRestApi._handle_filters_args`,
+        which mutates ``self._filters`` (a single instance shared across
+        requests on the same API view). Under concurrent traffic that shared
+        state can leak filters from one request into another — e.g. two
+        parallel ``GET /api/v1/<resource>/`` calls filtering by different
+        values can return mixed results.
+
+        Returning a fresh ``Filters`` per call keeps each request isolated.
+        Applies to every subclass of ``BaseSupersetModelRestApi``
+        (datasets, charts, dashboards, saved queries, queries, databases,
+        etc.) — see issue #33828 for the original report on the dataset
+        endpoint.
+
+        :param rison_args: Arguments parsed from the API request's
+            Rison-encoded ``q`` parameter.
+        :returns: A request-scoped ``Filters`` instance joined with the
+            API's base filters.
+        """
+        filters = self.datamodel.get_filters(
+            search_columns=self.search_columns,
+            search_filters=self.search_filters,
+        )
+        filters.rest_add_filters(rison_args.get(API_FILTERS_RIS_KEY, []))
+        return filters.get_joined_filters(self._base_filters)
+
     def _get_related_filter(
         self, datamodel: SQLAInterface, column_name: str, value: str
     ) -> Filters:
@@ -272,8 +608,7 @@ class BaseSupersetModelRestApi(ModelRestApi):
         filter_field = cast(RelatedFieldFilter, filter_field)
         search_columns = [filter_field.field_name] if filter_field else None
         filters = datamodel.get_filters(search_columns)
-        base_filters = self.filter_rel_fields.get(column_name)
-        if base_filters:
+        if base_filters := self.base_related_field_filters.get(column_name):
             filters.add_filter_list(base_filters)
         if value and filter_field:
             filters.add_filter(
@@ -300,13 +635,25 @@ class BaseSupersetModelRestApi(ModelRestApi):
                 return getattr(model, model_column_name)
         return str(model)
 
+    def _get_extra_field_for_model(
+        self, model: Model, column_name: str
+    ) -> dict[str, str]:
+        ret = {}
+        if column_name in self.extra_fields_rel_fields:
+            model_column_names = self.extra_fields_rel_fields.get(column_name)
+            if model_column_names:
+                for key in model_column_names:
+                    ret[key] = getattr(model, key)
+        return ret
+
     def _get_result_from_rows(
-        self, datamodel: SQLAInterface, rows: List[Model], column_name: str
-    ) -> List[Dict[str, Any]]:
+        self, datamodel: SQLAInterface, rows: list[Model], column_name: str
+    ) -> list[dict[str, Any]]:
         return [
             {
                 "value": datamodel.get_pk_value(row),
                 "text": self._get_text_for_model(row, column_name),
+                "extra": self._get_extra_field_for_model(row, column_name),
             }
             for row in rows
         ]
@@ -315,61 +662,31 @@ class BaseSupersetModelRestApi(ModelRestApi):
         self,
         datamodel: SQLAInterface,
         column_name: str,
-        ids: List[int],
-        result: List[Dict[str, Any]],
+        ids: list[int],
+        result: list[dict[str, Any]],
     ) -> None:
         if ids:
             # Filter out already present values on the result
             values = [row["value"] for row in result]
             ids = [id_ for id_ in ids if id_ not in values]
             pk_col = datamodel.get_pk()
-            # Fetch requested values from ids
-            extra_rows = db.session.query(datamodel.obj).filter(pk_col.in_(ids)).all()
+            # Fetch requested values from ids, applying the same scoping as the
+            # unforced query so ``include_ids`` cannot resolve rows the
+            # related-field filters deliberately hide.
+            query = db.session.query(datamodel.obj).filter(pk_col.in_(ids))
+            if base_filters := self.base_related_field_filters.get(column_name):
+                query = datamodel.apply_filters(
+                    query, datamodel.get_filters().add_filter_list(base_filters)
+                )
+            extra_rows = query.all()
             result += self._get_result_from_rows(datamodel, extra_rows, column_name)
-
-    def incr_stats(self, action: str, func_name: str) -> None:
-        """
-        Proxy function for statsd.incr to impose a key structure for REST API's
-
-        :param action: String with an action name eg: error, success
-        :param func_name: The function name
-        """
-        self.stats_logger.incr(f"{self.__class__.__name__}.{func_name}.{action}")
-
-    def timing_stats(self, action: str, func_name: str, value: float) -> None:
-        """
-        Proxy function for statsd.incr to impose a key structure for REST API's
-
-        :param action: String with an action name eg: error, success
-        :param func_name: The function name
-        :param value: A float with the time it took for the endpoint to execute
-        """
-        self.stats_logger.timing(
-            f"{self.__class__.__name__}.{func_name}.{action}", value
-        )
-
-    def send_stats_metrics(
-        self, response: Response, key: str, time_delta: Optional[float] = None
-    ) -> None:
-        """
-        Helper function to handle sending statsd metrics
-
-        :param response: flask response object, will evaluate if it was an error
-        :param key: The function name
-        :param time_delta: Optional time it took for the endpoint to execute
-        """
-        if 200 <= response.status_code < 400:
-            self.incr_stats("success", key)
-        else:
-            self.incr_stats("error", key)
-        if time_delta:
-            self.timing_stats("time", key, time_delta)
 
     @event_logger.log_this_with_context(
         action=lambda self, *args, **kwargs: f"{self.__class__.__name__}.info",
         object_ref=False,
         log_to_statsd=False,
     )
+    @handle_api_exception
     def info_headless(self, **kwargs: Any) -> Response:
         """
         Add statsd metrics to builtin FAB _info endpoint
@@ -383,6 +700,7 @@ class BaseSupersetModelRestApi(ModelRestApi):
         object_ref=False,
         log_to_statsd=False,
     )
+    @handle_api_exception
     def get_headless(self, pk: int, **kwargs: Any) -> Response:
         """
         Add statsd metrics to builtin FAB GET endpoint
@@ -396,6 +714,7 @@ class BaseSupersetModelRestApi(ModelRestApi):
         object_ref=False,
         log_to_statsd=False,
     )
+    @handle_api_exception
     def get_list_headless(self, **kwargs: Any) -> Response:
         """
         Add statsd metrics to builtin FAB GET list endpoint
@@ -409,6 +728,7 @@ class BaseSupersetModelRestApi(ModelRestApi):
         object_ref=False,
         log_to_statsd=False,
     )
+    @handle_api_exception
     def post_headless(self) -> Response:
         """
         Add statsd metrics to builtin FAB POST endpoint
@@ -422,6 +742,7 @@ class BaseSupersetModelRestApi(ModelRestApi):
         object_ref=False,
         log_to_statsd=False,
     )
+    @handle_api_exception
     def put_headless(self, pk: int) -> Response:
         """
         Add statsd metrics to builtin FAB PUT endpoint
@@ -435,6 +756,7 @@ class BaseSupersetModelRestApi(ModelRestApi):
         object_ref=False,
         log_to_statsd=False,
     )
+    @handle_api_exception
     def delete_headless(self, pk: int) -> Response:
         """
         Add statsd metrics to builtin FAB DELETE endpoint
@@ -443,15 +765,25 @@ class BaseSupersetModelRestApi(ModelRestApi):
         self.send_stats_metrics(response, self.delete.__name__, duration)
         return response
 
-    @expose("/related/<column_name>", methods=["GET"])
+    def ensure_access_list_write_access(self, column_name: str) -> Optional[Response]:
+        """Restrict access-list related fields to users with write access."""
+        if column_name in {"editors", "viewers"} and not security_manager.can_access(
+            "can_write", self.class_permission_name
+        ):
+            return self.response_403()
+        return None
+
+    @expose("/related/<column_name>", methods=("GET",))
     @protect()
     @safe
     @statsd_metrics
-    @rison(get_related_schema)
+    @parse_rison(get_related_schema)
+    @handle_api_exception
     def related(self, column_name: str, **kwargs: Any) -> FlaskResponse:
-        """Get related fields data
+        """Get related fields data.
         ---
         get:
+          summary: Get related fields data
           parameters:
           - in: path
             schema:
@@ -475,13 +807,18 @@ class BaseSupersetModelRestApi(ModelRestApi):
               $ref: '#/components/responses/400'
             401:
               $ref: '#/components/responses/401'
+            403:
+              $ref: '#/components/responses/403'
             404:
               $ref: '#/components/responses/404'
             500:
               $ref: '#/components/responses/500'
         """
+        if response := self.ensure_access_list_write_access(column_name):
+            return response
         if column_name not in self.allowed_rel_fields:
             self.incr_stats("error", self.related.__name__)
+            self.log_rejected_field_access(self.related.__name__, column_name)
             return self.response_404()
         args = kwargs.get("rison", {})
 
@@ -499,8 +836,7 @@ class BaseSupersetModelRestApi(ModelRestApi):
             return self.response_404()
         page, page_size = self._sanitize_page_args(page, page_size)
         # handle ordering
-        order_field = self.order_rel_fields.get(column_name)
-        if order_field:
+        if order_field := self.order_rel_fields.get(column_name):
             order_column, order_direction = order_field
         else:
             order_column, order_direction = "", ""
@@ -521,15 +857,17 @@ class BaseSupersetModelRestApi(ModelRestApi):
 
         return self.response(200, count=total_rows, result=result)
 
-    @expose("/distinct/<column_name>", methods=["GET"])
+    @expose("/distinct/<column_name>", methods=("GET",))
     @protect()
     @safe
     @statsd_metrics
-    @rison(get_related_schema)
+    @parse_rison(get_related_schema)
+    @handle_api_exception
     def distinct(self, column_name: str, **kwargs: Any) -> FlaskResponse:
-        """Get distinct values from field data
+        """Get distinct values from field data.
         ---
         get:
+          summary: Get distinct values from field data
           parameters:
           - in: path
             schema:
@@ -559,7 +897,8 @@ class BaseSupersetModelRestApi(ModelRestApi):
               $ref: '#/components/responses/500'
         """
         if column_name not in self.allowed_distinct_fields:
-            self.incr_stats("error", self.related.__name__)
+            self.incr_stats("error", self.distinct.__name__)
+            self.log_rejected_field_access(self.distinct.__name__, column_name)
             return self.response_404()
         args = kwargs.get("rison", {})
         # handle pagination
@@ -567,15 +906,13 @@ class BaseSupersetModelRestApi(ModelRestApi):
         # Create generic base filters with added request filter
         filters = self._get_distinct_filter(column_name, args.get("filter"))
         # Make the query
-        query_count = self.appbuilder.get_session.query(
+        query_count = db.session.query(
             func.count(distinct(getattr(self.datamodel.obj, column_name)))
         )
         count = self.datamodel.apply_filters(query_count, filters).scalar()
         if count == 0:
             return self.response(200, count=count, result=[])
-        query = self.appbuilder.get_session.query(
-            distinct(getattr(self.datamodel.obj, column_name))
-        )
+        query = db.session.query(distinct(getattr(self.datamodel.obj, column_name)))
         # Apply generic base filters with added request filter
         query = self.datamodel.apply_filters(query, filters)
         # Apply sort

@@ -14,34 +14,31 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-import re
-from typing import List, Union
+import builtins
+from typing import Callable, Union
 
-from flask import g, redirect, request, Response
+from flask import current_app, g, redirect, Response, url_for
 from flask_appbuilder import expose
 from flask_appbuilder.actions import action
 from flask_appbuilder.models.sqla.interface import SQLAInterface
 from flask_appbuilder.security.decorators import has_access
-from flask_babel import gettext as __, lazy_gettext as _
+from flask_babel import gettext as __
+from flask_login import AnonymousUserMixin, login_user
 
 from superset import db, event_logger, is_feature_enabled
 from superset.constants import MODEL_VIEW_RW_METHOD_PERMISSION_MAP, RouteMethod
 from superset.models.dashboard import Dashboard as DashboardModel
-from superset.typing import FlaskResponse
-from superset.utils import core as utils
+from superset.superset_typing import FlaskResponse
 from superset.views.base import (
     BaseSupersetView,
-    check_ownership,
+    common_bootstrap_payload,
     DeleteMixin,
-    generate_download_headers,
     SupersetModelView,
 )
 from superset.views.dashboard.mixin import DashboardMixin
 
 
-class DashboardModelView(
-    DashboardMixin, SupersetModelView, DeleteMixin
-):  # pylint: disable=too-many-ancestors
+class DashboardModelView(DashboardMixin, SupersetModelView, DeleteMixin):  # pylint: disable=too-many-ancestors
     route_base = "/dashboard"
     datamodel = SQLAInterface(DashboardModel)
     # TODO disable api_read and api_delete (used by cypress)
@@ -49,7 +46,8 @@ class DashboardModelView(
     class_permission_name = "Dashboard"
     method_permission_name = MODEL_VIEW_RW_METHOD_PERMISSION_MAP
 
-    include_route_methods = RouteMethod.CRUD_SET | {
+    include_route_methods = {
+        RouteMethod.LIST,
         RouteMethod.API_READ,
         RouteMethod.API_DELETE,
         "download_dashboards",
@@ -58,52 +56,16 @@ class DashboardModelView(
     @has_access
     @expose("/list/")
     def list(self) -> FlaskResponse:
-        if not is_feature_enabled("ENABLE_REACT_CRUD_VIEWS"):
-            return super().list()
-
         return super().render_app_template()
 
     @action("mulexport", __("Export"), __("Export dashboards?"), "fa-database")
-    def mulexport(  # pylint: disable=no-self-use
-        self, items: Union["DashboardModelView", List["DashboardModelView"]]
+    def mulexport(
+        self,
+        items: Union["DashboardModelView", builtins.list["DashboardModelView"]],
     ) -> FlaskResponse:
         if not isinstance(items, list):
             items = [items]
-        ids = "".join("&id={}".format(d.id) for d in items)
-        return redirect("/dashboard/export_dashboards_form?{}".format(ids[1:]))
-
-    @event_logger.log_this
-    @has_access
-    @expose("/export_dashboards_form")
-    def download_dashboards(self) -> FlaskResponse:
-        if request.args.get("action") == "go":
-            ids = request.args.getlist("id")
-            return Response(
-                DashboardModel.export_dashboards(ids),
-                headers=generate_download_headers("json"),
-                mimetype="application/text",
-            )
-        return self.render_template(
-            "superset/export_dashboards.html", dashboards_url="/dashboard/list"
-        )
-
-    def pre_add(self, item: "DashboardModelView") -> None:
-        item.slug = item.slug or None
-        if item.slug:
-            item.slug = item.slug.strip()
-            item.slug = item.slug.replace(" ", "-")
-            item.slug = re.sub(r"[^\w\-]+", "", item.slug)
-        if g.user not in item.owners:
-            item.owners.append(g.user)
-        utils.validate_json(item.json_metadata)
-        utils.validate_json(item.position_json)
-        owners = list(item.owners)
-        for slc in item.slices:
-            slc.owners = list(set(owners) | set(slc.owners))
-
-    def pre_update(self, item: "DashboardModelView") -> None:
-        check_ownership(item)
-        self.pre_add(item)
+        return redirect(url_for("DashboardModelView.download_dashboards", id=items))
 
 
 class Dashboard(BaseSupersetView):
@@ -114,36 +76,65 @@ class Dashboard(BaseSupersetView):
 
     @has_access
     @expose("/new/")
-    def new(self) -> FlaskResponse:  # pylint: disable=no-self-use
+    def new(self) -> FlaskResponse:
         """Creates a new, blank dashboard and redirects to it in edit mode"""
+        from superset.subjects.utils import (
+            get_default_viewers_for_new_asset,
+            get_user_subject,
+        )
+
+        editors = []
+        if g.user:
+            subj = get_user_subject(g.user.id)
+            if subj:
+                editors.append(subj)
         new_dashboard = DashboardModel(
-            dashboard_title="[ untitled dashboard ]", owners=[g.user]
+            dashboard_title="[ untitled dashboard ]",
+            editors=editors,
+            viewers=get_default_viewers_for_new_asset(g.user.id if g.user else None),
         )
         db.session.add(new_dashboard)
-        db.session.commit()
-        return redirect(f"/superset/dashboard/{new_dashboard.id}/?edit=true")
+        if after_create := current_app.config.get("AFTER_ASSET_CREATE"):
+            db.session.flush()
+            after_create(new_dashboard, "dashboard")
+        db.session.commit()  # pylint: disable=consider-using-transaction
+        return redirect(
+            url_for(
+                "Superset.dashboard", dashboard_id_or_slug=new_dashboard.id, edit="true"
+            )
+        )
 
+    @expose("/<dashboard_id_or_slug>/embedded")
+    @event_logger.log_this_with_extra_payload
+    def embedded(
+        self,
+        dashboard_id_or_slug: str,
+        add_extra_log_payload: Callable[..., None] = lambda **kwargs: None,
+    ) -> FlaskResponse:
+        """
+        Server side rendering for a dashboard
+        :param dashboard_id_or_slug: identifier for dashboard. used in the decorators
+        :param add_extra_log_payload: added by `log_this_with_manual_updates`, set a
+            default value to appease pylint
+        """
+        if not is_feature_enabled("EMBEDDED_SUPERSET"):
+            return Response(status=404)
 
-class DashboardModelViewAsync(DashboardModelView):  # pylint: disable=too-many-ancestors
-    route_base = "/dashboardasync"
-    class_permission_name = "Dashboard"
-    method_permission_name = MODEL_VIEW_RW_METHOD_PERMISSION_MAP
+        # Log in as an anonymous user, just for this view.
+        # This view needs to be visible to all users,
+        # and building the page fails if g.user and/or ctx.user aren't present.
+        login_user(AnonymousUserMixin(), force=True)
 
-    include_route_methods = {RouteMethod.API_READ}
+        add_extra_log_payload(
+            dashboard_id=dashboard_id_or_slug,
+            dashboard_version="v2",
+        )
 
-    list_columns = [
-        "id",
-        "dashboard_link",
-        "creator",
-        "modified",
-        "dashboard_title",
-        "changed_on",
-        "url",
-        "changed_by_name",
-    ]
-    label_columns = {
-        "dashboard_link": _("Dashboard"),
-        "dashboard_title": _("Title"),
-        "creator": _("Creator"),
-        "modified": _("Modified"),
-    }
+        bootstrap_data = {
+            "common": common_bootstrap_payload(),
+            "embedded": {"dashboard_id": dashboard_id_or_slug},
+        }
+
+        return self.render_app_template(
+            extra_bootstrap_data=bootstrap_data, entry="embedded"
+        )

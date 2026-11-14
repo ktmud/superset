@@ -15,63 +15,99 @@
 # specific language governing permissions and limitations
 # under the License.
 
-import importlib
-import logging
-from typing import Callable, Dict, TYPE_CHECKING
+from __future__ import annotations
 
-from flask import current_app, Flask, request, Response, session
+import logging
+from typing import Any, Callable, TYPE_CHECKING
+from urllib.parse import urlparse
+
+from flask import current_app as app, Flask, request, Response, session
 from flask_login import login_user
-from selenium.webdriver.remote.webdriver import WebDriver
 from werkzeug.http import parse_cookie
 
-from superset.utils.urls import headless_url
+from superset.security.session_invalidation import stamp_login_time
+from superset.utils.class_utils import load_class_from_name
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from flask_appbuilder.security.sqla.models import User
 
+    try:
+        from playwright.sync_api import BrowserContext
+    except ModuleNotFoundError:
+        BrowserContext = Any
+
 
 class MachineAuthProvider:
     def __init__(
-        self, auth_webdriver_func_override: Callable[[WebDriver, "User"], WebDriver]
+        self,
+        auth_webdriver_func_override: Callable[[BrowserContext, User], BrowserContext]
+        | None = None,
     ):
-        # This is here in order to allow for the authenticate_webdriver func to be
-        # overridden via config, as opposed to the entire provider implementation
+        # This is here in order to allow for the authenticate_browser_context
+        # func to be overridden via config, as opposed to the entire
+        # provider implementation
         self._auth_webdriver_func_override = auth_webdriver_func_override
 
-    def authenticate_webdriver(self, driver: WebDriver, user: "User",) -> WebDriver:
-        """
-            Default AuthDriverFuncType type that sets a session cookie flask-login style
-            :return: The WebDriver passed in (fluent)
-        """
+    def authenticate_browser_context(
+        self,
+        browser_context: BrowserContext,
+        user: User,
+    ) -> BrowserContext:
         # Short-circuit this method if we have an override configured
         if self._auth_webdriver_func_override:
-            return self._auth_webdriver_func_override(driver, user)
+            return self._auth_webdriver_func_override(browser_context, user)
 
-        # Setting cookies requires doing a request first
-        driver.get(headless_url("/login/"))
+        url = urlparse(app.config["WEBDRIVER_BASEURL"])
 
+        # No navigation is needed before setting cookies: unlike Selenium's
+        # driver.add_cookie(), BrowserContext.add_cookies() takes the domain
+        # directly. Priming with a page load on /login/ used to leave that page
+        # open on the shared cookie jar, and any late response from it carrying
+        # an anonymous "Set-Cookie: session=..." could overwrite the cookie
+        # injected below, silently deauthenticating the whole context.
+        cookies = self.get_cookies(user)
+
+        browser_context.clear_cookies()
+        browser_context.add_cookies(
+            [
+                {
+                    "name": cookie_name,
+                    "value": cookie_val,
+                    "domain": url.netloc,
+                    "path": "/",
+                    "sameSite": "Lax",
+                    "httpOnly": True,
+                }
+                for cookie_name, cookie_val in cookies.items()
+            ]
+        )
+        return browser_context
+
+    def get_cookies(self, user: User | None) -> dict[str, str]:
         if user:
             cookies = self.get_auth_cookies(user)
         elif request.cookies:
             cookies = request.cookies
         else:
             cookies = {}
-
-        for cookie_name, cookie_val in cookies.items():
-            driver.add_cookie(dict(name=cookie_name, value=cookie_val))
-
-        return driver
+        return cookies
 
     @staticmethod
-    def get_auth_cookies(user: "User") -> Dict[str, str]:
+    def get_auth_cookies(user: User) -> dict[str, str]:
         # Login with the user specified to get the reports
-        with current_app.test_request_context("/login"):
-            login_user(user)
+        with app.test_request_context("/login"):
+            # enforce_session_validity treats a session with no login time as older
+            # than the user's invalidation epoch (e.g. after a password change), so
+            # stamp a successful login like a normal one. Inactive users stay out.
+            if login_user(user):
+                stamp_login_time()
             # A mock response object to get the cookie information from
             response = Response()
-            current_app.session_interface.save_session(current_app, session, response)
+            # To ensure all `after_request` functions are called i.e Websockets JWT Auth
+            app.process_response(response)
+            app.session_interface.save_session(app, session, response)
 
         cookies = {}
 
@@ -91,21 +127,12 @@ class MachineAuthProvider:
 
 class MachineAuthProviderFactory:
     def __init__(self) -> None:
-        self._auth_provider = None
+        self._auth_provider: MachineAuthProvider | None = None
 
     def init_app(self, app: Flask) -> None:
-        auth_provider_fqclass = app.config["MACHINE_AUTH_PROVIDER_CLASS"]
-        auth_provider_classname = auth_provider_fqclass[
-            auth_provider_fqclass.rfind(".") + 1 :
-        ]
-        auth_provider_module_name = auth_provider_fqclass[
-            0 : auth_provider_fqclass.rfind(".")
-        ]
-        auth_provider_class = getattr(
-            importlib.import_module(auth_provider_module_name), auth_provider_classname
-        )
-
-        self._auth_provider = auth_provider_class(app.config["WEBDRIVER_AUTH_FUNC"])
+        self._auth_provider = load_class_from_name(
+            app.config["MACHINE_AUTH_PROVIDER_CLASS"]
+        )(app.config["WEBDRIVER_AUTH_FUNC"])
 
     @property
     def instance(self) -> MachineAuthProvider:

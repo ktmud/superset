@@ -14,17 +14,40 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-from typing import Any
+from typing import Any, ClassVar
 
+from flask import current_app
 from flask_babel import lazy_gettext as _
-from sqlalchemy import or_
+from sqlalchemy import and_, false, or_
+from sqlalchemy.orm import aliased
 from sqlalchemy.orm.query import Query
+from sqlalchemy.sql.elements import ColumnElement
 
-from superset import security_manager
+from superset import db, security_manager
+from superset.connectors.sqla import models
 from superset.connectors.sqla.models import SqlaTable
+from superset.models.core import FavStar
 from superset.models.slice import Slice
+from superset.semantic_layers.models import SemanticLayer, SemanticView
+from superset.subjects.filters import (
+    EditableFilter,
+    subject_relation_exists_for_current_user,
+)
+from superset.subjects.models import chart_editors
+from superset.tags.filters import BaseTagIdFilter, BaseTagNameFilter
+from superset.utils.core import get_user_id
+from superset.utils.filters import (
+    apply_extra_access_exclusions,
+    get_dataset_access_filters,
+    guest_embedded_dashboard_filter,
+    semantic_layer_grant_clause,
+    semantic_view_layer_join,
+    semantic_view_slice_join,
+    table_backed_slice_join,
+)
 from superset.views.base import BaseFilter
 from superset.views.base_api import BaseFavoriteFilter
+from superset.views.filters import BaseDeletedRecencyFilter, BaseDeletedStateFilter
 
 
 class ChartAllTextFilter(BaseFilter):  # pylint: disable=too-few-public-methods
@@ -45,6 +68,44 @@ class ChartAllTextFilter(BaseFilter):  # pylint: disable=too-few-public-methods
         )
 
 
+class ChartDatasourceFilter(BaseFilter):  # pylint: disable=too-few-public-methods
+    """Match a chart's datasource by both type and ID."""
+
+    name: ClassVar[str] = _("Datasource")
+    arg_name: ClassVar[str] = "chart_datasource"
+
+    def apply(self, query: Query, value: object) -> Query:
+        """Keep malformed identities from widening the chart list."""
+        # Saved Charts URLs used integer dataset IDs before typed identities.
+        if isinstance(value, int) and not isinstance(value, bool):
+            value = f"{value}__table"
+        if not isinstance(value, str):
+            return query.filter(false())
+
+        parts: list[str] = value.split("__")
+        if (
+            len(parts) != 2
+            or parts[1] not in {"table", "semantic_view"}
+            or not parts[0].isascii()
+            or not parts[0].isdigit()
+        ):
+            return query.filter(false())
+
+        try:
+            datasource_id: int = int(parts[0])
+        except ValueError:
+            return query.filter(false())
+        if datasource_id > 2**63 - 1:
+            return query.filter(false())
+
+        return query.filter(
+            and_(
+                self.model.datasource_id == datasource_id,
+                self.model.datasource_type == parts[1],
+            )
+        )
+
+
 class ChartFavoriteFilter(BaseFavoriteFilter):  # pylint: disable=too-few-public-methods
     """
     Custom filter for the GET list that filters all charts that a user has favored
@@ -55,12 +116,238 @@ class ChartFavoriteFilter(BaseFavoriteFilter):  # pylint: disable=too-few-public
     model = Slice
 
 
+class ChartTagNameFilter(BaseTagNameFilter):  # pylint: disable=too-few-public-methods
+    """
+    Custom filter for the GET list that filters all charts associated with
+    a certain tag (by its name).
+    """
+
+    arg_name = "chart_tags"
+    class_name = "slice"
+    model = Slice
+
+
+class ChartTagIdFilter(BaseTagIdFilter):  # pylint: disable=too-few-public-methods
+    """
+    Custom filter for the GET list that filters all charts associated with
+    a certain tag (by its ID).
+    """
+
+    arg_name = "chart_tag_id"
+    class_name = "slice"
+    model = Slice
+
+
+class ChartCertifiedFilter(BaseFilter):  # pylint: disable=too-few-public-methods
+    """
+    Custom filter for the GET list that filters all certified charts
+    """
+
+    name = _("Is certified")
+    arg_name = "chart_is_certified"
+
+    def apply(self, query: Query, value: Any) -> Query:
+        if value is True:
+            return query.filter(and_(Slice.certified_by.isnot(None)))
+        if value is False:
+            return query.filter(and_(Slice.certified_by.is_(None)))
+        return query
+
+
 class ChartFilter(BaseFilter):  # pylint: disable=too-few-public-methods
     def apply(self, query: Query, value: Any) -> Query:
+        # Embedded guests are scoped to their token's dashboards first. A guest
+        # is never entitled to all charts, regardless of what its role grants,
+        # and an empty token scope denies all charts (a deny-all clause).
+        if (guest_dashboards := guest_embedded_dashboard_filter()) is not None:
+            return query.filter(self.model.dashboards.any(guest_dashboards))
+
+        # Applied before the short-circuit below: an exclusion has to hold for
+        # principals who can reach every dataset, since those are exactly the
+        # ones the role paths stop narrowing. Guests are excepted above --
+        # their token already scopes them, and withholding here would strip
+        # charts from a dashboard they were legitimately granted.
+        query = apply_extra_access_exclusions(query, "charts", Slice.id)
+
         if security_manager.can_access_all_datasources():
             return query
-        perms = security_manager.user_view_menu_names("datasource_access")
-        schema_perms = security_manager.user_view_menu_names("schema_access")
-        return query.filter(
-            or_(self.model.perm.in_(perms), self.model.schema_perm.in_(schema_perms))
+
+        return self._apply_viewers(query)
+
+    def _apply_viewers(self, query: Query) -> Query:
+        from superset.subjects.models import chart_editors, chart_viewers
+        from superset.subjects.utils import get_user_subject_ids_subquery
+
+        user_id = get_user_id()
+        subject_subquery = get_user_subject_ids_subquery(user_id) if user_id else None
+
+        filters: list[Any] = []
+
+        # (A) Editor query: editors see all their charts
+        if subject_subquery is not None:
+            editor_query = (
+                db.session.query(Slice.id)
+                .join(chart_editors, Slice.id == chart_editors.c.chart_id)
+                .filter(chart_editors.c.subject_id.in_(subject_subquery))
+            )
+            filters.append(Slice.id.in_(editor_query))
+
+        # (B) Viewer query: viewers see their charts
+        if subject_subquery is not None:
+            viewer_query = (
+                db.session.query(Slice.id)
+                .join(chart_viewers, Slice.id == chart_viewers.c.chart_id)
+                .filter(chart_viewers.c.subject_id.in_(subject_subquery))
+            )
+            filters.append(Slice.id.in_(viewer_query))
+
+        # (C) No-viewer fallback: charts with no viewers → dataset-based access
+        layer_grant_clause: "ColumnElement[bool]" = semantic_layer_grant_clause()
+        chart_has_viewers = Slice.viewers.any()
+        table_alias = aliased(SqlaTable)
+        no_viewer_query = (
+            db.session.query(Slice.id)
+            # Type-aware datasource joins (mirroring DashboardAccessFilter):
+            # the SqlaTable join is constrained to table-backed charts (an
+            # unconstrained id join can bind a semantic-view chart to an
+            # unrelated table sharing its numeric id) and kept outer so
+            # charts on other datasource types survive into the access
+            # filter — their access matches through the perm columns
+            # denormalized onto Slice by ``set_related_perm``. Deleting or
+            # purging a table dataset clears its charts' denormalized perm
+            # columns, so a surviving schema/catalog grant cannot list such
+            # an orphan; the datasource-based object gate denies it too.
+            .join(table_alias, table_backed_slice_join(table_alias), isouter=True)
+            .join(
+                models.Database,
+                table_alias.database_id == models.Database.id,
+                isouter=True,
+            )
+            # A layer-level grant covers the layer's views (sc-119501) —
+            # list those charts too, through the same type-guarded
+            # outer-join shape as the SqlaTable join.
+            .join(SemanticView, semantic_view_slice_join(), isouter=True)
+            .join(SemanticLayer, semantic_view_layer_join(), isouter=True)
+            .filter(
+                and_(
+                    ~chart_has_viewers,
+                    # No include_all here: ``apply`` already returned the
+                    # unfiltered query for all_datasource_access holders
+                    # before this fallback runs (unlike the dashboard
+                    # filter, which needs the flag for chart-less rows).
+                    get_dataset_access_filters(Slice, layer_grant_clause),
+                )
+            )
         )
+        filters.append(Slice.id.in_(no_viewer_query))
+
+        extra_filters = current_app.config.get("EXTRA_ACCESS_QUERY_FILTERS", {})
+        if extra_charts_filter := extra_filters.get("charts"):
+            user_id = get_user_id()
+            if user_id:
+                filters.append(Slice.id.in_(extra_charts_filter(user_id)))
+
+        return query.filter(or_(*filters)) if filters else query
+
+
+class ChartEditableFilter(EditableFilter):  # pylint: disable=too-few-public-methods
+    """Filter for charts the user can edit."""
+
+    model = Slice
+    editors_table = chart_editors
+    editors_fk_column = "chart_id"
+
+
+class ChartHasCreatedByFilter(BaseFilter):  # pylint: disable=too-few-public-methods
+    """
+    Custom filter for the GET list that filters all charts created by user
+    """
+
+    name = _("Has created by")
+    arg_name = "chart_has_created_by"
+
+    def apply(self, query: Query, value: Any) -> Query:
+        if value is True:
+            return query.filter(and_(Slice.created_by_fk.isnot(None)))
+        if value is False:
+            return query.filter(and_(Slice.created_by_fk.is_(None)))
+        return query
+
+
+class ChartCreatedByMeFilter(BaseFilter):  # pylint: disable=too-few-public-methods
+    name = _("Created by me")
+    arg_name = "chart_created_by_me"
+
+    def apply(self, query: Query, value: Any) -> Query:
+        return query.filter(
+            or_(
+                Slice.created_by_fk  # pylint: disable=comparison-with-callable
+                == get_user_id(),
+                Slice.changed_by_fk  # pylint: disable=comparison-with-callable
+                == get_user_id(),
+            )
+        )
+
+
+class ChartOwnedCreatedFavoredByMeFilter(BaseFilter):  # pylint: disable=too-few-public-methods
+    """
+    Custom filter for the GET chart that filters all charts the user
+    owns, created, changed or favored.
+    """
+
+    name = _("Owned Created or Favored")
+    arg_name = "chart_owned_created_favored_by_me"
+
+    def apply(self, query: Query, value: Any) -> Query:
+        # If anonymous user filter nothing
+        if security_manager.current_user is None:
+            return query
+
+        from superset.subjects.models import chart_editors
+
+        editor_ids_query = db.session.query(chart_editors.c.chart_id).filter(
+            subject_relation_exists_for_current_user(chart_editors)
+        )
+
+        return query.join(
+            FavStar,
+            and_(
+                FavStar.user_id == get_user_id(),
+                FavStar.class_name == "slice",
+                Slice.id == FavStar.obj_id,
+            ),
+            isouter=True,
+        ).filter(
+            # pylint: disable=comparison-with-callable
+            or_(
+                Slice.id.in_(editor_ids_query),
+                Slice.created_by_fk == get_user_id(),
+                Slice.changed_by_fk == get_user_id(),
+                FavStar.user_id == get_user_id(),
+            )
+        )
+
+
+class ChartDeletedRecencyFilter(  # pylint: disable=too-few-public-methods
+    BaseDeletedRecencyFilter
+):
+    """Archive time-range preset: rows archived within the last N days."""
+
+    arg_name = "chart_deleted_recency"
+
+
+class ChartDeletedStateFilter(  # pylint: disable=too-few-public-methods
+    BaseDeletedStateFilter
+):
+    """Rison filter for the GET list that exposes soft-deleted charts.
+
+    Restore-audience scoping (only editors and admins may enumerate
+    soft-deleted rows) is applied by ``BaseDeletedStateFilter``, and the
+    base's rule must stay the only implementation: stacking a second,
+    semantically identical editors predicate here would mean a future
+    audience change lands in one copy and charts silently enforce the
+    intersection of old and new.
+    """
+
+    arg_name = "chart_deleted_state"
+    model = Slice

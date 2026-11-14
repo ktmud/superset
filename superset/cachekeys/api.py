@@ -25,8 +25,8 @@ from marshmallow.exceptions import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from superset.cachekeys.schemas import CacheInvalidationRequestSchema
-from superset.connectors.connector_registry import ConnectorRegistry
-from superset.extensions import cache_manager, db, event_logger
+from superset.connectors.sqla.models import SqlaTable
+from superset.extensions import cache_manager, db, event_logger, stats_logger_manager
 from superset.models.cache import CacheKey
 from superset.views.base_api import BaseSupersetModelRestApi, statsd_metrics
 
@@ -44,21 +44,21 @@ class CacheRestApi(BaseSupersetModelRestApi):
 
     openapi_spec_component_schemas = (CacheInvalidationRequestSchema,)
 
-    @expose("/invalidate", methods=["POST"])
+    @expose("/invalidate", methods=("POST",))
     @protect()
     @safe
     @statsd_metrics
     @event_logger.log_this_with_context(log_to_statsd=False)
     def invalidate(self) -> Response:
         """
-        Takes a list of datasources, finds the associated cache records and
-        invalidates them and removes the database records
-
+        Take a list of datasources, find and invalidate the associated cache records
+        and remove the database records.
         ---
         post:
+          summary: Invalidate cache records and remove the database records
           description: >-
-            Takes a list of datasources, finds the associated cache records and
-            invalidates them and removes the database records
+            Takes a list of datasources, finds and invalidates the associated cache
+            records and removes the database records.
           requestBody:
             description: >-
               A list of datasources uuid or the tuples of database and datasource names
@@ -83,13 +83,13 @@ class CacheRestApi(BaseSupersetModelRestApi):
             return self.response_400(message=str(error))
         datasource_uids = set(datasources.get("datasource_uids", []))
         for ds in datasources.get("datasources", []):
-            ds_obj = ConnectorRegistry.get_datasource_by_name(
-                session=db.session,
-                datasource_type=ds.get("datasource_type"),
+            ds_obj = SqlaTable.get_datasource_by_name(
                 datasource_name=ds.get("datasource_name"),
+                catalog=ds.get("catalog"),
                 schema=ds.get("schema"),
                 database_name=ds.get("database_name"),
             )
+
             if ds_obj:
                 datasource_uids.add(ds_obj.uid)
 
@@ -100,7 +100,10 @@ class CacheRestApi(BaseSupersetModelRestApi):
         )
         cache_keys = [c.cache_key for c in cache_key_objs]
         if cache_key_objs:
-            all_keys_deleted = cache_manager.cache.delete_many(*cache_keys)
+            # Chart query results live in ``data_cache``, not the default
+            # ``cache`` — using the wrong backend silently misses the Redis
+            # keys when ``CACHE_KEY_PREFIX`` differs between the two configs.
+            all_keys_deleted = cache_manager.data_cache.delete_many(*cache_keys)
 
             if not all_keys_deleted:
                 # expected behavior as keys may expire and cache is not a
@@ -113,17 +116,20 @@ class CacheRestApi(BaseSupersetModelRestApi):
                 delete_stmt = CacheKey.__table__.delete().where(  # pylint: disable=no-member
                     CacheKey.cache_key.in_(cache_keys)
                 )
+
                 db.session.execute(delete_stmt)
-                db.session.commit()
-                self.stats_logger.gauge("invalidated_cache", len(cache_keys))
+                db.session.commit()  # pylint: disable=consider-using-transaction
+
+                stats_logger_manager.instance.gauge(
+                    "invalidated_cache", len(cache_keys)
+                )
                 logger.info(
                     "Invalidated %s cache records for %s datasources",
                     len(cache_keys),
                     len(datasource_uids),
                 )
             except SQLAlchemyError as ex:  # pragma: no cover
+                db.session.rollback()  # pylint: disable=consider-using-transaction
                 logger.error(ex, exc_info=True)
-                db.session.rollback()
                 return self.response_500(str(ex))
-            db.session.commit()
         return self.response(201)

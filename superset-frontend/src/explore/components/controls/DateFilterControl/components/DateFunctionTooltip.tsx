@@ -16,10 +16,10 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React from 'react';
-import { useTheme, t } from '@superset-ui/core';
+import { t } from '@apache-superset/core/translation';
+import { useTheme } from '@apache-superset/core/theme';
 
-import { Tooltip } from 'src/components/Tooltip';
+import { Tooltip } from '@superset-ui/core/components';
 import { ClassNames } from '@emotion/react';
 
 const TIME_PICKER_HELPER = (
@@ -62,7 +62,7 @@ dateadd(datetime("2020-03-01"), 2, day)`}</code>
       <h4>{t('Syntax')}</h4>
       <pre>
         <code>{`datetrunc([datetime], [dateunit])
-dateunit = (year | month | week)`}</code>
+dateunit = (year | quarter | month | week)`}</code>
       </pre>
       <h4>{t('Example')}</h4>
       <pre>
@@ -85,12 +85,13 @@ dateunit = (year | month | week)`}</code>
     </div>
     <div>
       <h3>HOLIDAY</h3>
-      <p>{t('Get the specify date for the holiday')}</p>
+      <p>{t('Get the specified date for the holiday')}</p>
       <h4>{t('Syntax')}</h4>
       <pre>
         <code>{`holiday([string])
 holiday([holiday string], [datetime])
-holiday([holiday string], [datetime], [country name])`}</code>
+holiday([holiday string], [country code])
+holiday([holiday string], [datetime], [country code])`}</code>
       </pre>
       <h4>{t('Example')}</h4>
       <pre>
@@ -98,6 +99,7 @@ holiday([holiday string], [datetime], [country name])`}</code>
 holiday("christmas", datetime("2019"))
 holiday("christmas", dateadd(datetime("2019"), 1, year))
 holiday("christmas", datetime("2 years ago"))
+holiday("Boxing Day", "UK")
 holiday("Easter Monday", datetime("2019"), "UK")`}</code>
       </pre>
     </div>
@@ -111,27 +113,25 @@ const StyledTooltip = (props: any) => {
       {({ css }) => (
         <Tooltip
           overlayClassName={css`
-            .ant-tooltip-content {
-              min-width: ${theme.gridUnit * 125}px;
+            .ant-tooltip-container {
+              min-width: ${theme.sizeUnit * 125}px;
+              max-width: ${theme.sizeUnit * 125}px;
               max-height: 410px;
               overflow-y: scroll;
 
-              .ant-tooltip-inner {
-                max-width: ${theme.gridUnit * 125}px;
-                h3 {
-                  font-size: ${theme.typography.sizes.m}px;
-                  font-weight: ${theme.typography.weights.bold};
-                }
-                h4 {
-                  font-size: ${theme.typography.sizes.m}px;
-                  font-weight: ${theme.typography.weights.bold};
-                }
-                pre {
-                  border: none;
-                  text-align: left;
-                  word-break: break-word;
-                  font-size: ${theme.typography.sizes.s}px;
-                }
+              h3 {
+                font-size: ${theme.fontSize}px;
+                font-weight: ${theme.fontWeightStrong};
+              }
+              h4 {
+                font-size: ${theme.fontSize}px;
+                font-weight: ${theme.fontWeightStrong};
+              }
+              pre {
+                border: none;
+                text-align: left;
+                word-break: break-word;
+                font-size: ${theme.fontSizeSM}px;
               }
             }
           `}

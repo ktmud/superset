@@ -16,8 +16,13 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import { GenericDataType } from '@superset-ui/core';
-import { DEFAULT_FORM_DATA, PluginFilterSelectChartProps } from './types';
+import { GenericDataType } from '@apache-superset/core/common';
+import { noOp } from 'src/utils/common';
+import {
+  DEFAULT_FORM_DATA,
+  PluginFilterSelectChartProps,
+  PluginFilterSelectQueryFormData,
+} from './types';
 
 export default function transformProps(
   chartProps: PluginFilterSelectChartProps,
@@ -28,16 +33,26 @@ export default function transformProps(
     hooks,
     queriesData,
     width,
+    displaySettings,
     behaviors,
     appSection,
     filterState,
     isRefreshing,
+    inputRef,
   } = chartProps;
-  const newFormData = { ...DEFAULT_FORM_DATA, ...formData };
+  const newFormData = {
+    ...DEFAULT_FORM_DATA,
+    ...(formData as PluginFilterSelectQueryFormData),
+  };
   const {
-    setDataMask = () => {},
-    setFocusedFilter = () => {},
-    unsetFocusedFilter = () => {},
+    setDataMask = noOp,
+    setHoveredFilter = noOp,
+    unsetHoveredFilter = noOp,
+    setFocusedFilter = noOp,
+    unsetFocusedFilter = noOp,
+    setFilterActive = noOp,
+    clearAllTrigger,
+    onClearAllComplete,
   } = hooks;
   const [queryData] = queriesData;
   const { colnames = [], coltypes = [], data = [] } = queryData || {};
@@ -57,7 +72,15 @@ export default function transformProps(
     formData: newFormData,
     isRefreshing,
     setDataMask,
+    setHoveredFilter,
+    unsetHoveredFilter,
     setFocusedFilter,
     unsetFocusedFilter,
+    setFilterActive,
+    inputRef,
+    filterBarOrientation: displaySettings?.filterBarOrientation,
+    isOverflowingFilterBar: displaySettings?.isOverflowingFilterBar,
+    clearAllTrigger,
+    onClearAllComplete,
   };
 }

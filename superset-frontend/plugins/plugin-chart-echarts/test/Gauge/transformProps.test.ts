@@ -1,0 +1,896 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import {
+  CategoricalColorNamespace,
+  CategoricalColorScale,
+  ChartProps,
+  SqlaFormData,
+  VizType,
+} from '@superset-ui/core';
+import { supersetTheme } from '@apache-superset/core/theme';
+import transformProps, {
+  getIntervalBoundsAndColors,
+} from '../../src/Gauge/transformProps';
+import { EchartsGaugeChartProps } from '../../src/Gauge/types';
+
+describe('Echarts Gauge transformProps', () => {
+  const baseFormData: SqlaFormData = {
+    datasource: '26__table',
+    viz_type: VizType.Gauge,
+    metric: 'count',
+    adhocFilters: [],
+    rowLimit: 10,
+    minVal: 0,
+    maxVal: 100,
+    startAngle: 225,
+    endAngle: -45,
+    colorScheme: 'SUPERSET_DEFAULT',
+    fontSize: 14,
+    numberFormat: 'SMART_NUMBER',
+    valueFormatter: '{value}',
+    showPointer: true,
+    animation: true,
+    showAxisTick: false,
+    showSplitLine: false,
+    splitNumber: 10,
+    showProgress: true,
+    overlap: true,
+    roundCap: false,
+  };
+
+  test('should transform chart props for no group by column', () => {
+    const formData: SqlaFormData = { ...baseFormData, groupby: [] };
+    const queriesData = [
+      {
+        colnames: ['count'],
+        data: [
+          {
+            count: 16595,
+          },
+        ],
+      },
+    ];
+
+    const chartPropsConfig = {
+      formData,
+      width: 800,
+      height: 600,
+      queriesData,
+      theme: supersetTheme,
+    };
+
+    const chartProps = new ChartProps(chartPropsConfig);
+    const result = transformProps(chartProps as EchartsGaugeChartProps);
+
+    // Test core properties
+    expect(result.width).toBe(800);
+    expect(result.height).toBe(600);
+
+    // Test series data
+    const seriesData = (result.echartOptions as any).series[0].data;
+    expect(seriesData).toHaveLength(1);
+    expect(seriesData[0].value).toBe(16595);
+    expect(seriesData[0].name).toBe('');
+    expect(seriesData[0].itemStyle.color).toBe('#1f77b4');
+
+    // Test detail and title positions
+    expect(seriesData[0].title.offsetCenter).toEqual(['0%', '20%']);
+    expect(seriesData[0].title.fontSize).toBe(14);
+    expect(seriesData[0].detail.offsetCenter).toEqual(['0%', '32.6%']);
+    expect(seriesData[0].detail.fontSize).toBe(16.8);
+  });
+
+  test('should transform chart props for single group by column', () => {
+    const formData: SqlaFormData = {
+      ...baseFormData,
+      groupby: ['year'],
+    };
+    const queriesData = [
+      {
+        colnames: ['year', 'count'],
+        data: [
+          {
+            year: 1988,
+            count: 15,
+          },
+          {
+            year: 1995,
+            count: 219,
+          },
+        ],
+      },
+    ];
+
+    const chartPropsConfig = {
+      formData,
+      width: 800,
+      height: 600,
+      queriesData,
+      theme: supersetTheme,
+    };
+
+    const chartProps = new ChartProps(chartPropsConfig);
+    const result = transformProps(chartProps as EchartsGaugeChartProps);
+
+    // Test core properties
+    expect(result.width).toBe(800);
+    expect(result.height).toBe(600);
+
+    // Test series data
+    const seriesData = (result.echartOptions as any).series[0].data;
+    expect(seriesData).toHaveLength(2);
+
+    // First data point
+    expect(seriesData[0].value).toBe(15);
+    expect(seriesData[0].name).toBe('year: 1988');
+    expect(seriesData[0].itemStyle.color).toBe('#1f77b4');
+    expect(seriesData[0].title.offsetCenter).toEqual(['0%', '20%']);
+    expect(seriesData[0].title.fontSize).toBe(14);
+    expect(seriesData[0].detail.offsetCenter).toEqual(['0%', '32.6%']);
+    expect(seriesData[0].detail.fontSize).toBe(16.8);
+
+    // Second data point
+    expect(seriesData[1].value).toBe(219);
+    expect(seriesData[1].name).toBe('year: 1995');
+    expect(seriesData[1].itemStyle.color).toBe('#ff7f0e');
+    expect(seriesData[1].title.offsetCenter).toEqual(['0%', '48%']);
+    expect(seriesData[1].title.fontSize).toBe(14);
+    expect(seriesData[1].detail.offsetCenter).toEqual(['0%', '60.6%']);
+    expect(seriesData[1].detail.fontSize).toBe(16.8);
+  });
+
+  test('should transform chart props for multiple group by columns', () => {
+    const formData: SqlaFormData = {
+      ...baseFormData,
+      groupby: ['year', 'platform'],
+    };
+    const queriesData = [
+      {
+        colnames: ['year', 'platform', 'count'],
+        data: [
+          {
+            year: 2011,
+            platform: 'PC',
+            count: 140,
+          },
+          {
+            year: 2008,
+            platform: 'PC',
+            count: 76,
+          },
+        ],
+      },
+    ];
+
+    const chartPropsConfig = {
+      formData,
+      width: 800,
+      height: 600,
+      queriesData,
+      theme: supersetTheme,
+    };
+
+    const chartProps = new ChartProps(chartPropsConfig);
+    const result = transformProps(chartProps as EchartsGaugeChartProps);
+
+    // Test core properties
+    expect(result.width).toBe(800);
+    expect(result.height).toBe(600);
+
+    // Test series data
+    const seriesData = (result.echartOptions as any).series[0].data;
+    expect(seriesData).toHaveLength(2);
+
+    // First data point
+    expect(seriesData[0].value).toBe(140);
+    expect(seriesData[0].name).toBe('year: 2011, platform: PC');
+    expect(seriesData[0].itemStyle.color).toBe('#1f77b4');
+    expect(seriesData[0].title.offsetCenter).toEqual(['0%', '20%']);
+    expect(seriesData[0].title.fontSize).toBe(14);
+    expect(seriesData[0].detail.offsetCenter).toEqual(['0%', '32.6%']);
+    expect(seriesData[0].detail.fontSize).toBe(16.8);
+
+    // Second data point
+    expect(seriesData[1].value).toBe(76);
+    expect(seriesData[1].name).toBe('year: 2008, platform: PC');
+    expect(seriesData[1].itemStyle.color).toBe('#ff7f0e');
+    expect(seriesData[1].title.offsetCenter).toEqual(['0%', '48%']);
+    expect(seriesData[1].title.fontSize).toBe(14);
+    expect(seriesData[1].detail.offsetCenter).toEqual(['0%', '60.6%']);
+    expect(seriesData[1].detail.fontSize).toBe(16.8);
+  });
+
+  test('should transform chart props for intervals', () => {
+    const formData: SqlaFormData = {
+      ...baseFormData,
+      groupby: ['year', 'platform'],
+      intervals: '60,100',
+      intervalColorIndices: '1,2',
+      minVal: 20,
+    };
+    const queriesData = [
+      {
+        colnames: ['year', 'platform', 'count'],
+        data: [
+          {
+            year: 2011,
+            platform: 'PC',
+            count: 140,
+          },
+          {
+            year: 2008,
+            platform: 'PC',
+            count: 76,
+          },
+        ],
+      },
+    ];
+
+    const chartPropsConfig = {
+      formData,
+      width: 800,
+      height: 600,
+      queriesData,
+      theme: supersetTheme,
+    };
+
+    const chartProps = new ChartProps(chartPropsConfig);
+    const result = transformProps(chartProps as EchartsGaugeChartProps);
+
+    // Test core properties
+    expect(result.width).toBe(800);
+    expect(result.height).toBe(600);
+
+    // Test axisLine intervals
+    const { axisLine } = (result.echartOptions as any).series[0];
+    expect(axisLine.roundCap).toBe(false);
+    expect(axisLine.lineStyle.width).toBe(14);
+    expect(axisLine.lineStyle.color).toEqual([
+      [0.5, '#1f77b4'],
+      [1, '#ff7f0e'],
+    ]);
+
+    // Test series data
+    const seriesData = (result.echartOptions.series as any)[0].data;
+    expect(seriesData).toHaveLength(2);
+
+    // First data point
+    expect(seriesData[0].value).toBe(140);
+    expect(seriesData[0].name).toBe('year: 2011, platform: PC');
+    expect(seriesData[0].itemStyle.color).toBe('#1f77b4');
+
+    // Second data point
+    expect(seriesData[1].value).toBe(76);
+    expect(seriesData[1].name).toBe('year: 2008, platform: PC');
+    expect(seriesData[1].itemStyle.color).toBe('#ff7f0e');
+  });
+
+  test('should use interval_colors (real hex values) instead of legacy interval_color_indices when present', () => {
+    const formData: SqlaFormData = {
+      ...baseFormData,
+      groupby: ['year', 'platform'],
+      intervals: '60,100',
+      // Legacy field is intentionally still set to verify the new field
+      // takes precedence rather than requiring the old one to be cleared.
+      intervalColorIndices: '1,2',
+      intervalColors: ['#ff0000', '#00ff00'],
+      minVal: 20,
+    };
+    const queriesData = [
+      {
+        colnames: ['year', 'platform', 'count'],
+        data: [
+          { year: 2011, platform: 'PC', count: 140 },
+          { year: 2008, platform: 'PC', count: 76 },
+        ],
+      },
+    ];
+
+    const chartProps = new ChartProps({
+      formData,
+      width: 800,
+      height: 600,
+      queriesData,
+      theme: supersetTheme,
+    });
+
+    const result = transformProps(chartProps as EchartsGaugeChartProps);
+    const { axisLine } = (result.echartOptions as any).series[0];
+
+    expect(axisLine.lineStyle.color).toEqual([
+      [0.5, '#ff0000'],
+      [1, '#00ff00'],
+    ]);
+  });
+
+  test('a chart saved before interval_colors existed still renders using legacy interval_color_indices', () => {
+    // Simulates form_data persisted by a Gauge chart saved before this
+    // feature: only the legacy fields are present, `intervalColors` is
+    // absent entirely (not just empty).
+    const formData: SqlaFormData = {
+      ...baseFormData,
+      groupby: ['year', 'platform'],
+      intervals: '60,100',
+      intervalColorIndices: '1,2',
+      minVal: 20,
+    };
+    const queriesData = [
+      {
+        colnames: ['year', 'platform', 'count'],
+        data: [
+          { year: 2011, platform: 'PC', count: 140 },
+          { year: 2008, platform: 'PC', count: 76 },
+        ],
+      },
+    ];
+
+    const chartProps = new ChartProps({
+      formData,
+      width: 800,
+      height: 600,
+      queriesData,
+      theme: supersetTheme,
+    });
+
+    const result = transformProps(chartProps as EchartsGaugeChartProps);
+    const { axisLine } = (result.echartOptions as any).series[0];
+
+    expect(axisLine.lineStyle.color).toEqual([
+      [0.5, '#1f77b4'],
+      [1, '#ff7f0e'],
+    ]);
+  });
+});
+
+describe('Min/Max calculation and axis labels', () => {
+  const baseFormData: SqlaFormData = {
+    datasource: '26__table',
+    viz_type: VizType.Gauge,
+    metric: 'count',
+    adhocFilters: [],
+    rowLimit: 10,
+    startAngle: 225,
+    endAngle: -45,
+    colorScheme: 'SUPERSET_DEFAULT',
+    fontSize: 14,
+    numberFormat: 'SMART_NUMBER',
+    valueFormatter: '{value}',
+    showPointer: true,
+    animation: true,
+    showAxisTick: false,
+    showSplitLine: false,
+    splitNumber: 10,
+    showProgress: true,
+    overlap: true,
+    roundCap: false,
+    groupby: [],
+  };
+
+  test('should use provided minVal and maxVal when valid numbers', () => {
+    const formData: SqlaFormData = {
+      ...baseFormData,
+      minVal: 10,
+      maxVal: 100,
+    };
+    const queriesData = [
+      {
+        colnames: ['count'],
+        data: [{ count: 50 }, { count: 75 }],
+      },
+    ];
+
+    const chartProps = new ChartProps({
+      formData,
+      width: 800,
+      height: 600,
+      queriesData,
+      theme: supersetTheme,
+    });
+
+    const result = transformProps(chartProps as EchartsGaugeChartProps);
+    const series = (result.echartOptions as any).series[0];
+
+    expect(series.min).toBe(10);
+    expect(series.max).toBe(100);
+  });
+
+  test('should calculate min/max from data when minVal is null', () => {
+    const formData: SqlaFormData = {
+      ...baseFormData,
+      minVal: null,
+      maxVal: 100,
+    };
+    const queriesData = [
+      {
+        colnames: ['count'],
+        data: [{ count: 20 }, { count: 80 }],
+      },
+    ];
+
+    const chartProps = new ChartProps({
+      formData,
+      width: 800,
+      height: 600,
+      queriesData,
+      theme: supersetTheme,
+    });
+
+    const result = transformProps(chartProps as EchartsGaugeChartProps);
+    const series = (result.echartOptions as any).series[0];
+
+    expect(series.min).toBe(0);
+    expect(series.max).toBe(100);
+  });
+
+  test('should calculate min/max from data when maxVal is null', () => {
+    const formData: SqlaFormData = {
+      ...baseFormData,
+      minVal: 0,
+      maxVal: null,
+    };
+    const queriesData = [
+      {
+        colnames: ['count'],
+        data: [{ count: 20 }, { count: 80 }],
+      },
+    ];
+
+    const chartProps = new ChartProps({
+      formData,
+      width: 800,
+      height: 600,
+      queriesData,
+      theme: supersetTheme,
+    });
+
+    const result = transformProps(chartProps as EchartsGaugeChartProps);
+    const series = (result.echartOptions as any).series[0];
+
+    expect(series.min).toBe(0);
+    expect(series.max).toBe(160);
+  });
+
+  test('should calculate min/max from data when both are null', () => {
+    const formData: SqlaFormData = {
+      ...baseFormData,
+      minVal: null,
+      maxVal: null,
+    };
+    const queriesData = [
+      {
+        colnames: ['count'],
+        data: [{ count: 15 }, { count: 45 }],
+      },
+    ];
+
+    const chartProps = new ChartProps({
+      formData,
+      width: 800,
+      height: 600,
+      queriesData,
+      theme: supersetTheme,
+    });
+
+    const result = transformProps(chartProps as EchartsGaugeChartProps);
+    const series = (result.echartOptions as any).series[0];
+
+    expect(series.min).toBe(0);
+    expect(series.max).toBe(90);
+  });
+
+  test('should calculate min/max from data when minVal is empty string', () => {
+    const formData: SqlaFormData = {
+      ...baseFormData,
+      minVal: '' as any,
+      maxVal: 200,
+    };
+    const queriesData = [
+      {
+        colnames: ['count'],
+        data: [{ count: 30 }, { count: 60 }],
+      },
+    ];
+
+    const chartProps = new ChartProps({
+      formData,
+      width: 800,
+      height: 600,
+      queriesData,
+      theme: supersetTheme,
+    });
+
+    const result = transformProps(chartProps as EchartsGaugeChartProps);
+    const series = (result.echartOptions as any).series[0];
+
+    expect(series.min).toBe(0);
+    expect(series.max).toBe(200);
+  });
+
+  test('should calculate min/max from data when maxVal is invalid string', () => {
+    const formData: SqlaFormData = {
+      ...baseFormData,
+      minVal: 0,
+      maxVal: 'invalid' as any,
+    };
+    const queriesData = [
+      {
+        colnames: ['count'],
+        data: [{ count: 25 }, { count: 75 }],
+      },
+    ];
+
+    const chartProps = new ChartProps({
+      formData,
+      width: 800,
+      height: 600,
+      queriesData,
+      theme: supersetTheme,
+    });
+
+    const result = transformProps(chartProps as EchartsGaugeChartProps);
+    const series = (result.echartOptions as any).series[0];
+
+    expect(series.min).toBe(0);
+    expect(series.max).toBe(150);
+  });
+
+  test('should handle negative values in min/max calculation', () => {
+    const formData: SqlaFormData = {
+      ...baseFormData,
+      minVal: null,
+      maxVal: null,
+    };
+    const queriesData = [
+      {
+        colnames: ['count'],
+        data: [{ count: -20 }, { count: 40 }],
+      },
+    ];
+
+    const chartProps = new ChartProps({
+      formData,
+      width: 800,
+      height: 600,
+      queriesData,
+      theme: supersetTheme,
+    });
+
+    const result = transformProps(chartProps as EchartsGaugeChartProps);
+    const series = (result.echartOptions as any).series[0];
+
+    expect(series.min).toBe(-40);
+    expect(series.max).toBe(80);
+  });
+
+  test('should generate axis labels correctly based on min, max, and splitNumber', () => {
+    const formData: SqlaFormData = {
+      ...baseFormData,
+      minVal: 0,
+      maxVal: 100,
+      splitNumber: 5,
+    };
+    const queriesData = [
+      {
+        colnames: ['count'],
+        data: [{ count: 50 }],
+      },
+    ];
+
+    const chartProps = new ChartProps({
+      formData,
+      width: 800,
+      height: 600,
+      queriesData,
+      theme: supersetTheme,
+    });
+
+    const result = transformProps(chartProps as EchartsGaugeChartProps);
+    const series = (result.echartOptions as any).series[0];
+
+    expect(series.min).toBe(0);
+    expect(series.max).toBe(100);
+    expect(series.splitNumber).toBe(5);
+    expect(series.axisLabel).toBeDefined();
+    expect(series.axisLabel.formatter).toBeDefined();
+  });
+
+  test('should calculate axis label length correctly for different number formats', () => {
+    const formData: SqlaFormData = {
+      ...baseFormData,
+      minVal: 0,
+      maxVal: 1000,
+      splitNumber: 10,
+      numberFormat: ',d',
+    };
+    const queriesData = [
+      {
+        colnames: ['count'],
+        data: [{ count: 500 }],
+      },
+    ];
+
+    const chartProps = new ChartProps({
+      formData,
+      width: 800,
+      height: 600,
+      queriesData,
+      theme: supersetTheme,
+    });
+
+    const result = transformProps(chartProps as EchartsGaugeChartProps);
+    const series = (result.echartOptions as any).series[0];
+
+    expect(series.axisLabel).toBeDefined();
+    expect(series.axisLabel.formatter).toBeDefined();
+    expect(typeof series.axisLabel.formatter).toBe('function');
+  });
+
+  test('should integrate interval bounds and colors with calculated min/max', () => {
+    const formData: SqlaFormData = {
+      ...baseFormData,
+      minVal: null,
+      maxVal: null,
+      intervals: '20,60',
+      intervalColorIndices: '1,2',
+    };
+    const queriesData = [
+      {
+        colnames: ['count'],
+        data: [{ count: 10 }, { count: 50 }],
+      },
+    ];
+
+    const chartProps = new ChartProps({
+      formData,
+      width: 800,
+      height: 600,
+      queriesData,
+      theme: supersetTheme,
+    });
+
+    const result = transformProps(chartProps as EchartsGaugeChartProps);
+    const series = (result.echartOptions as any).series[0];
+
+    expect(series.min).toBe(0);
+    expect(series.max).toBe(100);
+
+    const { axisLine } = series;
+    expect(axisLine.lineStyle.color).toEqual(
+      expect.arrayContaining([
+        expect.arrayContaining([expect.any(Number), expect.any(String)]),
+      ]),
+    );
+  });
+
+  test('should handle zero values in data correctly', () => {
+    const formData: SqlaFormData = {
+      ...baseFormData,
+      minVal: null,
+      maxVal: null,
+    };
+    const queriesData = [
+      {
+        colnames: ['count'],
+        data: [{ count: 0 }, { count: 0 }],
+      },
+    ];
+
+    const chartProps = new ChartProps({
+      formData,
+      width: 800,
+      height: 600,
+      queriesData,
+      theme: supersetTheme,
+    });
+
+    const result = transformProps(chartProps as EchartsGaugeChartProps);
+    const series = (result.echartOptions as any).series[0];
+
+    expect(series.min).toBe(0);
+    expect(series.max).toBe(0);
+  });
+
+  test('should handle string minVal/maxVal that can be converted to numbers', () => {
+    const formData: SqlaFormData = {
+      ...baseFormData,
+      minVal: '10' as any,
+      maxVal: '200' as any,
+    };
+    const queriesData = [
+      {
+        colnames: ['count'],
+        data: [{ count: 50 }],
+      },
+    ];
+
+    const chartProps = new ChartProps({
+      formData,
+      width: 800,
+      height: 600,
+      queriesData,
+      theme: supersetTheme,
+    });
+
+    const result = transformProps(chartProps as EchartsGaugeChartProps);
+    const series = (result.echartOptions as any).series[0];
+
+    expect(series.min).toBe(10);
+    expect(series.max).toBe(200);
+  });
+
+  test('should handle different splitNumber values', () => {
+    const formData: SqlaFormData = {
+      ...baseFormData,
+      minVal: 0,
+      maxVal: 100,
+      splitNumber: 20,
+    };
+    const queriesData = [
+      {
+        colnames: ['count'],
+        data: [{ count: 50 }],
+      },
+    ];
+
+    const chartProps = new ChartProps({
+      formData,
+      width: 800,
+      height: 600,
+      queriesData,
+      theme: supersetTheme,
+    });
+
+    const result = transformProps(chartProps as EchartsGaugeChartProps);
+    const series = (result.echartOptions as any).series[0];
+
+    expect(series.splitNumber).toBe(20);
+  });
+});
+
+describe('getIntervalBoundsAndColors', () => {
+  test('should generate correct interval bounds and colors from legacy indices', () => {
+    const colorFn = CategoricalColorNamespace.getScale(
+      'supersetColors' as string,
+    );
+    expect(
+      getIntervalBoundsAndColors('', '', undefined, colorFn, 0, 10),
+    ).toEqual([]);
+    expect(
+      getIntervalBoundsAndColors('4, 10', '1, 2', undefined, colorFn, 0, 10),
+    ).toEqual([
+      [0.4, '#1f77b4'],
+      [1, '#ff7f0e'],
+    ]);
+    expect(
+      getIntervalBoundsAndColors(
+        '4, 8, 10',
+        '9, 8, 7',
+        undefined,
+        colorFn,
+        0,
+        10,
+      ),
+    ).toEqual([
+      [0.4, '#bcbd22'],
+      [0.8, '#7f7f7f'],
+      [1, '#e377c2'],
+    ]);
+    expect(
+      getIntervalBoundsAndColors('4, 10', '1, 2', undefined, colorFn, 2, 10),
+    ).toEqual([
+      [0.25, '#1f77b4'],
+      [1, '#ff7f0e'],
+    ]);
+    expect(
+      getIntervalBoundsAndColors('-4, 0', '1, 2', undefined, colorFn, -10, 0),
+    ).toEqual([
+      [0.6, '#1f77b4'],
+      [1, '#ff7f0e'],
+    ]);
+    expect(
+      getIntervalBoundsAndColors('-4, -2', '1, 2', undefined, colorFn, -10, -2),
+    ).toEqual([
+      [0.75, '#1f77b4'],
+      [1, '#ff7f0e'],
+    ]);
+  });
+
+  test('keeps the bounds, with positional colors, when legacy indices are unparseable', () => {
+    const colorFn = CategoricalColorNamespace.getScale(
+      'supersetColors' as string,
+    );
+    expect(
+      getIntervalBoundsAndColors('4, 10', '2,1,', undefined, colorFn, 0, 10),
+    ).toEqual([
+      [0.4, '#1f77b4'],
+      [1, '#ff7f0e'],
+    ]);
+  });
+
+  test('should prefer interval_colors (real hex values) over legacy indices when present', () => {
+    const colorFn = CategoricalColorNamespace.getScale(
+      'supersetColors' as string,
+    );
+    expect(
+      getIntervalBoundsAndColors(
+        '4, 10',
+        '1, 2',
+        ['#ff0000', '#00ff00'],
+        colorFn,
+        0,
+        10,
+      ),
+    ).toEqual([
+      [0.4, '#ff0000'],
+      [1, '#00ff00'],
+    ]);
+  });
+
+  test('should fall back to the color scheme for bounds missing an explicit interval_colors entry', () => {
+    const colorFn = CategoricalColorNamespace.getScale(
+      'supersetColors' as string,
+    );
+    expect(
+      getIntervalBoundsAndColors('4, 8, 10', '', ['#ff0000'], colorFn, 0, 10),
+    ).toEqual([
+      [0.4, '#ff0000'],
+      [0.8, colorFn.colors[1]],
+      [1, colorFn.colors[2]],
+    ]);
+  });
+
+  test('wraps the interval_colors fallback around the scheme like the editor does', () => {
+    // With more bounds than colors in the scheme, a bound past the end of
+    // `intervalColors` must wrap around the scheme the same way
+    // `IntervalColorsControl`'s own display does (`index % schemeColors.length`),
+    // rather than indexing straight off the end into `undefined`.
+    const colorFn = new CategoricalColorScale([
+      '#1f77b4',
+      '#ff7f0e',
+      '#2ca02c',
+    ]);
+    expect(
+      getIntervalBoundsAndColors(
+        '4, 6, 8, 10',
+        '',
+        ['#ff0000'],
+        colorFn,
+        0,
+        10,
+      ),
+    ).toEqual([
+      [0.4, '#ff0000'],
+      [0.6, '#ff7f0e'],
+      [0.8, '#2ca02c'],
+      [1, '#1f77b4'],
+    ]);
+  });
+
+  test('an empty interval_colors array falls back to legacy indices', () => {
+    const colorFn = CategoricalColorNamespace.getScale(
+      'supersetColors' as string,
+    );
+    expect(
+      getIntervalBoundsAndColors('4, 10', '2, 1', [], colorFn, 0, 10),
+    ).toEqual([
+      [0.4, '#ff7f0e'],
+      [1, '#1f77b4'],
+    ]);
+  });
+});
